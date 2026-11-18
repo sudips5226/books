@@ -271,10 +271,9 @@ pub fn words_to_glyphs(raw: &mut RawPage, words: &[OcrWord], img: &DynamicImage,
             }
         }
         let density = if total > 0 { dark as f32 / total as f32 } else { 0.0 };
-        let color = if dark > 0 {
-            Rgb((r / dark) as u8, (g / dark) as u8, (b / dark) as u8).snapped()
-        } else {
-            Rgb::BLACK
+        let color = match (r.checked_div(dark), g.checked_div(dark), b.checked_div(dark)) {
+            (Some(r), Some(g), Some(b)) => Rgb(r as u8, g as u8, b as u8).snapped(),
+            _ => Rgb::BLACK,
         };
         // Desaturated dark colours are just black ink.
         let color = {
@@ -405,7 +404,7 @@ pub fn detect_rules(img: &DynamicImage, dpi: f32, words: &[OcrWord]) -> Vec<Rule
                     next_active.push((a, b, m, m));
                 }
             }
-            done.extend(active.drain(..));
+            done.append(&mut active);
             active = next_active;
         }
         done.extend(active);
@@ -430,7 +429,10 @@ pub fn detect_rules(img: &DynamicImage, dpi: f32, words: &[OcrWord]) -> Vec<Rule
                 n += 1;
             }
         }
-        if n == 0 { Rgb::BLACK } else { Rgb((r / n) as u8, (g / n) as u8, (b / n) as u8).snapped() }
+        match (r.checked_div(n), g.checked_div(n), b.checked_div(n)) {
+            (Some(r), Some(g), Some(b)) => Rgb(r as u8, g as u8, b as u8).snapped(),
+            _ => Rgb::BLACK,
+        }
     };
     let inside_word = |r: &Rect| words.iter().any(|wd| r.fraction_inside(&wd.bbox.expand(0.5)) > 0.6);
     // A real line has light pixels on both sides (edges of filled areas don't).
@@ -490,7 +492,7 @@ pub fn detect_figures(img: &DynamicImage, dpi: f32, words: &[OcrWord], rules: &[
     let rgb = img.to_rgb8();
     let (w, h) = rgb.dimensions();
     let cell = (dpi / 36.0).max(4.0) as u32; // ~2pt
-    let (gw, gh) = ((w + cell - 1) / cell, (h + cell - 1) / cell);
+    let (gw, gh) = (w.div_ceil(cell), h.div_ceil(cell));
     let scale = 72.0 / dpi;
     let mut ink = vec![false; (gw * gh) as usize];
     for gy in 0..gh {

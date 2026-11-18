@@ -15,6 +15,9 @@
 //! PDF parsing and rendering are done by [PDFium](https://pdfium.googlesource.com/pdfium/)
 //! through `pdfium-render`, which loads `libpdfium` dynamically at runtime.
 
+// Geometry code indexes several parallel arrays; explicit index loops read better there.
+#![allow(clippy::needless_range_loop)]
+
 pub mod docx;
 pub mod extract;
 pub mod fonts;

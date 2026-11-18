@@ -453,7 +453,7 @@ fn detect_ruled_tables(raw: &RawPage) -> (Vec<RuledTable>, Vec<bool>) {
                 .iter()
                 .filter(|b| cell.rect.fraction_inside(&b.bbox.expand(2.0)) > 0.8)
                 .map(|b| b.color)
-                .last();
+                .next_back();
         }
         cells.sort_by_key(|c| (c.row, c.col));
         tables.push(RuledTable { bbox, xs, ys, cells });
@@ -527,7 +527,12 @@ impl Ctx<'_> {
                 _ => None,
             })
             .collect();
-        median(&mut v).unwrap_or(self.body_size)
+        if v.is_empty() {
+            return self.body_size;
+        }
+        // Lower median: a few large headings should not inflate the thresholds.
+        v.sort_by(|a, b| a.total_cmp(b));
+        v[(v.len() - 1) / 2]
     }
 
     fn line_count(&self, idxs: &[usize]) -> usize {
@@ -601,16 +606,25 @@ impl Ctx<'_> {
         let min_gap = (0.45 * size).max(2.5);
         let mut order: Vec<usize> = idxs.to_vec();
         order.sort_by(|&a, &b| self.items[a].bbox.y0.total_cmp(&self.items[b].bbox.y0));
+        let is_text = |i: usize| matches!(self.items[i].kind, ItemKind::Seg(_));
         let mut groups: Vec<Vec<usize>> = vec![vec![order[0]]];
         let mut end = self.items[order[0]].bbox.y1;
+        let mut end_text = is_text(order[0]);
         for &i in &order[1..] {
             let b = self.items[i].bbox;
-            if b.y0 - end >= min_gap {
+            // Text needs a paragraph-sized gap; pictures, tables and rules separate on any clear gap.
+            let threshold = if end_text && is_text(i) { min_gap } else { 1.5 };
+            if b.y0 - end >= threshold {
                 groups.push(vec![i]);
+                end = b.y1;
+                end_text = is_text(i);
             } else {
                 groups.last_mut().unwrap().push(i);
+                if b.y1 > end {
+                    end = b.y1;
+                    end_text = is_text(i);
+                }
             }
-            end = end.max(b.y1);
         }
         (groups.len() > 1).then_some(groups)
     }
@@ -1484,6 +1498,14 @@ impl Emitter<'_> {
     }
 }
 
+/// A small PNG filled with one colour (page backgrounds).
+fn solid_png(c: Rgb) -> Option<ImageData> {
+    let img = image::RgbImage::from_pixel(8, 8, image::Rgb([c.0, c.1, c.2]));
+    let mut buf = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(img).write_to(&mut buf, image::ImageFormat::Png).ok()?;
+    Some(ImageData { bytes: buf.into_inner(), ext: "png", px_width: 8, px_height: 8 })
+}
+
 fn min_x0(lines: &[&Line]) -> f32 {
     lines.iter().map(|l| l.bbox.x0).fold(f32::MAX, f32::min)
 }
@@ -1635,6 +1657,24 @@ pub fn analyse_page(raw_in: &RawPage, opts: &LayoutOptions) -> PageLayout {
             });
         } else {
             image_items.push(i);
+        }
+    }
+
+    if let Some(bg) = raw.background {
+        if let Some(data) = solid_png(bg) {
+            floating.insert(
+                0,
+                Picture {
+                    data,
+                    width: raw.width,
+                    height: raw.height,
+                    bbox: Rect::new(0.0, 0.0, raw.width, raw.height),
+                    indent: 0.0,
+                    space_before: 0.0,
+                    align: Align::Left,
+                    behind_text: true,
+                },
+            );
         }
     }
 

@@ -534,7 +534,11 @@ fn classify_paths(raw: &mut RawPage, paths: &[PathInfo], hints: &mut Vec<Rect>, 
         let rect_like = !p.has_curves && (4..=6).contains(&p.segments);
         if rect_like {
             if b.area() > page.area() * 0.85 {
-                continue; // page background
+                // Page background colour.
+                if p.filled && p.fill != Rgb::WHITE && p.fill.luminance() < 254.0 {
+                    raw.background = Some(p.fill);
+                }
+                continue;
             }
             if p.filled && !p.fill.is_near_white() {
                 raw.boxes.push(FilledBox { bbox: b, color: p.fill });

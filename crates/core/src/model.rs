@@ -279,6 +279,8 @@ pub struct RawPage {
     pub links: Vec<String>,
     /// The text came from OCR rather than the PDF text layer.
     pub ocr: bool,
+    /// Colour of a filled rectangle covering the whole page.
+    pub background: Option<Rgb>,
 }
 
 impl RawPage {
