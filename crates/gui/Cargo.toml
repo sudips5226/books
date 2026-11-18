@@ -1,0 +1,23 @@
+[package]
+name = "pdf2word-gui"
+description = "Qt 6 / QML desktop front-end for the PDF to Word converter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["ocr"]
+ocr = ["pdf2word-core/ocr"]
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+env_logger = "0.11"
+cxx = "1"
+cxx-qt = "0.8"
+cxx-qt-lib = { version = "0.8", features = ["qt_full"] }
+pdf2word-core = { path = "../core", default-features = false }
+
+[build-dependencies]
+cxx-qt-build = { version = "0.8", features = ["link_qt_object_files"] }

@@ -1,0 +1,22 @@
+[package]
+name = "pdf2word-core"
+description = "PDF to DOCX conversion with layout reconstruction, built on PDFium and Tesseract OCR"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = ["ocr"]
+# Tesseract OCR for scanned pages (links libtesseract via pkg-config).
+ocr = ["dep:pkg-config"]
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+pdfium-render = { version = "0.9", default-features = false, features = ["pdfium_7350", "image_025", "thread_safe"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[build-dependencies]
+pkg-config = { version = "0.3", optional = true }
