@@ -1927,10 +1927,156 @@ fn line_joiner(prev: &mut [Inline], next: &[Inline]) -> Joiner {
     Joiner::Space
 }
 
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32,
+        0x3000..=0x303F | 0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0xAC00..=0xD7AF | 0xFF00..=0xFFEF)
+}
+
+/// Builds text-box content from glyphs given in reading order.
+fn glyph_inlines(raw: &RawPage, glyphs: &[&Glyph], gap_is_space: &dyn Fn(&Glyph, &Glyph) -> bool) -> Vec<Inline> {
+    let mut atoms = Vec::new();
+    for (k, g) in glyphs.iter().enumerate() {
+        if k > 0 && (g.space_before || gap_is_space(glyphs[k - 1], g)) {
+            atoms.push(Atom::Space);
+        }
+        atoms.push(Atom::Char {
+            text: normalize_presentation_form(&expand_ligature(g.ch)),
+            style: raw.styles[g.style].clone(),
+            link: g.link.and_then(|l| raw.links.get(l)).cloned(),
+            width: 0.0,
+            glyph: 0,
+        });
+    }
+    atoms_to_inlines(atoms)
+}
+
+/// Groups rotated glyphs into lines and turns each into a rotated text box.
+fn rotated_text_boxes(raw: &RawPage) -> Vec<TextBox> {
+    let angle_diff = |a: f32, b: f32| {
+        let d = (a - b).rem_euclid(360.0);
+        d.min(360.0 - d)
+    };
+    // Unit vector along the text (display coordinates, y down) and its normal.
+    let axes = |a: f32| {
+        let r = a.to_radians();
+        ((r.cos(), -r.sin()), (r.sin(), r.cos()))
+    };
+    let mut groups: Vec<(f32, Vec<usize>)> = Vec::new();
+    for (i, (g, a)) in raw.rotated.iter().enumerate() {
+        let size = raw.styles[g.style].size;
+        let joined = groups.last_mut().is_some_and(|(ga, idxs)| {
+            if angle_diff(*ga, *a) > 3.0 {
+                return false;
+            }
+            let ((dx, dy), (nx, ny)) = axes(*ga);
+            let last = &raw.rotated[*idxs.last().unwrap()].0;
+            let along = (g.bbox.cx() - last.bbox.cx()) * dx + (g.bbox.cy() - last.bbox.cy()) * dy;
+            let across = (g.bbox.cx() - last.bbox.cx()) * nx + (g.bbox.cy() - last.bbox.cy()) * ny;
+            let ok = across.abs() < 0.5 * size && along > -0.3 * size && along < 2.0 * size;
+            if ok {
+                idxs.push(i);
+            }
+            ok
+        });
+        if !joined {
+            groups.push((*a, vec![i]));
+        }
+    }
+    let mut boxes = Vec::new();
+    for (a, mut idxs) in groups {
+        let ((dx, dy), _) = axes(a);
+        let along = |i: usize| raw.rotated[i].0.bbox.cx() * dx + raw.rotated[i].0.bbox.cy() * dy;
+        idxs.sort_by(|&x, &y| along(x).total_cmp(&along(y)));
+        let glyphs: Vec<&Glyph> = idxs.iter().map(|&i| &raw.rotated[i].0).collect();
+        if glyphs.iter().all(|g| g.ch.is_whitespace()) {
+            continue;
+        }
+        let size = glyphs.iter().map(|g| raw.styles[g.style].size).fold(0.0, f32::max);
+        let inlines = glyph_inlines(raw, &glyphs, &|p, n| {
+            let d = (n.bbox.cx() - p.bbox.cx()) * dx + (n.bbox.cy() - p.bbox.cy()) * dy;
+            d > 1.0 * raw.styles[n.style].size
+        });
+        let bbox = Rect::union_all(glyphs.iter().map(|g| &g.bbox)).unwrap();
+        let length = along(*idxs.last().unwrap()) - along(idxs[0]) + 0.65 * size;
+        boxes.push(TextBox {
+            inlines,
+            cx: bbox.cx(),
+            cy: bbox.cy(),
+            width: length * 1.06 + 2.0,
+            height: 1.3 * size,
+            rotation: (360.0 - a).rem_euclid(360.0),
+            vertical: false,
+        });
+    }
+    boxes
+}
+
+/// Finds columns of upright CJK characters written top to bottom, removes
+/// them from the horizontal text and returns them as vertical text boxes.
+fn vertical_text_boxes(raw: &mut RawPage) -> Vec<TextBox> {
+    let n = raw.glyphs.len();
+    let mut used = vec![false; n];
+    let mut chains: Vec<Vec<usize>> = Vec::new();
+    let mut cur: Vec<usize> = Vec::new();
+    let flush = |cur: &mut Vec<usize>, chains: &mut Vec<Vec<usize>>| {
+        if cur.len() >= 3 {
+            chains.push(std::mem::take(cur));
+        } else {
+            cur.clear();
+        }
+    };
+    for i in 0..n {
+        let g = &raw.glyphs[i];
+        let size = raw.styles[g.style].size;
+        let cjk = is_cjk(g.ch);
+        let continues = cur.last().is_some_and(|&p| {
+            let pg = &raw.glyphs[p];
+            cjk && g.bbox.y0 >= pg.bbox.cy() && g.bbox.y0 - pg.bbox.y1 < 0.6 * size && (g.bbox.cx() - pg.bbox.cx()).abs() < 0.35 * size
+        });
+        if continues {
+            cur.push(i);
+        } else {
+            flush(&mut cur, &mut chains);
+            if cjk {
+                cur.push(i);
+            }
+        }
+    }
+    flush(&mut cur, &mut chains);
+    let mut boxes = Vec::new();
+    for chain in chains {
+        let glyphs: Vec<&Glyph> = chain.iter().map(|&i| &raw.glyphs[i]).collect();
+        let size = glyphs.iter().map(|g| raw.styles[g.style].size).fold(0.0, f32::max);
+        let bbox = Rect::union_all(glyphs.iter().map(|g| &g.bbox)).unwrap();
+        let inlines = glyph_inlines(raw, &glyphs, &|p, n| n.bbox.y0 - p.bbox.y1 > 0.8 * raw.styles[n.style].size);
+        boxes.push(TextBox {
+            inlines,
+            cx: bbox.cx(),
+            cy: bbox.cy(),
+            width: 1.4 * size,
+            height: bbox.height() * 1.04 + 2.0,
+            rotation: 0.0,
+            vertical: true,
+        });
+        for i in chain {
+            used[i] = true;
+        }
+    }
+    let mut k = 0;
+    raw.glyphs.retain(|_| {
+        let keep = !used[k];
+        k += 1;
+        keep
+    });
+    boxes
+}
+
 /// Analyses one page.
 pub fn analyse_page(raw_in: &RawPage, opts: &LayoutOptions) -> PageLayout {
     let mut raw = raw_in.clone();
     apply_decorations(&mut raw);
+    let mut text_boxes = rotated_text_boxes(&raw);
+    text_boxes.extend(vertical_text_boxes(&mut raw));
     let segs = build_segments(&raw);
 
     let mut char_sizes: Vec<f32> = raw.glyphs.iter().map(|g| raw.styles[g.style].size).collect();
@@ -2010,6 +2156,7 @@ pub fn analyse_page(raw_in: &RawPage, opts: &LayoutOptions) -> PageLayout {
         ocr: raw.ocr,
         ..Default::default()
     };
+    layout.text_boxes = text_boxes;
     if items.is_empty() {
         layout.floating = floating;
         layout.margin_left = 72.0f32.min(raw.width / 4.0);

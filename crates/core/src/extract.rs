@@ -211,11 +211,21 @@ pub fn extract_page(
                     d.min(360.0 - d)
                 })
                 .fold(f32::MAX, f32::min);
-            if angle_diff > 4.0 {
-                // Rotated text is treated as part of a graphic.
-                graphic_hints.push(bbox);
-                continue;
+            // Rotated text becomes a text box (or part of a figure it belongs to).
+            let rotated = angle_diff > 4.0;
+            if rotated {
+                // The scaled size is not meaningful for rotated text: recover the
+                // line height H from the axis-aligned box (w = L·c + H·s, h = L·s + H·c).
+                let t = angle.to_radians();
+                let (c, s) = (t.cos().abs(), t.sin().abs());
+                let (w, h) = (bbox.width(), bbox.height());
+                let height = if (c * c - s * s).abs() > 0.2 { (h * c - w * s) / (c * c - s * s) } else { ch.unscaled_font_size().value * 1.15 };
+                if height.is_finite() && height > 1.0 {
+                    size = height / 1.15;
+                }
             }
+            // PDFium measures the angle clockwise; convert to counter-clockwise on the displayed page.
+            let display_angle = (360.0 - angle - tf.rotation_degrees()).rem_euclid(360.0);
 
             if is_garbage(c) {
                 stats.garbage_chars += 1;
@@ -299,7 +309,9 @@ pub fn extract_page(
                 link,
             };
             pending_space = false;
-            if is_invisible {
+            if rotated {
+                raw.rotated.push((glyph, display_angle));
+            } else if is_invisible {
                 stats.invisible_chars += 1;
                 invisible.push(glyph);
             } else {
@@ -655,6 +667,12 @@ fn cluster_graphics(raw: &RawPage, hints: &[Rect]) -> Vec<Rect> {
                     rect = rect.union(&run.0);
                 }
             }
+            // Rotated axis titles next to a chart belong to it.
+            for (g, _) in &raw.rotated {
+                if near.intersects(&g.bbox) {
+                    rect = rect.union(&g.bbox);
+                }
+            }
         }
         // Do not swallow regular text: if text density is high, it's a decorated text box.
         let text_area: f32 = raw
@@ -727,6 +745,7 @@ fn rasterize_regions(page: &PdfPage, raw: &mut RawPage, regions: &[Rect], opts: 
         let crop = full.crop_imm(x, y, w, h);
         let Some(data) = encode_image(&crop, opts.max_image_px) else { continue };
         raw.glyphs.retain(|g| !r.contains_point(g.bbox.cx(), g.bbox.cy()));
+        raw.rotated.retain(|(g, _)| !r.contains_point(g.bbox.cx(), g.bbox.cy()));
         raw.images.retain(|im| im.bbox.fraction_inside(&r) < 0.9);
         raw.rules.retain(|ru| ru.bbox.fraction_inside(&r.expand(1.0)) < 0.9);
         raw.boxes.retain(|b| b.bbox.fraction_inside(&r.expand(1.0)) < 0.9);

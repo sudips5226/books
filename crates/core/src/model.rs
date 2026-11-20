@@ -306,6 +306,8 @@ pub struct RawPage {
     pub ocr: bool,
     /// Colour of a filled rectangle covering the whole page.
     pub background: Option<Rgb>,
+    /// Rotated glyphs with their counter-clockwise angle in degrees.
+    pub rotated: Vec<(Glyph, f32)>,
 }
 
 impl RawPage {
@@ -598,7 +600,8 @@ pub struct TextBox {
     /// Centre of the text on the page.
     pub cx: f32,
     pub cy: f32,
-    /// Size of the unrotated box (along the text × across it).
+    /// Size of the unrotated box: horizontal text runs along `width`;
+    /// vertical text is a column `width` wide and `height` tall.
     pub width: f32,
     pub height: f32,
     /// Clockwise rotation in degrees.

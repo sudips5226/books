@@ -51,6 +51,11 @@ fn main() -> anyhow::Result<()> {
                 println!("  {:?} [{:.1},{:.1},{:.1},{:.1}] base={:.1} size={} sp={}", g.ch, g.bbox.x0, g.bbox.y0, g.bbox.x1, g.bbox.y1, g.baseline, raw.styles[g.style].size, g.space_before);
             }
         }
+        if std::env::var("DUMP_GLYPHS").is_ok() {
+            for (g, a) in &raw.rotated {
+                println!("  rot {:?} [{:.1},{:.1},{:.1},{:.1}] angle={a:.1} sp={}", g.ch, g.bbox.x0, g.bbox.y0, g.bbox.x1, g.bbox.y1, g.space_before);
+            }
+        }
         let l = layout::analyse_page(&raw, &LayoutOptions::default());
         println!("margins l={:.0} r={:.0} t={:.0} b={:.0} floating={}", l.margin_left, l.margin_right, l.margin_top, l.margin_bottom, l.floating.len());
         dump(&l.blocks, 0);

@@ -345,6 +345,51 @@ def rtl_office(path, workdir):
     os.replace(os.path.join(workdir, "rtl-office.pdf"), path)
 
 
+def rotated(path):
+    """Rotated sidebar, angled watermark and vertical Japanese text."""
+    c = canvas.Canvas(path, pagesize=letter)
+    w, h = letter
+    c.setFont("Helvetica-Bold", 18)
+    c.drawString(72, h - 80, "Rotated and vertical text")
+    c.setFont("Times-Roman", 11)
+    t = c.beginText(72, h - 110)
+    for line in ["Body text stays horizontal. The sidebar on the left edge is rotated by ninety",
+                 "degrees, the watermark is drawn at thirty degrees and the column on the right",
+                 "uses vertical Japanese writing."]:
+        t.textLine(line)
+    c.drawText(t)
+    # Sidebar reading bottom to top.
+    c.saveState()
+    c.translate(40, 300)
+    c.rotate(90)
+    c.setFont("Helvetica", 12)
+    c.setFillColor(colors.HexColor("#1f4e79"))
+    c.drawString(0, 0, "Confidential sidebar label")
+    c.restoreState()
+    # Watermark.
+    c.saveState()
+    c.translate(300, 400)
+    c.rotate(30)
+    c.setFont("Helvetica-Bold", 60)
+    c.setFillColor(colors.HexColor("#d0d0d0"))
+    c.drawCentredString(0, 0, "DRAFT")
+    c.restoreState()
+    # Vertical Japanese (one character per row, top to bottom).
+    try:
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+        pdfmetrics.registerFont(UnicodeCIDFont("HeiseiMin-W3"))
+        c.setFont("HeiseiMin-W3", 16)
+        y = h - 160
+        for ch in "縦書きの日本語":
+            c.drawString(w - 90, y, ch)
+            y -= 18
+    except Exception as e:  # pragma: no cover
+        print("CID font unavailable:", e)
+    c.showPage()
+    c.save()
+
+
 def scanned(src_pdf, path, workdir):
     if not shutil.which("pdftoppm"):
         print("pdftoppm not found; skipping scanned.pdf")
@@ -372,6 +417,7 @@ def main():
     scanned(os.path.join(out, "report.pdf"), os.path.join(out, "scanned.pdf"), out)
     typography(os.path.join(out, "typography.pdf"))
     rtl(os.path.join(out, "rtl.pdf"))
+    rotated(os.path.join(out, "rotated.pdf"))
     rtl_office(os.path.join(out, "rtl-office.pdf"), out)
     scanned(os.path.join(out, "typography.pdf"), os.path.join(out, "typography-scan.pdf"), out)
     print("written to", out)

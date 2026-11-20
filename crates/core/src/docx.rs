@@ -476,6 +476,38 @@ impl Writer {
         )
     }
 
+    /// A text box anchored at its page position (rotated or vertical text).
+    fn text_box_run(&mut self, tb: &TextBox) -> String {
+        let id = self.next_drawing;
+        self.next_drawing += 1;
+        let (w, h) = (tb.width.max(1.0), tb.height.max(1.0));
+        let (cx, cy) = (emu(w), emu(h));
+        let mut content = String::from(
+            r#"<w:p><w:pPr><w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/><w:jc w:val="center"/></w:pPr>"#,
+        );
+        self.inlines(&mut content, &tb.inlines);
+        content.push_str("</w:p>");
+        // Quarter turns use the text direction of an upright box (understood by
+        // every consumer); other angles rotate the shape itself.
+        let r = tb.rotation.rem_euclid(360.0);
+        let quarter = |target: f32| (r - target).abs() < 2.0;
+        let (vert, rot, w, h, cx, cy) = if tb.vertical {
+            ("eaVert", 0, w, h, cx, cy)
+        } else if quarter(270.0) {
+            ("vert270", 0, h, w, emu(h), emu(w))
+        } else if quarter(90.0) {
+            ("vert", 0, h, w, emu(h), emu(w))
+        } else {
+            ("horz", (r * 60000.0).round() as i64, w, h, cx, cy)
+        };
+        format!(
+            r#"<w:r><mc:AlternateContent><mc:Choice Requires="wps"><w:drawing><wp:anchor distT="0" distB="0" distL="0" distR="0" simplePos="0" relativeHeight="{rh}" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1"><wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="page"><wp:posOffset>{x}</wp:posOffset></wp:positionH><wp:positionV relativeFrom="page"><wp:posOffset>{y}</wp:posOffset></wp:positionV><wp:extent cx="{cx}" cy="{cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/><wp:wrapNone/><wp:docPr id="{id}" name="Text Box {id}"/><wp:cNvGraphicFramePr/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"><wps:wsp><wps:cNvSpPr txBox="1"/><wps:spPr><a:xfrm rot="{rot}"><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/><a:ln><a:noFill/></a:ln></wps:spPr><wps:txbx><w:txbxContent>{content}</w:txbxContent></wps:txbx><wps:bodyPr rot="0" vert="{vert}" wrap="none" lIns="0" tIns="0" rIns="0" bIns="0" anchor="ctr" anchorCtr="0"><a:noAutofit/></wps:bodyPr></wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing></mc:Choice></mc:AlternateContent></w:r>"#,
+            rh = 251660000 + id,
+            x = emu(tb.cx - w / 2.0),
+            y = emu(tb.cy - h / 2.0),
+        )
+    }
+
     fn picture_paragraph(&mut self, out: &mut String, pic: &Picture) {
         let run = self.inline_picture_run(pic);
         let jc = if pic.align == Align::Center { "center" } else { "left" };
@@ -673,6 +705,10 @@ impl Writer {
         let mut anchors: Vec<String> = Vec::new();
         for f in &page.floating {
             let r = self.anchored_picture_run(f, f.behind_text);
+            anchors.push(r);
+        }
+        for tb in &page.text_boxes {
+            let r = self.text_box_run(tb);
             anchors.push(r);
         }
         match self.mode {
