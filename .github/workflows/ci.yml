@@ -17,7 +17,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libtesseract-dev libleptonica-dev tesseract-ocr-eng \
-            qt6-base-dev qt6-declarative-dev
+            qt6-base-dev qt6-declarative-dev fonts-noto-cjk
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy

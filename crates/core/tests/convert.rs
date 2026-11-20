@@ -280,18 +280,45 @@ fn right_to_left_text() {
     }
 }
 
+/// A CJK font is available to PDFium (system font directories).
+fn fonts_with_cjk() -> bool {
+    let dirs = ["/usr/share/fonts", "/usr/local/share/fonts", "/System/Library/Fonts", "/Library/Fonts", "C:\\Windows\\Fonts"];
+    fn walk(p: &Path, depth: usize) -> bool {
+        let Ok(rd) = std::fs::read_dir(p) else { return false };
+        rd.flatten().any(|e| {
+            let path = e.path();
+            let name = e.file_name().to_string_lossy().to_lowercase();
+            if path.is_dir() {
+                depth < 4 && walk(&path, depth + 1)
+            } else {
+                ["cjk", "msgothic", "msmincho", "yugoth", "hiragino", "ipag", "ipam", "takao", "wqy", "droidsansfallback", "notosansjp", "notoserifjp"].iter().any(|k| name.contains(k))
+            }
+        })
+    }
+    dirs.iter().any(|d| walk(Path::new(d), 0))
+}
+
 #[test]
 fn rotated_and_vertical_text_boxes() {
     if !pdfium_available() {
         return;
     }
     let d = run("rotated.pdf", LayoutMode::Flow);
-    assert_eq!(d.document.matches("<wps:wsp>").count(), 3, "expected sidebar, watermark and vertical column");
-    assert!(d.document.contains(r#"vert="vert270""#), "90° sidebar should use vert270");
-    assert!(d.document.contains(r#"vert="eaVert""#), "Japanese column should be eaVert");
-    assert!(d.document.contains(r#"<a:xfrm rot="19800000">"#), "30° watermark rotation");
     let t = text(&d.document);
-    for s in ["Confidential sidebar label", "DRAFT", "縦書きの日本語"] {
+    // The Japanese column uses a non-embedded CID font: PDFium can only place
+    // its glyphs when a CJK font is installed (e.g. fonts-noto-cjk).
+    let cjk = !t.is_empty() && fonts_with_cjk();
+    if !cjk {
+        eprintln!("no CJK font installed: the vertical Japanese column is not checked");
+    }
+    assert_eq!(d.document.matches("<wps:wsp>").count(), if cjk { 3 } else { 2 }, "expected sidebar, watermark (and vertical column)");
+    assert!(d.document.contains(r#"vert="vert270""#), "90° sidebar should use vert270");
+    if cjk {
+        assert!(d.document.contains(r#"vert="eaVert""#), "Japanese column should be eaVert");
+        assert!(t.contains("縦書きの日本語"), "missing the Japanese column");
+    }
+    assert!(d.document.contains(r#"<a:xfrm rot="19800000">"#), "30° watermark rotation");
+    for s in ["Confidential sidebar label", "DRAFT"] {
         assert!(t.contains(s), "missing {s}");
     }
     // The body text stays ordinary horizontal text.
