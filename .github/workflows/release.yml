@@ -185,6 +185,8 @@ jobs:
             curl -fsSL -o "$APP/Contents/Resources/tessdata/$lang.traineddata" "$TESSDATA_URL/$lang.traineddata"
           done
           "$QT_ROOT_DIR/bin/macdeployqt" "$APP" -qmldir=crates/gui/qml -executable="$APP/Contents/MacOS/pdf2word"
+          # Homebrew libraries macdeployqt misses (@rpath between non-Qt libraries).
+          tools/macos-bundle-deps.sh "$APP"
       - name: Sign (Developer ID when configured, ad hoc otherwise)
         env:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
