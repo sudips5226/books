@@ -478,6 +478,7 @@ enum ItemKind {
     Image(usize),
     Table(usize),
     Rule(usize),
+    Equation(usize),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -613,7 +614,7 @@ impl Ctx<'_> {
         for &i in &order[1..] {
             let b = self.items[i].bbox;
             // Text needs a paragraph-sized gap; pictures, tables and rules separate on any clear gap.
-            let threshold = if end_text && is_text(i) { min_gap } else { 1.5 };
+            let threshold = if end_text && is_text(i) { min_gap } else { 0.5 };
             if b.y0 - end >= threshold {
                 groups.push(vec![i]);
                 end = b.y1;
@@ -708,6 +709,7 @@ impl Frame {
 struct Emitter<'a> {
     ctx: Ctx<'a>,
     tables: &'a [RuledTable],
+    equations: &'a [crate::math::DisplayEquation],
     floating: Vec<Picture>,
     detect_tables: bool,
 }
@@ -945,6 +947,69 @@ impl Emitter<'_> {
             prev_x1 = Some(seg.bbox.x1);
         }
         apply_letter_spacing(&mut out, raw);
+        self.inline_math(out, line)
+    }
+
+    /// Replaces runs of mathematics inside a text line by equation atoms.
+    fn inline_math(&self, atoms: Vec<Atom>, line: &Line) -> Vec<Atom> {
+        let raw = self.raw();
+        let is_math = |a: &Atom| matches!(a, Atom::Char { glyph, .. } if crate::math::inline_math_glyph(raw, &raw.glyphs[*glyph]));
+        if !atoms.iter().any(is_math) {
+            return atoms;
+        }
+        let is_neutral = |a: &Atom| {
+            matches!(a, Atom::Char { text, style, .. }
+                if style.vert != VertAlign::Baseline
+                    || text.chars().all(|c| c.is_ascii_digit() || "=+-()[]/|',^*<>!−".contains(c)))
+        };
+        let is_punct = |a: &Atom| matches!(a, Atom::Char { text, .. } if matches!(text.as_str(), "." | "," | ";" | ":"));
+        let mut out: Vec<Atom> = Vec::new();
+        let mut i = 0;
+        while i < atoms.len() {
+            if !is_math(&atoms[i]) {
+                out.push(atoms[i].clone());
+                i += 1;
+                continue;
+            }
+            // Neutral characters directly before the maths ("(", digits) belong to it.
+            let mut span: Vec<Atom> = Vec::new();
+            while out.last().is_some_and(|l| is_neutral(l) && !is_punct(l)) {
+                span.insert(0, out.pop().unwrap());
+            }
+            let mut j = i;
+            while j < atoms.len() {
+                let a = &atoms[j];
+                if is_math(a) || is_neutral(a) || is_punct(a) {
+                    span.push(a.clone());
+                    j += 1;
+                    continue;
+                }
+                if matches!(a, Atom::Space) {
+                    let next = atoms[j + 1..].iter().find(|x| !matches!(x, Atom::Space));
+                    if next.is_some_and(|x| is_math(x) || (is_neutral(x) && !is_punct(x))) {
+                        j += 1;
+                        continue;
+                    }
+                }
+                break;
+            }
+            let mut tail = Vec::new();
+            while span.last().is_some_and(is_punct) {
+                tail.insert(0, span.pop().unwrap());
+            }
+            let matoms: Vec<crate::math::MAtom> = span
+                .iter()
+                .filter_map(|a| match a {
+                    Atom::Char { glyph, .. } => Some(crate::math::atom_of(raw, &raw.glyphs[*glyph])),
+                    _ => None,
+                })
+                .collect();
+            let mut nodes = crate::math::parse(matoms, &[]);
+            crate::math::normalize_sizes(&mut nodes, line.size);
+            out.push(Atom::Math(nodes));
+            out.extend(tail);
+            i = j;
+        }
         out
     }
 
@@ -1258,10 +1323,36 @@ impl Emitter<'_> {
                             cursor.y = cursor.y.max(b.y0 - 1.0) + 1.0 + rule.width;
                             out.push(Block::Rule(rb));
                         }
+                        ItemKind::Equation(k) => {
+                            let p = self.equation_paragraph(k, frame);
+                            self.place_paragraph(p, cursor, out);
+                        }
                         ItemKind::Seg(_) => unreachable!(),
                     }
                 }
             }
+        }
+    }
+
+    /// A display equation as its own (centred or indented) paragraph.
+    fn equation_paragraph(&self, k: usize, frame: Frame) -> Paragraph {
+        let eq = &self.equations[k];
+        let b = eq.bbox;
+        let centred = (b.cx() - (frame.x0 + frame.x1) / 2.0).abs() < 0.08 * frame.width();
+        let mut nodes = eq.nodes.clone();
+        crate::math::normalize_sizes(&mut nodes, eq.size);
+        // One "line" as tall as the equation, so spacing and frames match its box.
+        let font_size = (b.height() / 1.2).max(eq.size);
+        Paragraph {
+            inlines: vec![Inline::Math(nodes)],
+            align: if centred { Align::Center } else { Align::Left },
+            indent_left: if centred { 0.0 } else { (b.x0 - frame.x0).max(0.0) },
+            line_pitch: None,
+            first_baseline: b.y0 + 1.2 * font_size - DESCENT * font_size,
+            n_lines: 1,
+            font_size,
+            bbox: b,
+            ..Default::default()
         }
     }
 
@@ -2074,6 +2165,8 @@ fn vertical_text_boxes(raw: &mut RawPage) -> Vec<TextBox> {
 /// Analyses one page.
 pub fn analyse_page(raw_in: &RawPage, opts: &LayoutOptions) -> PageLayout {
     let mut raw = raw_in.clone();
+    // Display equations were cut out during extraction (with their bars).
+    let equations = std::mem::take(&mut raw.equations);
     apply_decorations(&mut raw);
     let mut text_boxes = rotated_text_boxes(&raw);
     text_boxes.extend(vertical_text_boxes(&mut raw));
@@ -2141,6 +2234,9 @@ pub fn analyse_page(raw_in: &RawPage, opts: &LayoutOptions) -> PageLayout {
     for (i, t) in tables.iter().enumerate() {
         items.push(Item { kind: ItemKind::Table(i), bbox: t.bbox });
     }
+    for (i, e) in equations.iter().enumerate() {
+        items.push(Item { kind: ItemKind::Equation(i), bbox: e.bbox });
+    }
     for (i, r) in raw.rules.iter().enumerate() {
         if consumed_rules[i] || r.orientation != RuleOrientation::Horizontal || r.bbox.width() < 24.0 {
             continue;
@@ -2173,7 +2269,7 @@ pub fn analyse_page(raw_in: &RawPage, opts: &LayoutOptions) -> PageLayout {
 
     let ctx = Ctx { raw: &raw, segs: &segs, items: &items, body_size };
     let root = ctx.cut((0..items.len()).collect(), 0);
-    let mut em = Emitter { ctx, tables: &tables, floating: Vec::new(), detect_tables: opts.detect_tables };
+    let mut em = Emitter { ctx, tables: &tables, equations: &equations, floating: Vec::new(), detect_tables: opts.detect_tables };
     let mut cursor = Cursor { y: 0.0 };
     let mut blocks = Vec::new();
     em.emit(&root, frame, &mut cursor, &mut blocks);
@@ -2229,6 +2325,9 @@ pub fn detect_headings(pages: &mut [PageLayout]) {
 
     let mut heading_sizes: Vec<i32> = Vec::new();
     let is_candidate = |p: &Paragraph| -> bool {
+        if p.inlines.iter().any(|i| matches!(i, Inline::Math(_))) {
+            return false;
+        }
         let text = p.plain_text();
         let len = text.trim().chars().count();
         p.font_size >= body * 1.18 && p.n_lines <= 3 && len > 0 && len < 160 && text.chars().any(|c| c.is_alphabetic())

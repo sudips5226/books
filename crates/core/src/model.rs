@@ -308,6 +308,8 @@ pub struct RawPage {
     pub background: Option<Rgb>,
     /// Rotated glyphs with their counter-clockwise angle in degrees.
     pub rotated: Vec<(Glyph, f32)>,
+    /// Display equations found on the page (their glyphs are removed).
+    pub equations: Vec<crate::math::DisplayEquation>,
 }
 
 impl RawPage {

@@ -48,10 +48,13 @@ fn main() -> anyhow::Result<()> {
         println!("=== page {} ({}x{}) glyphs={} images={} rules={} boxes={} stats={:?}", i + 1, raw.width, raw.height, raw.glyphs.len(), raw.images.len(), raw.rules.len(), raw.boxes.len(), stats);
         if std::env::var("DUMP_GLYPHS").is_ok() {
             for g in &raw.glyphs {
-                println!("  {:?} [{:.1},{:.1},{:.1},{:.1}] base={:.1} size={} sp={}", g.ch, g.bbox.x0, g.bbox.y0, g.bbox.x1, g.bbox.y1, g.baseline, raw.styles[g.style].size, g.space_before);
+                println!("  {:?} [{:.1},{:.1},{:.1},{:.1}] base={:.1} size={} sp={} font={} math={}", g.ch, g.bbox.x0, g.bbox.y0, g.bbox.x1, g.bbox.y1, g.baseline, raw.styles[g.style].size, g.space_before, raw.styles[g.style].font, raw.styles[g.style].math);
             }
         }
         if std::env::var("DUMP_GLYPHS").is_ok() {
+            for r in &raw.rules {
+                println!("  rule [{:.1},{:.1},{:.1},{:.1}] {:?} w={:.2}", r.bbox.x0, r.bbox.y0, r.bbox.x1, r.bbox.y1, r.orientation, r.width);
+            }
             for (g, a) in &raw.rotated {
                 println!("  rot {:?} [{:.1},{:.1},{:.1},{:.1}] angle={a:.1} sp={}", g.ch, g.bbox.x0, g.bbox.y0, g.bbox.x1, g.bbox.y1, g.space_before);
             }

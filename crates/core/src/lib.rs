@@ -23,6 +23,7 @@ pub mod embed;
 pub mod extract;
 pub mod fonts;
 pub mod layout;
+pub mod math;
 pub mod metrics;
 pub mod model;
 pub mod ocr;
@@ -329,6 +330,7 @@ pub fn convert(
                     Ok(words) => {
                         let settings = engine.settings().clone();
                         ocr::words_to_glyphs(&mut raw, &words, &img, &settings);
+                        raw.equations.clear();
                         // Table rulings and underlines of a scan only exist as pixels.
                         let scanned = raw.rules.is_empty();
                         if scanned {

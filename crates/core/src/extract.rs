@@ -185,6 +185,9 @@ pub fn extract_page(
             }
             // PDFium reports end-of-line hyphenation hyphens as U+0002.
             let c = if c == '\u{2}' { '\u{AD}' } else { c };
+            let font_name = ch.font_name();
+            // TeX's extension font stores big operators at ASCII positions.
+            let c = if font_name.to_ascii_lowercase().contains("cmex") { crate::math::cmex_char(c) } else { c };
             if c == '\u{3}' {
                 continue;
             }
@@ -247,7 +250,6 @@ pub fn extract_page(
             let (color, alpha) = pdf_color(ch.fill_color()).unwrap_or((Rgb::BLACK, 255));
             let color = if is_invisible || alpha < 20 { Rgb::BLACK } else { color.snapped() };
 
-            let font_name = ch.font_name();
             let weight_bold = matches!(
                 ch.font_weight(),
                 Some(PdfFontWeight::Weight600)
@@ -273,6 +275,9 @@ pub fn extract_page(
                     } else {
                         info.family
                     };
+                    let math = crate::math::is_math_font(&font_name);
+                    // Maths fonts map to Word's maths font.
+                    let family = if math { "Cambria Math".to_string() } else { family };
                     let generic = match crate::fonts::generic_of(&family) {
                         Generic::Unknown if flags & 4 != 0 => Generic::Mono,
                         Generic::Unknown if flags & 8 != 0 => Generic::Serif,
@@ -281,6 +286,7 @@ pub fn extract_page(
                     };
                     let st = TextStyle {
                         generic,
+                        math,
                         font: family,
                         size: (size * 2.0).round() / 2.0,
                         bold: info.bold || flags & 1 != 0 || flags & 32 != 0,
@@ -336,12 +342,22 @@ pub fn extract_page(
 
     classify_paths(&mut raw, &paths, &mut graphic_hints, &page_rect);
 
+    // Equations before figure detection: fraction bars are not chart axes.
+    let (equations, complex_math) = crate::math::extract_display_equations(&mut raw);
+    raw.equations = equations;
+
+    let mut regions: Vec<(Rect, f32)> = Vec::new();
     if opts.rasterize_vector_graphics && (!graphic_hints.is_empty() || !raw.boxes.is_empty()) {
-        let regions = cluster_graphics(&raw, &graphic_hints);
-        if !regions.is_empty() {
-            if let Err(e) = rasterize_regions(page, &mut raw, &regions, opts) {
-                log::warn!("page {}: could not rasterise vector graphics: {e}", index + 1);
-            }
+        regions = cluster_graphics(&raw, &graphic_hints).into_iter().map(|r| (r, 1.5)).collect();
+    }
+    // Matrices and other structures the equation builder cannot express are kept
+    // as pictures (glyph boxes already include their full height: no padding).
+    if opts.extract_images {
+        regions.extend(complex_math.into_iter().map(|r| (r, 0.0)));
+    }
+    if !regions.is_empty() {
+        if let Err(e) = rasterize_regions(page, &mut raw, &regions, opts) {
+            log::warn!("page {}: could not rasterise vector graphics: {e}", index + 1);
         }
     }
 
@@ -720,7 +736,7 @@ fn text_runs(raw: &RawPage) -> Vec<(Rect, usize)> {
 }
 
 /// Renders figure regions to images, removing the glyphs/images/rules they cover.
-fn rasterize_regions(page: &PdfPage, raw: &mut RawPage, regions: &[Rect], opts: &ExtractOptions) -> anyhow::Result<()> {
+fn rasterize_regions(page: &PdfPage, raw: &mut RawPage, regions: &[(Rect, f32)], opts: &ExtractOptions) -> anyhow::Result<()> {
     let scale = opts.graphics_dpi / 72.0;
     let target_w = (raw.width * scale).round() as i32;
     let bitmap = page.render_with_config(
@@ -733,8 +749,8 @@ fn rasterize_regions(page: &PdfPage, raw: &mut RawPage, regions: &[Rect], opts: 
     let (pw, ph) = full.dimensions();
     let sx = pw as f32 / raw.width;
     let sy = ph as f32 / raw.height;
-    for r in regions {
-        let r = r.expand(1.5).intersection(&Rect::new(0.0, 0.0, raw.width, raw.height));
+    for (r, pad) in regions {
+        let r = r.expand(*pad).intersection(&Rect::new(0.0, 0.0, raw.width, raw.height));
         let x = (r.x0 * sx).floor().max(0.0) as u32;
         let y = (r.y0 * sy).floor().max(0.0) as u32;
         let w = ((r.width() * sx).ceil() as u32).min(pw.saturating_sub(x));
