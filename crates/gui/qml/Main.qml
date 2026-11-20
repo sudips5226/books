@@ -19,6 +19,7 @@ ApplicationWindow {
     readonly property color subtle: dark ? "#9aa4b2" : "#5f6b7a"
     readonly property var queue: JSON.parse(conv.queueJson)
     readonly property var structure: JSON.parse(conv.structureJson)
+    readonly property var textItems: JSON.parse(conv.textItemsJson)
 
     // Colours of the structure overlay.
     readonly property var kindColors: ({
@@ -66,6 +67,127 @@ ApplicationWindow {
         id: folderDialog
         title: "Folder for the Word documents"
         onAccepted: conv.setOutputFolderUrl(selectedFolder)
+    }
+
+    FileDialog {
+        id: savePdfDialog
+        title: "Save the edited PDF as"
+        fileMode: FileDialog.SaveFile
+        defaultSuffix: "pdf"
+        nameFilters: ["PDF documents (*.pdf)"]
+        onAccepted: conv.saveEditedPdf(selectedFile)
+    }
+
+    // Change or delete a run of text.
+    Dialog {
+        id: editDialog
+        property int itemIndex: -1
+        property var item: ({})
+        title: "Edit text"
+        modal: true
+        anchors.centerIn: parent
+        width: Math.min(window.width - 80, 640)
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        onOpened: { editField.forceActiveFocus(); editField.selectAll() }
+        onAccepted: conv.replaceText(itemIndex, editField.text, fitBox.checked)
+
+        ColumnLayout {
+            anchors.fill: parent
+            spacing: 8
+            Label {
+                text: (editDialog.item.font || "") + " · " + (editDialog.item.size || 0) + " pt"
+                      + (editDialog.item.bold ? " · bold" : "") + (editDialog.item.italic ? " · italic" : "")
+                      + (editDialog.item.invisible ? " · invisible (OCR text layer)" : "")
+                color: window.subtle
+            }
+            TextField {
+                id: editField
+                Layout.fillWidth: true
+                onAccepted: editDialog.accept()
+            }
+            CheckBox {
+                id: fitBox
+                text: "Keep within the original width (condense longer text)"
+                checked: true
+            }
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                font.pointSize: 9
+                color: window.subtle
+                text: "The text keeps its font when the PDF contains the needed letters; otherwise the changed letters use a similar installed font."
+            }
+            Button {
+                text: "Delete this text"
+                onClicked: { conv.deleteText(editDialog.itemIndex); editDialog.close() }
+            }
+        }
+    }
+
+    // Add new text where the page was clicked.
+    Dialog {
+        id: insertDialog
+        property real px: 0
+        property real py: 0
+        title: "Add text"
+        modal: true
+        anchors.centerIn: parent
+        width: Math.min(window.width - 80, 560)
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        onOpened: { insertField.text = ""; insertField.forceActiveFocus() }
+        onAccepted: conv.insertText(px, py, insertField.text, insertSize.value,
+                                     insertFamily.currentIndex + (insertBold.checked ? 4 : 0) + (insertItalic.checked ? 8 : 0))
+
+        ColumnLayout {
+            anchors.fill: parent
+            spacing: 8
+            TextField {
+                id: insertField
+                Layout.fillWidth: true
+                placeholderText: "New text"
+                onAccepted: insertDialog.accept()
+            }
+            RowLayout {
+                spacing: 8
+                ComboBox {
+                    id: insertFamily
+                    model: ["Sans-serif", "Serif", "Monospace"]
+                }
+                SpinBox {
+                    id: insertSize
+                    from: 4
+                    to: 96
+                    value: 11
+                    editable: true
+                }
+                Label { text: "pt" }
+                CheckBox { id: insertBold; text: "Bold" }
+                CheckBox { id: insertItalic; text: "Italic" }
+            }
+        }
+    }
+
+    // Replace text throughout the document.
+    Dialog {
+        id: findDialog
+        title: "Find and replace in the PDF"
+        modal: true
+        anchors.centerIn: parent
+        width: Math.min(window.width - 80, 560)
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        onOpened: findField.forceActiveFocus()
+        onAccepted: conv.findReplace(findField.text, replaceField.text)
+
+        GridLayout {
+            anchors.fill: parent
+            columns: 2
+            columnSpacing: 8
+            rowSpacing: 8
+            Label { text: "Find" }
+            TextField { id: findField; Layout.fillWidth: true }
+            Label { text: "Replace with" }
+            TextField { id: replaceField; Layout.fillWidth: true; onAccepted: findDialog.accept() }
+        }
     }
 
     function statusText(s) {
@@ -139,7 +261,7 @@ ApplicationWindow {
                     // Detected structure over the page.
                     Item {
                         id: overlay
-                        visible: conv.showStructure && preview.status === Image.Ready
+                        visible: conv.showStructure && !conv.editMode && preview.status === Image.Ready
                         x: preview.x + (preview.width - preview.paintedWidth) / 2
                         y: preview.y + (preview.height - preview.paintedHeight) / 2
                         width: preview.paintedWidth
@@ -170,6 +292,67 @@ ApplicationWindow {
                                 ToolTip.delay: 300
                             }
                         }
+                    }
+
+                    // Text runs that can be edited.
+                    Item {
+                        id: editOverlay
+                        visible: conv.editMode && preview.status === Image.Ready
+                        x: preview.x + (preview.width - preview.paintedWidth) / 2
+                        y: preview.y + (preview.height - preview.paintedHeight) / 2
+                        width: preview.paintedWidth
+                        height: preview.paintedHeight
+                        enabled: !conv.editBusy && !conv.busy
+
+                        // A click on empty space adds text there.
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.IBeamCursor
+                            onClicked: (mouse) => {
+                                insertDialog.px = mouse.x / width
+                                insertDialog.py = mouse.y / height
+                                insertDialog.open()
+                            }
+                        }
+
+                        Repeater {
+                            model: window.textItems
+                            delegate: Rectangle {
+                                required property var modelData
+                                x: modelData.x * editOverlay.width - 2
+                                y: modelData.y * editOverlay.height - 2
+                                width: Math.max(4, modelData.w * editOverlay.width + 4)
+                                height: Math.max(4, modelData.h * editOverlay.height + 4)
+                                radius: 2
+                                color: textHover.containsMouse ? Qt.rgba(0.17, 0.34, 0.6, 0.18) : Qt.rgba(0.17, 0.34, 0.6, 0.05)
+                                border.color: textHover.containsMouse ? window.accent : Qt.rgba(0.17, 0.34, 0.6, 0.35)
+                                border.width: textHover.containsMouse ? 2 : 1
+
+                                MouseArea {
+                                    id: textHover
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: {
+                                        editDialog.itemIndex = modelData.i
+                                        editDialog.item = modelData
+                                        editField.text = modelData.text
+                                        editDialog.open()
+                                    }
+                                }
+                                ToolTip.visible: textHover.containsMouse
+                                ToolTip.text: modelData.font + " · " + modelData.size + " pt — click to edit"
+                                ToolTip.delay: 400
+                            }
+                        }
+                    }
+
+                    BusyIndicator {
+                        anchors.right: parent.right
+                        anchors.top: parent.top
+                        anchors.margins: 8
+                        running: conv.editBusy
+                        visible: running
                     }
 
                     Column {
@@ -222,11 +405,41 @@ ApplicationWindow {
                     }
                 }
 
+                // Editing tools.
+                RowLayout {
+                    Layout.fillWidth: true
+                    visible: conv.editMode && conv.pageCount > 0
+                    spacing: 6
+                    Label {
+                        Layout.fillWidth: true
+                        elide: Text.ElideRight
+                        color: window.subtle
+                        text: conv.editCount > 0
+                              ? conv.editCount + (conv.editCount === 1 ? " change" : " changes") + " — converting uses the edited PDF"
+                              : "Click a line to change it, or empty space to add text"
+                    }
+                    Button {
+                        text: "Find and replace…"
+                        enabled: !conv.editBusy && !conv.busy
+                        onClicked: findDialog.open()
+                    }
+                    Button {
+                        text: "Undo"
+                        enabled: conv.editCount > 0 && !conv.editBusy && !conv.busy
+                        onClicked: conv.undoEdit()
+                    }
+                    Button {
+                        text: "Save PDF…"
+                        enabled: conv.editCount > 0 && !conv.editBusy
+                        onClicked: savePdfDialog.open()
+                    }
+                }
+
                 // Legend of the overlay.
                 Flow {
                     Layout.fillWidth: true
                     spacing: 10
-                    visible: conv.showStructure && conv.pageCount > 0
+                    visible: conv.showStructure && !conv.editMode && conv.pageCount > 0
                     Repeater {
                         model: window.kindNames
                         delegate: Row {
@@ -255,8 +468,14 @@ ApplicationWindow {
                     CheckBox {
                         text: "Show detected structure"
                         checked: conv.showStructure
-                        enabled: conv.pageCount > 0
+                        enabled: conv.pageCount > 0 && !conv.editMode
                         onToggled: conv.setStructureVisible(checked)
+                    }
+                    CheckBox {
+                        text: "Edit text"
+                        checked: conv.editMode
+                        enabled: conv.pageCount > 0
+                        onToggled: conv.enableEditing(checked)
                     }
                     Item { Layout.fillWidth: true }
                     RowLayout {
@@ -334,6 +553,12 @@ ApplicationWindow {
                                             text: row.modelData.name
                                             elide: Text.ElideMiddle
                                             Layout.fillWidth: true
+                                        }
+                                        Label {
+                                            visible: row.modelData.edits > 0
+                                            text: "✎ " + row.modelData.edits
+                                            color: row.highlighted ? row.palette.highlightedText : window.accent
+                                            font.pointSize: 9
                                         }
                                         Label {
                                             text: window.statusText(row.modelData.status)
@@ -708,9 +933,32 @@ ApplicationWindow {
             Qt.quit()
         })
     }
+    // PDF2WORD_EDIT_DEMO="text": turns on editing and replaces the first text run.
+    Timer {
+        running: conv.editDemo.length > 0
+        interval: 2500
+        onTriggered: conv.enableEditing(true)
+    }
+    Timer {
+        running: conv.editDemo.length > 0
+        interval: 4000
+        onTriggered: conv.replaceText(0, conv.editDemo, true)
+    }
+    Timer {
+        running: conv.editDemo.length > 0
+        interval: 7500
+        onTriggered: {
+            if (window.textItems.length > 1) {
+                editDialog.itemIndex = 1
+                editDialog.item = window.textItems[1]
+                editField.text = window.textItems[1].text
+                editDialog.open()
+            }
+        }
+    }
     Timer {
         running: conv.screenshotPath.length > 0
-        interval: 6000
+        interval: conv.editDemo.length > 0 ? 9000 : 6000
         onTriggered: conv.autoConvert ? conv.convert() : window.screenshot()
     }
     Connections {

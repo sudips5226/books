@@ -8,6 +8,9 @@ layout and formatting of the original, including scanned pages through OCR.
 * **PDFium** (via [`pdfium-render`](https://crates.io/crates/pdfium-render)) parses and renders PDFs.
 * **Tesseract** OCR for scanned pages, linked through its stable C API.
 * A purpose-built WordprocessingML writer: no Office, LibreOffice or other runtime needed.
+* **Text editing in the PDF itself**: correct a word, delete or add text, or
+  find and replace throughout the document, then save the corrected PDF (or
+  convert it to Word).
 
 ## What is preserved
 
@@ -64,12 +67,13 @@ Three layout modes:
                                                           reflow.rs (continuous) ───▶ docx.rs ──▶ .docx
 ```
 
-* `crates/core`: the library (`convert()`, `inspect()`, `render_page_png()`, `page_structure()`, progress events, cancellation).
+* `crates/core`: the library (`convert()`, `inspect()`, `render_page_png()`, `page_structure()`, progress events, cancellation;
+  `edit::text_items()`, `edit::apply_edits()`, `edit::find_replace()` for editing PDFs).
   Modules: `extract` (PDFium), `annots` (outline, link targets, annotations, form fields),
   `ocr` and `scan` (Tesseract, straightening, language), `layout` (reconstruction, bidi, text boxes, tables),
   `structure` (headers/footers, lists, footnotes, styles), `navigate` (outline, links, TOC, comments, controls),
   `reflow` (continuous mode), `math` (equations → OMML), `metrics` (font widths, compensation),
-  `embed` (font embedding), `docx` (writer)
+  `embed` (font embedding), `docx` (writer), `edit` (PDF text editing)
 * `crates/cli`: `pdf2word` command-line front-end
 * `crates/gui`: Qt Quick application (`src/converter.rs` QObject bridge + `qml/Main.qml`)
 * `tools/`: `fetch-pdfium.sh` (prebuilt PDFium download), `make_test_pdfs.py` and `math-fixture.tex`
@@ -182,6 +186,34 @@ Choose the layout mode and the content, structure and OCR options; they are
 remembered for the next start. Conversions run in the background and can be
 cancelled.
 
+**Edit text** outlines the page's lines of text: click one to change or
+delete it, or click empty space to add text (font family, size, bold,
+italic). **Find and replace…** changes a word everywhere in the document,
+**Undo** takes edits back one by one and **Save PDF…** writes the corrected
+PDF. A file with edits shows ✎ in the list, and converting it uses the
+edited version.
+
+### Editing the text of a PDF
+
+Only the edited text changes: the page's content stream is rewritten at the
+operators that draw that text, so every other line keeps its exact
+position, kerning and font. For a change inside a line, the unchanged
+start and end of the line are kept as they were too.
+
+* New text keeps the **original font** when the PDF is known to contain the
+  needed letters. PDFs usually embed only the letters they use, so this is
+  learned from the characters the font draws anywhere in the document; fonts
+  that are not embedded can show any letter of their encoding.
+* Letters the font lacks are set in a **similar installed font** (the same
+  family if installed, then a metric-compatible clone such as Liberation
+  Sans for Arial, then a generic serif/sans/monospace font, then any font
+  with the letters), which is embedded into the PDF. The app says when this
+  happens.
+* **Keep within the original width** condenses longer text (down to half
+  its width) so it does not run into what follows. Otherwise text after the
+  edit on the same line moves along, as in a word processor.
+* Text in OCR text layers (invisible text) can be corrected the same way.
+
 ### Command line
 
 ```sh
@@ -191,6 +223,8 @@ pdf2word book.pdf -m continuous             # one flowing document, Word columns
 pdf2word scan.pdf --ocr always -l eng+deu   # force OCR, several languages
 pdf2word a.pdf b.pdf c.pdf -o converted/    # batch
 pdf2word big.pdf -p 1-5,10-                 # page selection
+pdf2word in.pdf --replace "2023=2024" --replace "Acme=Acme Ltd" -o fixed.pdf
+                                            # correct the PDF's text (no conversion)
 ```
 
 Run `pdf2word --help` for all options. Content: `--no-images`, `--no-figures`,
@@ -200,7 +234,8 @@ Run `pdf2word --help` for all options. Content: `--no-images`, `--no-figures`,
 `--ocr auto|always|never`, `-l/--lang` (`auto` by default: detected from the
 document among the installed languages), `--ocr-dpi`, `--ocr-font`,
 `--tessdata`, `--no-straighten`, `--no-picture-text`, `--threads`. Also
-`--password` and `--pdfium`.
+`--password` and `--pdfium`. With `--replace OLD=NEW` (repeatable) the PDF's
+text is corrected and a PDF is written instead (default `<input>-edited.pdf`).
 
 ### Library
 
@@ -293,3 +328,10 @@ The CI runs it on every push and reports drops against `eval/baseline.json`
   Very short words inherit bold or italic from their line. Automatic language
   detection chooses among the installed languages only.
 * **Right-to-left** lists are kept as plain text, without hanging indents.
+* **PDF text editing** works on whole lines (runs of the same font), not on
+  paragraphs: text does not re-wrap to the next line. Hebrew, Arabic and other
+  right-to-left text cannot be edited yet (it would need reordering and
+  shaping), nor text inside form XObjects (some PDFs draw whole pages that
+  way) or vertical text. Replacement letters missing from an embedded font
+  subset come from an installed font, so they can look different. Saving
+  rewrites the file, which invalidates digital signatures.

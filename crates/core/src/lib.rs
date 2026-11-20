@@ -20,6 +20,7 @@
 
 pub mod annots;
 pub mod docx;
+pub mod edit;
 pub mod embed;
 pub mod extract;
 pub mod fonts;

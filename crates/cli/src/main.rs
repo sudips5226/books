@@ -118,6 +118,12 @@ struct Args {
     #[arg(long)]
     threads: Option<usize>,
 
+    /// Correct text in the PDF itself instead of converting it: replaces every
+    /// occurrence of OLD with NEW (repeatable) and writes the corrected PDF to
+    /// --output (default: `<input>-edited.pdf`).
+    #[arg(long = "replace", value_name = "OLD=NEW")]
+    replace: Vec<String>,
+
     /// Path to the PDFium shared library (file or directory).
     #[arg(long)]
     pdfium: Option<PathBuf>,
@@ -125,6 +131,43 @@ struct Args {
     /// Only print warnings and errors.
     #[arg(short, long)]
     quiet: bool,
+}
+
+/// `--replace`: corrects text in the PDF and writes a new PDF.
+fn replace_text(args: &Args) -> anyhow::Result<()> {
+    let [input] = args.inputs.as_slice() else { bail!("--replace works on one PDF at a time") };
+    let output = args.output.clone().unwrap_or_else(|| {
+        let stem = input.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "document".into());
+        input.with_file_name(format!("{stem}-edited.pdf"))
+    });
+    if output.extension().is_none_or(|e| !e.eq_ignore_ascii_case("pdf")) {
+        bail!("with --replace the output is a PDF file: {}", output.display());
+    }
+    let tmp = std::env::temp_dir().join(format!("pdf2word-edit-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp)?;
+    let mut current = input.clone();
+    let mut total = 0;
+    for (i, pair) in args.replace.iter().enumerate() {
+        let Some((old, new)) = pair.split_once('=') else { bail!("--replace expects OLD=NEW, got '{pair}'") };
+        let next = tmp.join(format!("step{i}.pdf"));
+        let (n, report) = pdf2word_core::edit::find_replace(&current, args.password.as_deref(), old, new, &next, args.pdfium.as_deref())?;
+        for note in report.notes {
+            log::warn!("{note}");
+        }
+        if !args.quiet {
+            log::info!("'{old}' → '{new}': {n} text run(s) changed");
+        }
+        total += n;
+        if n > 0 {
+            current = next;
+        }
+    }
+    std::fs::copy(&current, &output).with_context(|| format!("cannot write {}", output.display()))?;
+    let _ = std::fs::remove_dir_all(&tmp);
+    if !args.quiet {
+        log::info!("wrote {} ({total} change(s))", output.display());
+    }
+    Ok(())
 }
 
 fn main() {
@@ -141,6 +184,9 @@ fn main() {
 }
 
 fn run(args: Args) -> anyhow::Result<()> {
+    if !args.replace.is_empty() {
+        return replace_text(&args);
+    }
     let mut opts = ConvertOptions {
         layout_mode: args.mode,
         ocr_mode: args.ocr,

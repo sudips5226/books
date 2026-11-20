@@ -112,6 +112,23 @@ impl FontData {
         v
     }
 
+    /// Index of the face inside a font collection (0 for single fonts).
+    pub fn face_index(&self) -> u32 {
+        self.index
+    }
+
+    /// The parsed face.
+    pub fn face(&self) -> Option<ttf_parser::Face<'_>> {
+        ttf_parser::Face::parse(&self.bytes, self.index).ok()
+    }
+
+    /// TrueType outlines whose licence allows embedding into a document.
+    pub fn embeddable(&self) -> bool {
+        self.face().is_some_and(|f| {
+            f.tables().glyf.is_some() && !matches!(f.permissions(), Some(ttf_parser::Permissions::Restricted))
+        })
+    }
+
     /// True if every character of `text` (except spaces) has a glyph.
     pub fn covers(&self, text: &str) -> bool {
         let Ok(f) = ttf_parser::Face::parse(&self.bytes, self.index) else { return false };
@@ -181,6 +198,18 @@ impl FontLibrary {
             }
         }
         None
+    }
+
+    /// Advance of `c` in em with the font known for `family` (built-in
+    /// tables for the core families, then installed fonts).
+    pub fn advance(&self, family: &str, bold: bool, italic: bool, c: char) -> Option<f32> {
+        match self.resolve(family, bold, italic)? {
+            Resolved::Table(i) => {
+                let f = &builtin_faces()[i];
+                Some(*f.widths.get(&(c as u32)).unwrap_or(&f.default) as f32 / f.upem)
+            }
+            Resolved::Data(d) => d.advance(c),
+        }
     }
 
     /// The family whose metrics Word will effectively use for `style`.
@@ -313,6 +342,19 @@ pub fn face_families(face: &ttf_parser::Face) -> Vec<String> {
         }
     }
     v
+}
+
+/// Installed family names (lower case).
+pub fn installed_families() -> Vec<String> {
+    let mut v: Vec<String> = system_index().keys().map(|k| k.0.clone()).collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// The installed font of `family` closest to the requested style.
+pub fn installed_font(family: &str, bold: bool, italic: bool) -> Option<Arc<FontData>> {
+    system_font(family, bold, italic)
 }
 
 fn system_font(family: &str, bold: bool, italic: bool) -> Option<Arc<FontData>> {

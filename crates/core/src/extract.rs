@@ -135,6 +135,17 @@ impl PageTransform {
         }
     }
 
+    /// Inverse of [`PageTransform::point`]: PDF user space from this transform's coordinates.
+    pub fn to_user(&self, x: f32, y: f32) -> (f32, f32) {
+        let (ux, uy) = match self.rot {
+            1 => (y, x),
+            2 => (self.w0 - x, y),
+            3 => (self.w0 - y, self.h0 - x),
+            _ => (x, self.h0 - y),
+        };
+        (ux + self.ox, uy + self.oy)
+    }
+
     pub fn rect(&self, r: &PdfRect) -> Rect {
         let (ax, ay) = self.point(r.left().value, r.bottom().value);
         let (bx, by) = self.point(r.right().value, r.top().value);
