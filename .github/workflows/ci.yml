@@ -36,3 +36,38 @@ jobs:
         env:
           QMAKE: /usr/bin/qmake6
         run: cargo build -p pdf2word-gui --release
+
+  # Conversion quality on real PDFs (see tools/eval.py): converts the corpus,
+  # renders the DOCX files with LibreOffice and compares with eval/baseline.json.
+  # Informational: LibreOffice versions differ between machines, so a drop is
+  # reported (and the report uploaded) without failing the build.
+  quality:
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Tesseract, LibreOffice and Poppler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libtesseract-dev libleptonica-dev tesseract-ocr-eng \
+            libreoffice-writer libreoffice-math poppler-utils python3-pil fonts-liberation fonts-crosextra-carlito fonts-crosextra-caladea
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch PDFium and the corpus
+        run: |
+          tools/fetch-pdfium.sh "$PWD/pdfium"
+          python3 tools/eval.py fetch
+      - name: Build
+        run: cargo build --release -p pdf2word
+      - name: Evaluate
+        env:
+          PDFIUM_DYNAMIC_LIB_PATH: ${{ github.workspace }}/pdfium
+        run: python3 -W ignore tools/eval.py run --bin target/release/pdf2word
+      - name: Compare with the baseline
+        run: python3 tools/eval.py compare eval/report/results.json eval/baseline.json --tolerance 0.05
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: quality-report
+          path: eval/report

@@ -770,6 +770,93 @@ pub fn inspect(input: &Path, password: Option<&str>, pdfium_path: Option<&Path>)
 }
 
 /// Renders a page to a PNG file (for previews). `page` is 0-based.
+/// A detected element of a page, for showing the structure over a preview.
+#[derive(Clone, Debug)]
+pub struct StructureBox {
+    /// "heading", "paragraph", "list", "table", "column", "picture", "figure", "equation", "rule", "textbox", "comment", "field".
+    pub kind: &'static str,
+    /// Position as fractions of the page width and height (0..1).
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    /// Short description (heading level, table size …).
+    pub label: String,
+}
+
+/// The structure the converter finds on one page (without OCR), for previews.
+pub fn page_structure(input: &Path, password: Option<&str>, page: usize, pdfium_path: Option<&Path>) -> anyhow::Result<Vec<StructureBox>> {
+    let pdfium = load_pdfium(pdfium_path)?;
+    let document = pdfium.load_pdf_from_file(input, password).map_err(|e| anyhow!("could not open {}: {e}", input.display()))?;
+    let p = document.pages().get(page as PdfPageIndex)?;
+    let opts = ConvertOptions::default();
+    let (raw, _) = extract::extract_page(&document, &p, page, &opts.extract)?;
+    let mut layouts = vec![layout::analyse_page(&raw, &opts.layout)];
+    layout::detect_headings(&mut layouts);
+    structure::detect_lists(&mut layouts);
+    let l = &layouts[0];
+    let (pw, ph) = (l.width.max(1.0), l.height.max(1.0));
+    let mut out = Vec::new();
+    let mut push = |kind: &'static str, r: model::Rect, label: String| {
+        if r.width() > 0.0 && r.height() > 0.0 {
+            out.push(StructureBox { kind, x: r.x0 / pw, y: r.y0 / ph, w: r.width() / pw, h: r.height() / ph, label });
+        }
+    };
+    fn walk(blocks: &[model::Block], push: &mut dyn FnMut(&'static str, model::Rect, String)) {
+        for b in blocks {
+            match b {
+                model::Block::Paragraph(p) => {
+                    let math = p.inlines.iter().any(|i| matches!(i, model::Inline::Math(_))) && p.plain_text().trim().len() < 3;
+                    let (kind, label) = match (p.heading, p.list, math) {
+                        (Some(h), _, _) => ("heading", format!("Heading {h}")),
+                        (_, Some(l), _) => ("list", format!("List item (level {})", l.level + 1)),
+                        (_, _, true) => ("equation", "Equation".to_string()),
+                        _ => ("paragraph", format!("Paragraph, {} line{}", p.n_lines, if p.n_lines == 1 { "" } else { "s" })),
+                    };
+                    push(kind, p.bbox, label);
+                }
+                model::Block::Table(t) if t.layout_only => {
+                    for r in &t.rows {
+                        for c in &r.cells {
+                            if let Some(bb) = blocks_bbox(&c.blocks) {
+                                push("column", bb, "Column".into());
+                            }
+                            walk(&c.blocks, push);
+                        }
+                    }
+                }
+                model::Block::Table(t) => push("table", t.bbox, format!("Table, {} × {}", t.rows.len(), t.col_widths.len())),
+                model::Block::Picture(pic) => push(if pic.vector.is_some() { "figure" } else { "picture" }, pic.bbox, if pic.vector.is_some() { "Figure (editable shapes)".into() } else { "Picture".into() }),
+                model::Block::Rule(r) => push("rule", r.bbox.expand(1.0), "Rule".into()),
+            }
+        }
+    }
+    fn blocks_bbox(blocks: &[model::Block]) -> Option<model::Rect> {
+        let rects: Vec<model::Rect> = blocks
+            .iter()
+            .map(|b| match b {
+                model::Block::Paragraph(p) => p.bbox,
+                model::Block::Table(t) => t.bbox,
+                model::Block::Picture(p) => p.bbox,
+                model::Block::Rule(r) => r.bbox,
+            })
+            .collect();
+        model::Rect::union_all(rects.iter())
+    }
+    walk(&l.blocks, &mut push);
+    for f in &l.floating {
+        push("picture", f.bbox, if f.overlay { "Annotation".into() } else { "Floating picture".into() });
+    }
+    for tb in &l.text_boxes {
+        let (w, h) = if (tb.rotation.rem_euclid(180.0) - 90.0).abs() < 2.0 { (tb.height, tb.width) } else { (tb.width, tb.height) };
+        push("textbox", model::Rect::new(tb.cx - w / 2.0, tb.cy - h / 2.0, tb.cx + w / 2.0, tb.cy + h / 2.0), "Text box".into());
+    }
+    for c in &raw.comments {
+        push("comment", c.bbox, format!("Comment: {}", c.text.chars().take(60).collect::<String>()));
+    }
+    Ok(out)
+}
+
 pub fn render_page_png(
     input: &Path,
     password: Option<&str>,

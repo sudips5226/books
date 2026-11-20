@@ -6,12 +6,17 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # OCR languages shipped with every package (tessdata_fast); `--lang auto` chooses among them.
+  TESSDATA_LANGS: eng deu fra spa ita por nld
+  TESSDATA_URL: https://github.com/tesseract-ocr/tessdata_fast/raw/main
 
 jobs:
   windows:
     runs-on: windows-2022
     env:
       VCPKG_TRIPLET: x64-windows-release
+      # Code signing runs only when the certificate secrets are configured.
+      HAS_SIGNING_CERT: ${{ secrets.WINDOWS_CERTIFICATE != '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -57,9 +62,26 @@ jobs:
           Copy-Item "$env:VCPKG_BIN\*.dll" $dist
           bash tools/fetch-pdfium.sh "$dist" win-x64
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          Invoke-WebRequest https://github.com/tesseract-ocr/tessdata_fast/raw/main/eng.traineddata -OutFile "$dist\tessdata\eng.traineddata"
-          Invoke-WebRequest https://github.com/tesseract-ocr/tessdata_fast/raw/main/osd.traineddata -OutFile "$dist\tessdata\osd.traineddata"
+          foreach ($lang in $env:TESSDATA_LANGS.Split(' ')) {
+            Invoke-WebRequest "$env:TESSDATA_URL/$lang.traineddata" -OutFile "$dist\tessdata\$lang.traineddata"
+          }
           Copy-Item packaging\windows\README.txt $dist
+      - name: Sign the programs (when a certificate is configured)
+        if: env.HAS_SIGNING_CERT == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          # WINDOWS_CERTIFICATE: base64 of a code-signing .pfx; WINDOWS_CERTIFICATE_PASSWORD: its password.
+          $pfx = "$env:RUNNER_TEMP\cert.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+            Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
+          "SIGNTOOL=$($signtool.FullName)" | Out-File -Append $env:GITHUB_ENV
+          $dist = "dist\pdf2word-windows-x64"
+          & $signtool.FullName sign /f $pfx /p $env:WINDOWS_CERTIFICATE_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 "$dist\pdf2word.exe" "$dist\pdf2word-gui.exe"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
       - name: Installer (Inno Setup)
         shell: pwsh
         run: |
@@ -69,6 +91,16 @@ jobs:
           if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
           & $iscc "/DSourceDir=$PWD\dist\pdf2word-windows-x64" "/DAppVersion=$ver" packaging\windows\installer.iss
           if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Sign the installer (when a certificate is configured)
+        if: env.HAS_SIGNING_CERT == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $setup = Get-ChildItem dist -Filter "pdf2word-setup-*.exe" | Select-Object -First 1
+          & $env:SIGNTOOL sign /f "$env:RUNNER_TEMP\cert.pfx" /p $env:WINDOWS_CERTIFICATE_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $setup.FullName
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Remove-Item "$env:RUNNER_TEMP\cert.pfx"
       - name: Smoke test (portable CLI, text and OCR)
         shell: pwsh
         run: |
@@ -109,7 +141,21 @@ jobs:
           if-no-files-found: error
 
   macos:
-    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+            pdfium: mac-arm64
+          - runner: macos-15-intel
+            arch: x86_64
+            pdfium: mac-x64
+    runs-on: ${{ matrix.runner }}
+    env:
+      # Developer ID signing and notarisation run only when their secrets are configured.
+      HAS_SIGNING_CERT: ${{ secrets.MACOS_CERTIFICATE != '' }}
+      HAS_NOTARY: ${{ secrets.APPLE_ID != '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -126,7 +172,7 @@ jobs:
         run: brew install tesseract pkgconf
       - name: Build
         run: QMAKE="$QT_ROOT_DIR/bin/qmake" cargo build --release -p pdf2word -p pdf2word-gui
-      - name: Bundle (.app and .dmg)
+      - name: Bundle (.app)
         run: |
           set -euo pipefail
           APP="dist/PDF to Word.app"
@@ -134,13 +180,56 @@ jobs:
           cp target/release/pdf2word-gui target/release/pdf2word "$APP/Contents/MacOS/"
           cp packaging/macos/Info.plist "$APP/Contents/"
           cp packaging/icons/pdf2word.icns "$APP/Contents/Resources/"
-          tools/fetch-pdfium.sh "$APP/Contents/Frameworks" mac-arm64
-          curl -fsSL -o "$APP/Contents/Resources/tessdata/eng.traineddata" https://github.com/tesseract-ocr/tessdata_fast/raw/main/eng.traineddata
+          tools/fetch-pdfium.sh "$APP/Contents/Frameworks" ${{ matrix.pdfium }}
+          for lang in $TESSDATA_LANGS; do
+            curl -fsSL -o "$APP/Contents/Resources/tessdata/$lang.traineddata" "$TESSDATA_URL/$lang.traineddata"
+          done
           "$QT_ROOT_DIR/bin/macdeployqt" "$APP" -qmldir=crates/gui/qml -executable="$APP/Contents/MacOS/pdf2word"
-          # Ad-hoc signature (required for Apple Silicon binaries to run at all).
-          codesign --force --deep --sign - "$APP"
+      - name: Sign (Developer ID when configured, ad hoc otherwise)
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          APP="dist/PDF to Word.app"
+          if [ "$HAS_SIGNING_CERT" = "true" ]; then
+            # MACOS_CERTIFICATE: base64 of a Developer ID Application .p12; MACOS_SIGNING_IDENTITY:
+            # e.g. "Developer ID Application: Name (TEAMID)".
+            KC="$RUNNER_TEMP/signing.keychain-db"
+            security create-keychain -p "$RUNNER_TEMP" "$KC"
+            security set-keychain-settings -lut 21600 "$KC"
+            security unlock-keychain -p "$RUNNER_TEMP" "$KC"
+            echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+            security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+            rm "$RUNNER_TEMP/cert.p12"
+            security set-key-partition-list -S apple-tool:,apple: -s -k "$RUNNER_TEMP" "$KC" > /dev/null
+            security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+            codesign --force --deep --options runtime --timestamp --sign "$MACOS_SIGNING_IDENTITY" "$APP"
+            codesign --verify --deep --strict "$APP"
+          else
+            # Ad-hoc signature (required for Apple Silicon binaries to run at all).
+            codesign --force --deep --sign - "$APP"
+          fi
+      - name: Disk image
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
           ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          hdiutil create -volname "PDF to Word" -srcfolder "$APP" -ov -format UDZO "dist/pdf2word-$ver-macos-arm64.dmg"
+          DMG="dist/pdf2word-$ver-macos-${{ matrix.arch }}.dmg"
+          hdiutil create -volname "PDF to Word" -srcfolder "dist/PDF to Word.app" -ov -format UDZO "$DMG"
+          if [ "$HAS_SIGNING_CERT" = "true" ]; then
+            codesign --sign "$MACOS_SIGNING_IDENTITY" --timestamp "$DMG"
+            if [ "$HAS_NOTARY" = "true" ]; then
+              # APPLE_APP_PASSWORD: an app-specific password of the Apple ID.
+              xcrun notarytool submit "$DMG" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+              xcrun stapler staple "$DMG"
+            fi
+          fi
       - name: Smoke test
         run: |
           set -euo pipefail
@@ -148,15 +237,15 @@ jobs:
           "$BIN/pdf2word" crates/core/tests/fixtures/report.pdf -o smoke.docx
           "$BIN/pdf2word" crates/core/tests/fixtures/invoice.pdf -o smoke-ocr.docx --ocr always 2>&1 | tee ocr.log
           ! grep -q "OCR unavailable" ocr.log
-          QT_QPA_PLATFORM=offscreen "$BIN/pdf2word-gui" crates/core/tests/fixtures/report.pdf > gui.log 2>&1 &
+          QT_QPA_PLATFORM=offscreen PDF2WORD_SCREENSHOT="$PWD/gui.png" "$BIN/pdf2word-gui" crates/core/tests/fixtures/report.pdf > gui.log 2>&1 &
           pid=$!
-          sleep 15
-          kill -0 $pid || { cat gui.log; echo "GUI exited early"; exit 1; }
-          kill $pid
+          sleep 25
+          if kill -0 $pid 2>/dev/null; then kill $pid; cat gui.log; echo "GUI did not finish"; exit 1; fi
           ! grep -E "is not installed|failed to load|QQmlApplicationEngine failed" gui.log
+          test -s gui.png
       - uses: actions/upload-artifact@v4
         with:
-          name: pdf2word-macos-arm64
+          name: pdf2word-macos-${{ matrix.arch }}
           path: dist/*.dmg
           if-no-files-found: error
 
@@ -187,7 +276,9 @@ jobs:
           set -euo pipefail
           mkdir -p AppDir/usr/lib AppDir/usr/share/tessdata dist
           tools/fetch-pdfium.sh AppDir/usr/lib linux-x64
-          curl -fsSL -o AppDir/usr/share/tessdata/eng.traineddata https://github.com/tesseract-ocr/tessdata_fast/raw/main/eng.traineddata
+          for lang in $TESSDATA_LANGS; do
+            curl -fsSL -o "AppDir/usr/share/tessdata/$lang.traineddata" "$TESSDATA_URL/$lang.traineddata"
+          done
           for t in linuxdeploy-x86_64.AppImage linuxdeploy-plugin-qt-x86_64.AppImage; do
             curl -fsSL -o "$t" "https://github.com/linuxdeploy/${t%-x86_64.AppImage}/releases/download/continuous/$t"
             chmod +x "$t"
@@ -206,13 +297,11 @@ jobs:
           AppDir/usr/bin/pdf2word crates/core/tests/fixtures/report.pdf -o smoke.docx
           AppDir/usr/bin/pdf2word crates/core/tests/fixtures/invoice.pdf -o smoke-ocr.docx --ocr always 2>&1 | tee ocr.log
           ! grep -q "OCR unavailable" ocr.log
-          export APPIMAGE_EXTRACT_AND_RUN=1 QT_QPA_PLATFORM=offscreen
-          dist/*.AppImage crates/core/tests/fixtures/report.pdf > gui.log 2>&1 &
-          pid=$!
-          sleep 20
-          kill -0 $pid || { cat gui.log; echo "GUI exited early"; exit 1; }
-          kill $pid
+          # The GUI loads its QML, shows the PDF, saves a screenshot and quits by itself.
+          export APPIMAGE_EXTRACT_AND_RUN=1 QT_QPA_PLATFORM=offscreen PDF2WORD_SCREENSHOT="$PWD/gui.png"
+          timeout 60 dist/*.AppImage crates/core/tests/fixtures/report.pdf > gui.log 2>&1 || { cat gui.log; echo "GUI failed"; exit 1; }
           ! grep -E "is not installed|failed to load|QQmlApplicationEngine failed" gui.log
+          test -s gui.png
       - uses: actions/upload-artifact@v4
         with:
           name: pdf2word-linux-x86_64
@@ -237,4 +326,5 @@ jobs:
             artifacts/pdf2word-windows-x64-portable.zip
             artifacts/pdf2word-windows-x64-installer/*.exe
             artifacts/pdf2word-macos-arm64/*.dmg
+            artifacts/pdf2word-macos-x86_64/*.dmg
             artifacts/pdf2word-linux-x86_64/*.AppImage

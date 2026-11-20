@@ -7,30 +7,50 @@ import com.pdf2word.app
 
 ApplicationWindow {
     id: window
-    width: 1180
-    height: 800
-    minimumWidth: 900
-    minimumHeight: 600
+    width: 1240
+    height: 840
+    minimumWidth: 960
+    minimumHeight: 620
     visible: true
     title: conv.inputPath.length > 0 ? "PDF to Word — " + conv.inputPath.split(/[\\/]/).pop() : "PDF to Word"
 
     readonly property color accent: "#2b579a"
-    readonly property color subtle: palette.window.hslLightness < 0.5 ? "#9aa4b2" : "#5f6b7a"
+    readonly property bool dark: palette.window.hslLightness < 0.5
+    readonly property color subtle: dark ? "#9aa4b2" : "#5f6b7a"
+    readonly property var queue: JSON.parse(conv.queueJson)
+    readonly property var structure: JSON.parse(conv.structureJson)
+
+    // Colours of the structure overlay.
+    readonly property var kindColors: ({
+        "heading": "#8e44ad", "paragraph": "#2b78e4", "list": "#16a085", "table": "#27ae60",
+        "column": "#95a5a6", "picture": "#e67e22", "figure": "#d35400", "equation": "#c0392b",
+        "rule": "#7f8c8d", "textbox": "#f1c40f", "comment": "#e84393"
+    })
+    readonly property var kindNames: [
+        ["heading", "Heading"], ["paragraph", "Paragraph"], ["list", "List item"], ["table", "Table"],
+        ["column", "Column"], ["picture", "Picture"], ["figure", "Editable figure"], ["equation", "Equation"],
+        ["textbox", "Text box"], ["comment", "Comment"]
+    ]
+
+    onClosing: conv.saveSettings()
 
     Converter {
         id: conv
         Component.onCompleted: openFromArguments()
         onFinished: (success, message) => {
-            if (success)
+            if (success) {
+                doneLabel.text = "✔ " + message
                 doneBanner.open()
+            }
         }
     }
 
     FileDialog {
         id: openDialog
-        title: "Open PDF"
+        title: "Open PDF files"
+        fileMode: FileDialog.OpenFiles
         nameFilters: ["PDF documents (*.pdf)", "All files (*)"]
-        onAccepted: conv.openPdf(selectedFile)
+        onAccepted: conv.addUrls(selectedFiles)
     }
 
     FileDialog {
@@ -40,6 +60,19 @@ ApplicationWindow {
         defaultSuffix: "docx"
         nameFilters: ["Word documents (*.docx)"]
         onAccepted: conv.setOutputUrl(selectedFile)
+    }
+
+    FolderDialog {
+        id: folderDialog
+        title: "Folder for the Word documents"
+        onAccepted: conv.setOutputFolderUrl(selectedFolder)
+    }
+
+    function statusText(s) {
+        return s === "waiting" ? "Waiting" : s === "converting" ? "Converting…" : s === "done" ? "Done" : "Failed"
+    }
+    function statusColor(s) {
+        return s === "done" ? "#2e9d57" : s === "failed" ? "#d64545" : s === "converting" ? accent : subtle
     }
 
     header: ToolBar {
@@ -62,9 +95,9 @@ ApplicationWindow {
                 Layout.fillWidth: true
             }
             Button {
-                text: conv.busy ? "Cancel" : "Convert to Word"
+                text: conv.busy ? "Cancel" : (conv.pending > 1 ? "Convert " + conv.pending + " files" : "Convert to Word")
                 highlighted: !conv.busy
-                enabled: conv.busy || conv.pageCount > 0
+                enabled: conv.busy || conv.pending > 0
                 onClicked: conv.busy ? conv.cancel() : conv.convert()
             }
         }
@@ -77,7 +110,7 @@ ApplicationWindow {
         // ------------------------------------------------------------ preview
         Pane {
             SplitView.fillWidth: true
-            SplitView.minimumWidth: 400
+            SplitView.minimumWidth: 420
             padding: 12
 
             ColumnLayout {
@@ -85,9 +118,10 @@ ApplicationWindow {
                 spacing: 8
 
                 Rectangle {
+                    id: stage
                     Layout.fillWidth: true
                     Layout.fillHeight: true
-                    color: palette.window.hslLightness < 0.5 ? "#2a2d33" : "#e6e9ee"
+                    color: window.dark ? "#2a2d33" : "#e6e9ee"
                     radius: 6
 
                     Image {
@@ -102,10 +136,46 @@ ApplicationWindow {
                         mipmap: true
                     }
 
+                    // Detected structure over the page.
+                    Item {
+                        id: overlay
+                        visible: conv.showStructure && preview.status === Image.Ready
+                        x: preview.x + (preview.width - preview.paintedWidth) / 2
+                        y: preview.y + (preview.height - preview.paintedHeight) / 2
+                        width: preview.paintedWidth
+                        height: preview.paintedHeight
+
+                        Repeater {
+                            model: window.structure
+                            delegate: Rectangle {
+                                required property var modelData
+                                readonly property color kindColor: window.kindColors[modelData.kind] || "#888888"
+                                x: modelData.x * overlay.width - 1
+                                y: modelData.y * overlay.height - 1
+                                width: Math.max(3, modelData.w * overlay.width + 2)
+                                height: Math.max(3, modelData.h * overlay.height + 2)
+                                color: Qt.rgba(kindColor.r, kindColor.g, kindColor.b, modelData.kind === "column" ? 0.04 : 0.14)
+                                border.color: kindColor
+                                border.width: modelData.kind === "column" ? 1 : 1.5
+                                z: modelData.kind === "column" ? 0 : 1
+
+                                MouseArea {
+                                    id: hover
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    acceptedButtons: Qt.NoButton
+                                }
+                                ToolTip.visible: hover.containsMouse
+                                ToolTip.text: modelData.label
+                                ToolTip.delay: 300
+                            }
+                        }
+                    }
+
                     Column {
                         anchors.centerIn: parent
                         spacing: 12
-                        visible: conv.pageCount === 0
+                        visible: window.queue.length === 0
                         Label {
                             anchors.horizontalCenter: parent.horizontalCenter
                             text: "📄"
@@ -113,7 +183,7 @@ ApplicationWindow {
                         }
                         Label {
                             anchors.horizontalCenter: parent.horizontalCenter
-                            text: "Drop a PDF file here"
+                            text: "Drop PDF files here"
                             font.pixelSize: 18
                         }
                         Button {
@@ -138,7 +208,7 @@ ApplicationWindow {
                         onDropped: (drop) => {
                             dropHighlight.visible = false
                             if (drop.hasUrls && drop.urls.length > 0)
-                                conv.openPdf(drop.urls[0])
+                                conv.addUrls(drop.urls)
                         }
                     }
                     Rectangle {
@@ -152,29 +222,66 @@ ApplicationWindow {
                     }
                 }
 
+                // Legend of the overlay.
+                Flow {
+                    Layout.fillWidth: true
+                    spacing: 10
+                    visible: conv.showStructure && conv.pageCount > 0
+                    Repeater {
+                        model: window.kindNames
+                        delegate: Row {
+                            required property var modelData
+                            spacing: 4
+                            Rectangle {
+                                width: 12
+                                height: 12
+                                anchors.verticalCenter: parent.verticalCenter
+                                color: "transparent"
+                                border.width: 2
+                                border.color: window.kindColors[modelData[0]]
+                            }
+                            Label {
+                                text: modelData[1]
+                                font.pointSize: 9
+                                color: window.subtle
+                            }
+                        }
+                    }
+                }
+
                 RowLayout {
-                    Layout.alignment: Qt.AlignHCenter
-                    enabled: conv.pageCount > 0
+                    Layout.fillWidth: true
                     spacing: 6
-                    Button {
-                        text: "◀"
-                        enabled: conv.previewPage > 1
-                        onClicked: conv.showPage(conv.previewPage - 1)
+                    CheckBox {
+                        text: "Show detected structure"
+                        checked: conv.showStructure
+                        enabled: conv.pageCount > 0
+                        onToggled: conv.setStructureVisible(checked)
                     }
-                    SpinBox {
-                        id: pageSpin
-                        from: 1
-                        to: Math.max(1, conv.pageCount)
-                        value: conv.previewPage
-                        editable: true
-                        onValueModified: conv.showPage(value)
+                    Item { Layout.fillWidth: true }
+                    RowLayout {
+                        enabled: conv.pageCount > 0
+                        spacing: 6
+                        Button {
+                            text: "◀"
+                            enabled: conv.previewPage > 1
+                            onClicked: conv.showPage(conv.previewPage - 1)
+                        }
+                        SpinBox {
+                            from: 1
+                            to: Math.max(1, conv.pageCount)
+                            value: conv.previewPage
+                            editable: true
+                            onValueModified: conv.showPage(value)
+                        }
+                        Label { text: "of " + conv.pageCount }
+                        Button {
+                            text: "▶"
+                            enabled: conv.previewPage < conv.pageCount
+                            onClicked: conv.showPage(conv.previewPage + 1)
+                        }
                     }
-                    Label { text: "of " + conv.pageCount }
-                    Button {
-                        text: "▶"
-                        enabled: conv.previewPage < conv.pageCount
-                        onClicked: conv.showPage(conv.previewPage + 1)
-                    }
+                    Item { Layout.fillWidth: true }
                 }
             }
         }
@@ -182,10 +289,10 @@ ApplicationWindow {
         // ------------------------------------------------------------ options
         ScrollView {
             id: optionsView
-            SplitView.preferredWidth: 400
-            SplitView.minimumWidth: 320
+            SplitView.preferredWidth: 420
+            SplitView.minimumWidth: 340
             contentWidth: availableWidth
-            enabled: !conv.busy
+            background: Rectangle { color: window.palette.window }
 
             ColumnLayout {
                 width: optionsView.availableWidth
@@ -194,22 +301,126 @@ ApplicationWindow {
                 Item { Layout.preferredHeight: 4 }
 
                 GroupBox {
-                    title: "Output file"
+                    title: window.queue.length > 1 ? "Files (" + window.queue.length + ")" : "Files"
                     Layout.fillWidth: true
                     Layout.leftMargin: 12
                     Layout.rightMargin: 12
-                    RowLayout {
+                    ColumnLayout {
                         anchors.fill: parent
+                        spacing: 6
+
+                        ListView {
+                            id: queueView
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: Math.min(Math.max(contentHeight, 36), 210)
+                            clip: true
+                            model: window.queue
+                            ScrollBar.vertical: ScrollBar {}
+                            delegate: ItemDelegate {
+                                id: row
+                                required property var modelData
+                                required property int index
+                                width: ListView.view.width
+                                highlighted: index === conv.selected
+                                onClicked: conv.selectItem(index)
+                                ToolTip.visible: hovered && modelData.message.length > 0
+                                ToolTip.text: modelData.message
+                                ToolTip.delay: 500
+                                contentItem: ColumnLayout {
+                                    spacing: 2
+                                    RowLayout {
+                                        spacing: 6
+                                        Label {
+                                            text: row.modelData.name
+                                            elide: Text.ElideMiddle
+                                            Layout.fillWidth: true
+                                        }
+                                        Label {
+                                            text: window.statusText(row.modelData.status)
+                                            color: row.highlighted ? row.palette.highlightedText : window.statusColor(row.modelData.status)
+                                            font.pointSize: 9
+                                        }
+                                        ToolButton {
+                                            text: "✕"
+                                            enabled: row.modelData.status !== "converting"
+                                            implicitWidth: 26
+                                            implicitHeight: 22
+                                            onClicked: conv.removeItem(row.index)
+                                        }
+                                    }
+                                    ProgressBar {
+                                        Layout.fillWidth: true
+                                        visible: row.modelData.status === "converting"
+                                        value: row.modelData.progress
+                                    }
+                                }
+                            }
+                        }
+                        Label {
+                            visible: window.queue.length === 0
+                            text: "No files yet — open or drop PDFs; several files are converted one after the other."
+                            wrapMode: Text.WordWrap
+                            color: window.subtle
+                            font.pointSize: 9
+                            Layout.fillWidth: true
+                        }
+                        RowLayout {
+                            Button {
+                                text: "Add files…"
+                                enabled: !conv.busy
+                                onClicked: openDialog.open()
+                            }
+                            Button {
+                                text: "Clear list"
+                                enabled: window.queue.length > 0 && !conv.busy
+                                onClicked: conv.clearQueue()
+                            }
+                        }
+                    }
+                }
+
+                GroupBox {
+                    title: "Output"
+                    Layout.fillWidth: true
+                    Layout.leftMargin: 12
+                    Layout.rightMargin: 12
+                    enabled: !conv.busy
+                    GridLayout {
+                        anchors.fill: parent
+                        columns: 3
+                        columnSpacing: 8
+                        Label { text: "Document" }
                         TextField {
                             Layout.fillWidth: true
                             placeholderText: "document.docx"
                             text: conv.outputPath
-                            onEditingFinished: conv.outputPath = text
+                            enabled: conv.selected >= 0
+                            onEditingFinished: conv.setOutputText(text)
                             selectByMouse: true
                         }
                         Button {
                             text: "Save as…"
+                            enabled: conv.selected >= 0
                             onClicked: saveDialog.open()
+                        }
+                        Label { text: "Folder" }
+                        TextField {
+                            Layout.fillWidth: true
+                            readOnly: true
+                            text: conv.outputFolder
+                            placeholderText: "next to each PDF"
+                        }
+                        RowLayout {
+                            spacing: 2
+                            Button {
+                                text: "Choose…"
+                                onClicked: folderDialog.open()
+                            }
+                            ToolButton {
+                                text: "✕"
+                                visible: conv.outputFolder.length > 0
+                                onClicked: conv.setOutputFolderUrl("")
+                            }
                         }
                     }
                 }
@@ -219,6 +430,7 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     Layout.leftMargin: 12
                     Layout.rightMargin: 12
+                    enabled: !conv.busy
                     ColumnLayout {
                         anchors.fill: parent
                         ComboBox {
@@ -242,10 +454,98 @@ ApplicationWindow {
                 }
 
                 GroupBox {
+                    title: "Content"
+                    Layout.fillWidth: true
+                    Layout.leftMargin: 12
+                    Layout.rightMargin: 12
+                    enabled: !conv.busy
+                    ColumnLayout {
+                        anchors.fill: parent
+                        spacing: 0
+                        CheckBox {
+                            text: "Images"
+                            checked: conv.extractImages
+                            onToggled: conv.extractImages = checked
+                        }
+                        CheckBox {
+                            text: "Charts and diagrams"
+                            checked: conv.vectorFigures
+                            enabled: conv.extractImages
+                            onToggled: conv.vectorFigures = checked
+                        }
+                        CheckBox {
+                            text: "Simple charts as editable shapes"
+                            checked: conv.vectorShapes
+                            enabled: conv.extractImages && conv.vectorFigures
+                            onToggled: conv.vectorShapes = checked
+                            leftPadding: 28
+                        }
+                        CheckBox {
+                            text: "Detect tables"
+                            checked: conv.detectTables
+                            onToggled: conv.detectTables = checked
+                        }
+                        CheckBox {
+                            text: "Embed the PDF's fonts (when their licence allows)"
+                            checked: conv.embedFonts
+                            onToggled: conv.embedFonts = checked
+                        }
+                        CheckBox {
+                            text: "Keep text widths when fonts are substituted"
+                            checked: conv.keepWidths
+                            onToggled: conv.keepWidths = checked
+                        }
+                    }
+                }
+
+                GroupBox {
+                    title: "Document structure"
+                    Layout.fillWidth: true
+                    Layout.leftMargin: 12
+                    Layout.rightMargin: 12
+                    enabled: !conv.busy
+                    ColumnLayout {
+                        anchors.fill: parent
+                        spacing: 0
+                        CheckBox {
+                            text: "Headings (navigation pane)"
+                            checked: conv.detectHeadings
+                            onToggled: conv.detectHeadings = checked
+                        }
+                        CheckBox {
+                            text: "Paragraph styles"
+                            checked: conv.paragraphStyles
+                            onToggled: conv.paragraphStyles = checked
+                        }
+                        CheckBox {
+                            text: "Headers and footers with page numbers"
+                            checked: conv.headersFooters
+                            onToggled: conv.headersFooters = checked
+                        }
+                        CheckBox {
+                            text: "Word lists and footnotes"
+                            checked: conv.wordLists
+                            onToggled: conv.wordLists = checked
+                        }
+                        CheckBox {
+                            text: "Bookmarks, links and table of contents"
+                            checked: conv.navigation
+                            onToggled: conv.navigation = checked
+                        }
+                        CheckBox {
+                            text: "Comments and form fields"
+                            checked: conv.comments
+                            onToggled: conv.comments = checked
+                        }
+                    }
+                }
+
+                GroupBox {
                     title: "OCR (scanned pages)"
                     Layout.fillWidth: true
                     Layout.leftMargin: 12
                     Layout.rightMargin: 12
+                    enabled: !conv.busy
                     GridLayout {
                         anchors.fill: parent
                         columns: 2
@@ -278,6 +578,20 @@ ApplicationWindow {
                             onValueModified: conv.ocrDpi = value
                             enabled: conv.ocrMode !== 2
                         }
+                        CheckBox {
+                            Layout.columnSpan: 2
+                            text: "Straighten skewed or sideways scans"
+                            checked: conv.straighten
+                            enabled: conv.ocrMode !== 2
+                            onToggled: conv.straighten = checked
+                        }
+                        CheckBox {
+                            Layout.columnSpan: 2
+                            text: "Read text in pictures (alternative text)"
+                            checked: conv.pictureText
+                            enabled: conv.ocrMode !== 2
+                            onToggled: conv.pictureText = checked
+                        }
                         Label {
                             Layout.columnSpan: 2
                             text: conv.ocrEngine
@@ -288,52 +602,11 @@ ApplicationWindow {
                 }
 
                 GroupBox {
-                    title: "Content"
-                    Layout.fillWidth: true
-                    Layout.leftMargin: 12
-                    Layout.rightMargin: 12
-                    ColumnLayout {
-                        anchors.fill: parent
-                        spacing: 0
-                        CheckBox {
-                            text: "Images"
-                            checked: conv.extractImages
-                            onToggled: conv.extractImages = checked
-                        }
-                        CheckBox {
-                            text: "Charts and diagrams (rendered as pictures)"
-                            checked: conv.vectorFigures
-                            enabled: conv.extractImages
-                            onToggled: conv.vectorFigures = checked
-                        }
-                        CheckBox {
-                            text: "Detect tables"
-                            checked: conv.detectTables
-                            onToggled: conv.detectTables = checked
-                        }
-                        CheckBox {
-                            text: "Heading styles (navigation pane)"
-                            checked: conv.detectHeadings
-                            onToggled: conv.detectHeadings = checked
-                        }
-                        CheckBox {
-                            text: "Embed the PDF's fonts (when their licence allows)"
-                            checked: conv.embedFonts
-                            onToggled: conv.embedFonts = checked
-                        }
-                        CheckBox {
-                            text: "Keep text widths when fonts are substituted"
-                            checked: conv.keepWidths
-                            onToggled: conv.keepWidths = checked
-                        }
-                    }
-                }
-
-                GroupBox {
                     title: "Pages & security"
                     Layout.fillWidth: true
                     Layout.leftMargin: 12
                     Layout.rightMargin: 12
+                    enabled: !conv.busy
                     GridLayout {
                         anchors.fill: parent
                         columns: 2
@@ -341,7 +614,7 @@ ApplicationWindow {
                         Label { text: "Pages" }
                         TextField {
                             Layout.fillWidth: true
-                            placeholderText: "all  (e.g. 1-3, 7, 10-)"
+                            placeholderText: window.queue.length > 1 ? "all (one file only)" : "all  (e.g. 1-3, 7, 10-)"
                             text: conv.pageRange
                             onEditingFinished: conv.pageRange = text
                         }
@@ -420,9 +693,34 @@ ApplicationWindow {
         background: Rectangle { color: window.accent; radius: 8 }
         Timer { running: doneBanner.visible; interval: 3500; onTriggered: doneBanner.close() }
         Label {
+            id: doneLabel
             color: "white"
             text: "✔ Word document created"
             font.bold: true
         }
+    }
+
+    // Test hooks: PDF2WORD_SCREENSHOT=file.png saves the window and quits;
+    // with PDF2WORD_AUTOCONVERT=1 the queue is converted first.
+    function screenshot() {
+        window.contentItem.parent.grabToImage(function(result) {
+            result.saveToFile(conv.screenshotPath)
+            Qt.quit()
+        })
+    }
+    Timer {
+        running: conv.screenshotPath.length > 0
+        interval: 6000
+        onTriggered: conv.autoConvert ? conv.convert() : window.screenshot()
+    }
+    Connections {
+        target: conv
+        enabled: conv.autoConvert && conv.screenshotPath.length > 0
+        function onFinished(success, message) { shotDelay.start() }
+    }
+    Timer {
+        id: shotDelay
+        interval: 1500
+        onTriggered: window.screenshot()
     }
 }

@@ -1098,6 +1098,7 @@ dependencies = [
  "env_logger",
  "log",
  "pdf2word-core",
+ "serde_json",
 ]
 
 [[package]]
