@@ -248,13 +248,37 @@ def embedded_font(path, workdir):
     doc.build([Paragraph("Embedded Fixture Sans", head), Spacer(1, 12)] + [Paragraph(LOREM, body) for _ in range(3)])
 
 
+def typography(path):
+    """One line per font style, for OCR font/bold/italic detection."""
+    c = canvas.Canvas(path, pagesize=letter)
+    w, h = letter
+    y = h - 90
+    styles = [
+        ("Times-Roman", "Times regular text for the classifier"),
+        ("Times-Bold", "Times bold text for the classifier"),
+        ("Times-Italic", "Times italic text for the classifier"),
+        ("Helvetica", "Helvetica regular text for the classifier"),
+        ("Helvetica-Bold", "Helvetica bold text for the classifier"),
+        ("Helvetica-Oblique", "Helvetica oblique text for the classifier"),
+        ("Courier", "Courier monospaced text for the classifier"),
+        ("Courier-Bold", "Courier bold text for the classifier"),
+    ]
+    for font, text in styles:
+        c.setFont(font, 14)
+        c.drawString(72, y, text)
+        y -= 40
+    c.showPage()
+    c.save()
+
+
 def scanned(src_pdf, path, workdir):
     if not shutil.which("pdftoppm"):
         print("pdftoppm not found; skipping scanned.pdf")
         return
-    prefix = os.path.join(workdir, "scanpage")
+    stem = "scan-" + os.path.splitext(os.path.basename(src_pdf))[0]
+    prefix = os.path.join(workdir, stem)
     subprocess.run(["pdftoppm", "-r", "200", "-f", "1", "-l", "1", "-png", src_pdf, prefix], check=True)
-    png = [f for f in os.listdir(workdir) if f.startswith("scanpage") and f.endswith(".png")][0]
+    png = [f for f in os.listdir(workdir) if f.startswith(stem) and f.endswith(".png")][0]
     c = canvas.Canvas(path, pagesize=A4)
     c.drawImage(os.path.join(workdir, png), 0, 0, width=A4[0], height=A4[1])
     c.showPage()
@@ -272,6 +296,8 @@ def main():
     font_widths(os.path.join(out, "fonts.pdf"))
     embedded_font(os.path.join(out, "embedded.pdf"), out)
     scanned(os.path.join(out, "report.pdf"), os.path.join(out, "scanned.pdf"), out)
+    typography(os.path.join(out, "typography.pdf"))
+    scanned(os.path.join(out, "typography.pdf"), os.path.join(out, "typography-scan.pdf"), out)
     print("written to", out)
 
 

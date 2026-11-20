@@ -38,8 +38,9 @@ struct Args {
     #[arg(long, default_value_t = 300.0)]
     ocr_dpi: f32,
 
-    /// Font family used for OCR text.
-    #[arg(long, default_value = "Times New Roman")]
+    /// Font family for OCR text; `auto` picks Times New Roman, Arial or
+    /// Courier New from the letter shapes.
+    #[arg(long, default_value = "auto")]
     ocr_font: String,
 
     /// Pages to convert, 1-based (e.g. `1-3,7,10-`).
