@@ -6,4 +6,12 @@ fn main() {
         .qt_module("QuickControls2")
         .files(["src/converter.rs"])
         .build();
+
+    // Application icon and version information in the Windows executable.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        println!("cargo:rerun-if-changed=../../packaging/windows/app.rc");
+        if let Err(e) = embed_resource::compile("../../packaging/windows/app.rc", embed_resource::NONE).manifest_optional() {
+            println!("cargo:warning=could not embed the application icon: {e}");
+        }
+    }
 }

@@ -300,7 +300,8 @@ fn bundled_tessdata() -> Option<std::path::PathBuf> {
     }
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
-    [dir.join("tessdata"), dir.join("../share/tessdata")].into_iter().find(|p| p.is_dir())
+    // Windows/portable: next to the exe; Linux AppImage: ../share; macOS bundle: ../Resources.
+    [dir.join("tessdata"), dir.join("../share/tessdata"), dir.join("../Resources/tessdata")].into_iter().find(|p| p.is_dir())
 }
 
 /// Parses Tesseract TSV output (level 5 rows are words).

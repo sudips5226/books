@@ -21,3 +21,4 @@ pdf2word-core = { path = "../core", default-features = false }
 
 [build-dependencies]
 cxx-qt-build = { version = "0.8", features = ["link_qt_object_files"] }
+embed-resource = "3"

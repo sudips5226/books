@@ -181,6 +181,7 @@ pub fn load_pdfium(explicit: Option<&Path>) -> anyhow::Result<Pdfium> {
             push(dir.to_path_buf(), &mut candidates);
             push(dir.join("lib"), &mut candidates);
             push(dir.join("../lib"), &mut candidates);
+            push(dir.join("../Frameworks"), &mut candidates);
         }
     }
     push(PathBuf::from("."), &mut candidates);

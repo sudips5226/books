@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=PDF to Word
+GenericName=PDF to DOCX converter
+Comment=Convert PDF files to editable Word documents, with OCR for scans
+Exec=pdf2word-gui %f
+Icon=pdf2word
+Terminal=false
+Categories=Office;
+MimeType=application/pdf;
