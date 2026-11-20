@@ -14,12 +14,15 @@ layout and formatting of the original, including scanned pages through OCR.
 | Area | Details |
 |---|---|
 | Characters | font family (PostScript names mapped to Word fonts), size, bold, italic, small caps, colour, underline, strike-through, highlight, super/subscripts with exact baseline shift, hyperlinks, ligatures expanded |
+| Fonts | the PDF's own TrueType fonts are **embedded** into the DOCX when their licence allows (subset fonts get a rebuilt Unicode map); otherwise each run gets **character spacing / scaling** so that it keeps its PDF width with the font Word substitutes (built-in metrics of Word's core fonts plus installed system fonts) |
 | Paragraphs | left/centre/right/justified alignment, left/right indents, first-line and hanging indents, exact line pitch, original vertical spacing, tab stops (including right tabs for page numbers), hyphenation joined in flowing text, intentional line breaks (addresses, titles) kept |
 | Structure | multi-column layouts (recursive XY-cut, reading order preserved), bulleted/numbered lists, heading styles (Heading 1–3 for the navigation pane), horizontal rules |
+| Scripts | **right-to-left** Hebrew and Arabic (visual → logical order, mirrored brackets, Arabic presentation forms normalised, bidi paragraphs and tables); **rotated text** and **vertical East Asian text** as positioned text boxes |
+| Equations | maths fonts (TeX, Cambria Math, STIX …) become **native Word equations (OMML)**: fractions, radicals, sums/integrals with limits, super/subscripts, inline and display; matrices and case distinctions are kept as pictures |
 | Tables | ruled tables with merged cells (row/column spans), per-edge borders, cell shading; whitespace-aligned tables (invoices, statements) with per-column alignment |
 | Graphics | embedded raster images (PNG/JPEG), vector charts and diagrams rasterised with their labels, background images/watermarks behind text, pictures with text flowing beside them |
 | Pages | page size and orientation per page, margins derived from content, one section per page so pages stay aligned |
-| Scans | Tesseract OCR with size/baseline estimation, colour and bold detection, bullet repair, **table rulings and underlines recovered from pixels**, pictures cropped from the scan; PDFs that already carry an invisible OCR text layer reuse it |
+| Scans | Tesseract OCR with per-letter boxes and baselines; **bold** (stroke width), **italic** (slant) and **font class** (serif / sans / monospace → Times New Roman / Arial / Courier New) from the letter shapes; colour, bullet repair, **table rulings and underlines recovered from pixels**, pictures cropped from the scan; PDFs that already carry an invisible OCR text layer reuse it |
 
 Two output modes:
 
@@ -47,10 +50,28 @@ Two output modes:
                                  lines → paragraphs/tables  pictures, rules
 ```
 
-* `crates/core`: the library (`convert()`, `inspect()`, `render_page_png()`, progress events, cancellation)
+* `crates/core`: the library (`convert()`, `inspect()`, `render_page_png()`, progress events, cancellation).
+  Modules: `extract` (PDFium), `ocr` (Tesseract), `layout` (reconstruction, bidi, text boxes),
+  `math` (equations → OMML), `metrics` (font widths, compensation), `embed` (font embedding), `docx` (writer)
 * `crates/cli`: `pdf2word` command-line front-end
 * `crates/gui`: Qt Quick application (`src/converter.rs` QObject bridge + `qml/Main.qml`)
-* `tools/`: `fetch-pdfium.sh` (prebuilt PDFium download) and `make_test_pdfs.py` (sample documents)
+* `tools/`: `fetch-pdfium.sh` (prebuilt PDFium download), `make_test_pdfs.py` and `math-fixture.tex`
+  (sample documents), `gen_metrics.py` (built-in font metrics), `make_icons.py` (application icon)
+* `packaging/`: icons, Windows resource and Inno Setup script, macOS `Info.plist`, Linux `.desktop`
+
+## Downloads
+
+Every push builds ready-to-run packages in GitHub Actions (workflow
+**Release builds**); tagged versions (`v*`) publish them as a GitHub release:
+
+| Platform | Package |
+|---|---|
+| Windows x64 | `pdf2word-setup-<version>-x64.exe` installer (Start menu, optional desktop icon, *Open with* for PDFs) or the portable folder |
+| macOS (Apple Silicon) | `pdf2word-<version>-macos-arm64.dmg` (ad-hoc signed: right-click → Open the first time) |
+| Linux x86_64 | `pdf2word-<version>-linux-x86_64.AppImage` |
+
+All packages include PDFium, Tesseract and English OCR data. The programs
+are not code-signed, so Windows SmartScreen and macOS Gatekeeper warn on first start.
 
 ## Building
 
@@ -134,8 +155,8 @@ pdf2word big.pdf -p 1-5,10-                 # page selection
 ```
 
 Run `pdf2word --help` for all options: `--no-images`, `--no-figures`,
-`--no-tables`, `--no-headings`, `--ocr-dpi`, `--ocr-font`, `--tessdata`,
-`--password`, `--pdfium`.
+`--no-tables`, `--no-headings`, `--no-embed-fonts`, `--no-width-compensation`,
+`--ocr-dpi`, `--ocr-font` (`auto` by default), `--tessdata`, `--password`, `--pdfium`.
 
 ### Library
 
@@ -153,23 +174,45 @@ println!("{} pages, {} tables", report.pages, report.tables);
 PDFIUM_DYNAMIC_LIB_PATH=./pdfium cargo test
 ```
 
-Unit tests cover geometry, font-name analysis, list and hyphenation handling,
-paragraph and column detection, and the DOCX writer. Integration tests
-(`crates/core/tests/convert.rs`) convert sample PDFs (regenerate them with
-`python3 tools/make_test_pdfs.py DIR`; this needs `reportlab`). They check
-headings, merged table cells, formatting, links, list indents, reading order,
-alignment, exact-mode frames, and the OCR pipeline including table-ruling
-recovery from pixels. Without PDFium (or Tesseract language data), those
-tests are skipped.
+Unit tests cover geometry, font names and metrics, width compensation,
+ToUnicode parsing, font rebuilding and obfuscation, bidi reordering, list and
+hyphenation handling, paragraph and column detection, the equation parser and
+the DOCX writer. Integration tests (`crates/core/tests/convert.rs`) convert the
+sample PDFs in `crates/core/tests/fixtures`. Regenerate them with
+`python3 tools/make_test_pdfs.py DIR`, which needs `reportlab`, `fonttools`,
+`python-bidi` and `arabic-reshaper`. `math.pdf` comes from
+`pdflatex tools/math-fixture.tex`. The integration tests check:
+
+* headings, merged cells, formatting, links, lists, reading order, alignment;
+* exact-mode frames and page selection;
+* width compensation for condensed and letter-spaced text;
+* the embedded font: it must parse, carry the right family name and map every character;
+* right-to-left order with numbers and Latin runs;
+* rotated and vertical text boxes;
+* equations (fractions, radicals, n-ary operators, scripts) and the matrix pictures;
+* OCR: table rulings from pixels, and bold/italic/font class on a scanned typography sample.
+
+Without PDFium (or Tesseract language data), those tests are skipped.
 
 `cargo run -p pdf2word-core --example dump_layout -- file.pdf [page]` prints
-the analysed layout tree, which helps when tuning heuristics.
+the analysed layout tree (`DUMP_GLYPHS=1` adds glyphs, rules and rotated text).
 
 ## Limitations
 
-* Fonts that are not installed are substituted by Word, which can change line
-  wrapping in flow mode. Exact mode is more robust to this.
-* Right-to-left and vertical scripts are not reconstructed. Rotated text is
-  kept as part of a rasterised figure.
-* Equations are kept as text runs (with super/subscripts), not as Word equations.
-* OCR cannot recognise font families. All recognised text uses `--ocr-font`.
+* **Fonts.** Embedding needs a TrueType font in the PDF with a usable encoding.
+  Type 1 and CFF fonts (common in LaTeX and print PDFs) cannot be embedded in
+  DOCX, so width compensation is used for them instead. Embedded subsets only
+  contain the characters of the document, so text typed later in Word falls
+  back to another font. LibreOffice applies kerning by default, so line breaks
+  can differ slightly there. Word does not kern unless told to.
+* **Rotated and vertical text** use standard DrawingML text boxes.
+  LibreOffice ignores shape rotation (30° text shows horizontally) and turns
+  vertical CJK glyphs sideways. This has not been checked in Word.
+* **Equations** are rebuilt from geometry. Matrices, case distinctions and
+  other two-dimensional layouts are kept as pictures, not editable maths.
+  Multi-line aligned equations become one equation per line.
+* **OCR** classifies fonts as serif, sans or monospace only, not by name.
+  Very short words inherit bold or italic from their line.
+* **Right-to-left** lists are kept as plain text, without hanging indents.
+* **Installers** are not code-signed or notarised. The macOS build targets
+  Apple Silicon only.

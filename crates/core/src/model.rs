@@ -336,6 +336,8 @@ pub enum Inline {
         link: Option<String>,
         /// Width of the run's non-space glyphs in the PDF (points), 0 = unknown.
         pdf_width: f32,
+        /// Part of `pdf_width` that is letter spacing (PDF `Tc`) rather than glyph width.
+        pdf_tracking: f32,
     },
     /// An equation (Office Math).
     Math(Vec<MathNode>),

@@ -213,7 +213,7 @@ impl OcrEngine {
                     line_no += 1;
                     let (mut x1, mut y1, mut x2, mut y2) = (0, 0, 0, 0);
                     line_base = (ffi::TessPageIteratorBaseline(pit, ffi::RIL_TEXTLINE, &mut x1, &mut y1, &mut x2, &mut y2) != 0)
-                        .then(|| (x1 as f32 * scale, y1 as f32 * scale, x2 as f32 * scale, y2 as f32 * scale));
+                        .then_some((x1 as f32 * scale, y1 as f32 * scale, x2 as f32 * scale, y2 as f32 * scale));
                 }
                 if ffi::TessPageIteratorIsAtBeginningOf(pit, ffi::RIL_WORD) != 0 {
                     if let Some(wd) = current.take() {
@@ -646,7 +646,8 @@ pub fn words_to_glyphs(raw: &mut RawPage, words: &[OcrWord], img: &DynamicImage,
     let mut metrics: Vec<(f32, f32)> = vec![(11.0, 0.0); words.len()];
     let mut shapes: Vec<WordShape> = vec![WordShape::default(); words.len()];
     let blur = 1.0 / sx;
-    let mut line_info: std::collections::BTreeMap<(u32, u32, u32), (Option<f32>, Option<f32>)> = Default::default();
+    type LineKey = (u32, u32, u32);
+    let mut line_info: std::collections::BTreeMap<LineKey, (Option<f32>, Option<f32>)> = Default::default();
     for (key, idxs) in &line_groups {
         let ws: Vec<&OcrWord> = idxs.iter().map(|&i| &words[i]).collect();
         let (cap, xh, base) = line_heights(&ws, blur);
@@ -678,7 +679,7 @@ pub fn words_to_glyphs(raw: &mut RawPage, words: &[OcrWord], img: &DynamicImage,
     // Bold: stroke width relative to other text of the same font class (light
     // fonts such as Courier have thin bold strokes), else page-wide.
     let threshold_of = |values: &[f32]| -> Option<f32> { bimodal_threshold(values, 1.3) };
-    let all: Vec<f32> = line_groups.values().flat_map(|v| reliable_of(v)).map(|i| shapes[i].stroke).collect();
+    let all: Vec<f32> = line_groups.values().flat_map(&reliable_of).map(|i| shapes[i].stroke).collect();
     let page_threshold = threshold_of(&all).unwrap_or_else(|| {
         let mut v = all.clone();
         v.sort_by(|a, b| a.total_cmp(b));

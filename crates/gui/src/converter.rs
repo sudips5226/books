@@ -44,6 +44,8 @@ pub mod qobject {
         #[qproperty(bool, vector_figures, cxx_name = "vectorFigures")]
         #[qproperty(bool, detect_tables, cxx_name = "detectTables")]
         #[qproperty(bool, detect_headings, cxx_name = "detectHeadings")]
+        #[qproperty(bool, embed_fonts, cxx_name = "embedFonts")]
+        #[qproperty(bool, keep_widths, cxx_name = "keepWidths")]
         #[qproperty(QString, ocr_engine, cxx_name = "ocrEngine")]
         type Converter = super::ConverterRust;
     }
@@ -114,6 +116,8 @@ pub struct ConverterRust {
     vector_figures: bool,
     detect_tables: bool,
     detect_headings: bool,
+    embed_fonts: bool,
+    keep_widths: bool,
     ocr_engine: QString,
 
     cancel: Option<CancelToken>,
@@ -143,6 +147,8 @@ impl Default for ConverterRust {
             vector_figures: true,
             detect_tables: true,
             detect_headings: true,
+            embed_fonts: true,
+            keep_widths: true,
             ocr_engine: QString::from(&format!("Tesseract {}", pdf2word_core::ocr_version())),
             cancel: None,
         }
@@ -292,6 +298,8 @@ impl qobject::Converter {
             pages: opt_string(self.page_range()),
             password: opt_string(self.password()),
             detect_headings: *self.detect_headings(),
+            embed_fonts: *self.embed_fonts(),
+            compensate_widths: *self.keep_widths(),
             ..Default::default()
         };
         o.ocr.language = opt_string(self.ocr_language()).unwrap_or_else(|| "eng".into());
@@ -351,12 +359,13 @@ impl qobject::Converter {
                 match result {
                     Ok(r) => {
                         let msg = format!(
-                            "Done in {secs:.1}s: {} page(s), {} paragraphs, {} tables, {} images{}",
+                            "Done in {secs:.1}s: {} page(s), {} paragraphs, {} tables, {} images{}{}",
                             r.pages,
                             r.paragraphs,
                             r.tables,
                             r.images,
-                            if r.ocr_pages.is_empty() { String::new() } else { format!(", OCR on {} page(s)", r.ocr_pages.len()) }
+                            if r.ocr_pages.is_empty() { String::new() } else { format!(", OCR on {} page(s)", r.ocr_pages.len()) },
+                            if r.embedded_fonts.is_empty() { String::new() } else { format!(", {} embedded font(s)", r.embedded_fonts.len()) }
                         );
                         obj.as_mut().set_progress(1.0);
                         obj.as_mut().set_status(QString::from(&msg));

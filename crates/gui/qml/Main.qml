@@ -233,7 +233,7 @@ ApplicationWindow {
                             color: window.subtle
                             font.pointSize: 9
                             text: conv.layoutMode === 0
-                                ? "Paragraphs, columns, lists and tables are rebuilt with the original fonts, indents and spacing. Best for editing."
+                                ? "Paragraphs, columns, lists, tables and equations are rebuilt with the original fonts, indents and spacing. Best for editing."
                                 : "Every text block is placed in a frame at its exact position on the page. Best visual fidelity, harder to edit."
                         }
                     }
@@ -313,6 +313,16 @@ ApplicationWindow {
                             text: "Heading styles (navigation pane)"
                             checked: conv.detectHeadings
                             onToggled: conv.detectHeadings = checked
+                        }
+                        CheckBox {
+                            text: "Embed the PDF's fonts (when their licence allows)"
+                            checked: conv.embedFonts
+                            onToggled: conv.embedFonts = checked
+                        }
+                        CheckBox {
+                            text: "Keep text widths when fonts are substituted"
+                            checked: conv.keepWidths
+                            onToggled: conv.keepWidths = checked
                         }
                     }
                 }

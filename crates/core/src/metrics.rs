@@ -316,7 +316,8 @@ pub fn face_families(face: &ttf_parser::Face) -> Vec<String> {
 }
 
 fn system_font(family: &str, bold: bool, italic: bool) -> Option<Arc<FontData>> {
-    static LOADED: OnceLock<Mutex<HashMap<(PathBuf, u32), Arc<FontData>>>> = OnceLock::new();
+    type Loaded = Mutex<HashMap<(PathBuf, u32), Arc<FontData>>>;
+    static LOADED: OnceLock<Loaded> = OnceLock::new();
     let idx = system_index();
     let key = [(bold, italic), (bold, false), (false, italic), (false, false)]
         .into_iter()
@@ -340,8 +341,8 @@ fn system_font(family: &str, bold: bool, italic: bool) -> Option<Arc<FontData>> 
 pub fn compensate(pages: &mut [PageLayout], lib: &FontLibrary) {
     fn inlines(v: &mut [Inline], lib: &FontLibrary) {
         for i in v {
-            if let Inline::Text { text, style, pdf_width, .. } = i {
-                adjust(text, style, *pdf_width, lib);
+            if let Inline::Text { text, style, pdf_width, pdf_tracking, .. } = i {
+                adjust(text, style, *pdf_width, *pdf_tracking, lib);
             }
         }
     }
@@ -375,7 +376,7 @@ fn needs_shaping(c: char) -> bool {
         0x0591..=0x08FF | 0x0900..=0x0DFF | 0x0E00..=0x0FFF | 0x1000..=0x109F | 0x1780..=0x17FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF)
 }
 
-fn adjust(text: &str, style: &mut TextStyle, pdf_width: f32, lib: &FontLibrary) {
+fn adjust(text: &str, style: &mut TextStyle, pdf_width: f32, pdf_tracking: f32, lib: &FontLibrary) {
     let n = text.chars().filter(|c| !c.is_whitespace()).count();
     if pdf_width <= 0.0 || n < 2 || style.small_caps || text.chars().any(needs_shaping) {
         return;
@@ -388,10 +389,13 @@ fn adjust(text: &str, style: &mut TextStyle, pdf_width: f32, lib: &FontLibrary) 
     if (ratio - 1.0).abs() < 0.015 {
         return;
     }
-    let (scale, rest) = if (0.92..=1.08).contains(&ratio) {
+    // Letter spacing in the PDF stays letter spacing; only differences in the
+    // glyphs themselves are worth scaling.
+    let glyph_ratio = (pdf_width - pdf_tracking) / word_w;
+    let (scale, rest) = if (0.92..=1.08).contains(&glyph_ratio) {
         (100u16, pdf_width - word_w)
     } else {
-        let scale = (ratio * 100.0).round().clamp(60.0, 160.0) as u16;
+        let scale = (glyph_ratio * 100.0).round().clamp(60.0, 160.0) as u16;
         (scale, pdf_width - word_w * scale as f32 / 100.0)
     };
     let spacing = (rest / n as f32).clamp(-0.2 * style.size, style.size);
@@ -428,16 +432,21 @@ mod tests {
         let mut st = TextStyle { font: "Arial".into(), size: 10.0, ..Default::default() };
         let (w, _) = lib.measure("Hello", &st).unwrap();
         // 5% wider in the PDF → spacing.
-        adjust("Hello", &mut st, w * 1.05, &lib);
+        adjust("Hello", &mut st, w * 1.05, 0.0, &lib);
         assert_eq!(st.char_scale, 100);
         assert!((st.char_spacing - w * 0.05 / 5.0).abs() < 0.05);
         // 25% narrower (condensed font) → scaling.
         let mut st = TextStyle { font: "Arial".into(), size: 10.0, ..Default::default() };
-        adjust("Hello", &mut st, w * 0.75, &lib);
+        adjust("Hello", &mut st, w * 0.75, 0.0, &lib);
         assert_eq!(st.char_scale, 75);
         // Matching width → untouched.
         let mut st = TextStyle { font: "Arial".into(), size: 10.0, ..Default::default() };
-        adjust("Hello", &mut st, w, &lib);
+        adjust("Hello", &mut st, w, 0.0, &lib);
         assert_eq!((st.char_scale, st.char_spacing), (100, 0.0));
+        // 20% wider only because of letter spacing → spacing, not scaling.
+        let mut st = TextStyle { font: "Arial".into(), size: 10.0, ..Default::default() };
+        adjust("Hello", &mut st, w * 1.2, w * 0.2, &lib);
+        assert_eq!(st.char_scale, 100);
+        assert!((st.char_spacing - w * 0.2 / 5.0).abs() < 0.05);
     }
 }

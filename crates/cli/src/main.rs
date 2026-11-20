@@ -71,6 +71,10 @@ struct Args {
     #[arg(long)]
     no_width_compensation: bool,
 
+    /// Do not embed the PDF's fonts into the DOCX.
+    #[arg(long)]
+    no_embed_fonts: bool,
+
     /// Path to the PDFium shared library (file or directory).
     #[arg(long)]
     pdfium: Option<PathBuf>,
@@ -101,6 +105,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         password: args.password.clone(),
         detect_headings: !args.no_headings,
         compensate_widths: !args.no_width_compensation,
+        embed_fonts: !args.no_embed_fonts,
         pdfium_path: args.pdfium.clone(),
         ..Default::default()
     };
@@ -145,13 +150,14 @@ fn run(args: Args) -> anyhow::Result<()> {
             Ok(r) => {
                 if !quiet {
                     log::info!(
-                        "wrote {} ({} pages, {} paragraphs, {} tables, {} images{}) in {:.1}s",
+                        "wrote {} ({} pages, {} paragraphs, {} tables, {} images{}{}) in {:.1}s",
                         output.display(),
                         r.pages,
                         r.paragraphs,
                         r.tables,
                         r.images,
                         if r.ocr_pages.is_empty() { String::new() } else { format!(", OCR on {} page(s)", r.ocr_pages.len()) },
+                        if r.embedded_fonts.is_empty() { String::new() } else { format!(", embedded fonts: {}", r.embedded_fonts.join(", ")) },
                         start.elapsed().as_secs_f32()
                     );
                 }

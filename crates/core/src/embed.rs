@@ -58,7 +58,7 @@ fn name_of(o: Option<&Object>) -> Option<&[u8]> {
     }
 }
 
-fn as_dict<'a>(o: Option<&'a Object>) -> Option<&'a lopdf::Dictionary> {
+fn as_dict(o: Option<&Object>) -> Option<&lopdf::Dictionary> {
     match o {
         Some(Object::Dictionary(d)) => Some(d),
         Some(Object::Stream(s)) => Some(&s.dict),
@@ -592,10 +592,15 @@ pub fn rebuild_font(data: &[u8], map: &HashMap<char, u16>, family: &str, bold: b
 // Selection
 // ---------------------------------------------------------------------------
 
+/// A face: (family, bold, italic).
+type FaceKey = (String, bool, bool);
+/// Characters used by a face and its runs as (text, PDF width, size).
+type FaceUse = (HashSet<char>, Vec<(String, f32, f32)>);
+
 /// Characters used per (family, bold, italic) in the laid-out pages.
-fn used_chars(pages: &[PageLayout]) -> HashMap<(String, bool, bool), (HashSet<char>, Vec<(String, f32, f32)>)> {
-    let mut used: HashMap<(String, bool, bool), (HashSet<char>, Vec<(String, f32, f32)>)> = HashMap::new();
-    fn inl(v: &[Inline], used: &mut HashMap<(String, bool, bool), (HashSet<char>, Vec<(String, f32, f32)>)>) {
+fn used_chars(pages: &[PageLayout]) -> HashMap<FaceKey, FaceUse> {
+    let mut used: HashMap<FaceKey, FaceUse> = HashMap::new();
+    fn inl(v: &[Inline], used: &mut HashMap<FaceKey, FaceUse>) {
         for i in v {
             if let Inline::Text { text, style, pdf_width, .. } = i {
                 let e = used.entry((style.font.clone(), style.bold, style.italic)).or_default();
@@ -606,7 +611,7 @@ fn used_chars(pages: &[PageLayout]) -> HashMap<(String, bool, bool), (HashSet<ch
             }
         }
     }
-    fn blocks(v: &[Block], used: &mut HashMap<(String, bool, bool), (HashSet<char>, Vec<(String, f32, f32)>)>) {
+    fn blocks(v: &[Block], used: &mut HashMap<FaceKey, FaceUse>) {
         for b in v {
             match b {
                 Block::Paragraph(p) => inl(&p.inlines, used),

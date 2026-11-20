@@ -3,6 +3,7 @@
 //! cannot be found (set `PDFIUM_DYNAMIC_LIB_PATH`) the tests are skipped.
 
 use std::io::Read;
+
 use std::path::{Path, PathBuf};
 
 use pdf2word_core::{convert, ConvertOptions, LayoutMode, OcrMode};
@@ -186,4 +187,149 @@ fn ocr_pipeline_on_rendered_page() {
     assert!(all.contains("Quarterly Business Report"), "{all}");
     assert!(all.contains("Executive Summary"));
     assert_eq!(tables, 1, "scanned table not reconstructed");
+}
+
+fn run_zip(name: &str) -> zip::ZipArchive<std::io::Cursor<Vec<u8>>> {
+    let out = std::env::temp_dir().join(format!("pdf2word-test-{}-{name}-zip.docx", std::process::id()));
+    let opts = ConvertOptions { ocr_mode: OcrMode::Never, ..Default::default() };
+    convert(&fixture(name), &out, &opts, None, &mut |_| {}).expect("conversion failed");
+    let bytes = std::fs::read(&out).unwrap();
+    let _ = std::fs::remove_file(&out);
+    zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap()
+}
+
+#[test]
+fn width_compensation_for_condensed_and_tracked_text() {
+    if !pdfium_available() {
+        return;
+    }
+    let d = run("fonts.pdf", LayoutMode::Flow);
+    // Helvetica drawn at 82% width → character scale; letter-spaced Times → spacing.
+    assert!(d.document.contains(r#"<w:w w:val="82"/>"#), "no horizontal scaling");
+    assert!(d.document.contains("<w:spacing w:val=\""), "no character spacing");
+}
+
+#[test]
+fn embeds_pdf_fonts() {
+    if !pdfium_available() {
+        return;
+    }
+    let mut z = run_zip("embedded.pdf");
+    let mut table = String::new();
+    z.by_name("word/fontTable.xml").unwrap().read_to_string(&mut table).unwrap();
+    assert!(table.contains(r#"<w:font w:name="Fixture Sans">"#), "{table}");
+    let key = table.split("w:fontKey=\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+    let mut obf = Vec::new();
+    z.by_name("word/fonts/font1.odttf").unwrap().read_to_end(&mut obf).unwrap();
+    let font = pdf2word_core::embed::obfuscate(&obf, &key);
+    let face = ttf_parser::Face::parse(&font, 0).expect("embedded font must parse");
+    assert_eq!(pdf2word_core::metrics::face_families(&face), vec!["Fixture Sans".to_string()]);
+    for c in "Layout preservation".chars().filter(|c| !c.is_whitespace()) {
+        assert!(face.glyph_index(c).is_some(), "missing glyph for {c:?}");
+    }
+    let mut settings = String::new();
+    z.by_name("word/settings.xml").unwrap().read_to_string(&mut settings).unwrap();
+    assert!(settings.contains("<w:embedTrueTypeFonts/>"));
+}
+
+#[test]
+fn right_to_left_text() {
+    if !pdfium_available() {
+        return;
+    }
+    for name in ["rtl.pdf", "rtl-office.pdf"] {
+        let d = run(name, LayoutMode::Flow);
+        let t = text(&d.document);
+        assert!(d.document.contains("<w:bidi/>"), "{name}: no bidi paragraphs");
+        assert!(d.document.contains("<w:rtl/>"), "{name}: no rtl runs");
+        // Logical (reading) order, not the visual order stored in the PDF.
+        assert!(t.contains("מסמך לדוגמה בעברית"), "{name}: {t}");
+        assert!(t.contains("English"), "{name}: Latin run lost");
+        assert!(t.contains("2024"), "{name}: number reversed");
+    }
+}
+
+#[test]
+fn rotated_and_vertical_text_boxes() {
+    if !pdfium_available() {
+        return;
+    }
+    let d = run("rotated.pdf", LayoutMode::Flow);
+    assert_eq!(d.document.matches("<wps:wsp>").count(), 3, "expected sidebar, watermark and vertical column");
+    assert!(d.document.contains(r#"vert="vert270""#), "90° sidebar should use vert270");
+    assert!(d.document.contains(r#"vert="eaVert""#), "Japanese column should be eaVert");
+    assert!(d.document.contains(r#"<a:xfrm rot="19800000">"#), "30° watermark rotation");
+    let t = text(&d.document);
+    for s in ["Confidential sidebar label", "DRAFT", "縦書きの日本語"] {
+        assert!(t.contains(s), "missing {s}");
+    }
+    // The body text stays ordinary horizontal text.
+    assert!(t.contains("Body text stays horizontal."));
+}
+
+#[test]
+fn equations_become_office_math() {
+    if !pdfium_available() {
+        return;
+    }
+    let d = run("math.pdf", LayoutMode::Flow);
+    let doc = &d.document;
+    assert!(doc.matches("<m:oMath>").count() >= 6, "inline and display equations");
+    for tag in ["<m:f>", "<m:rad>", "<m:nary>", "<m:sSup>", "<m:sSub>"] {
+        assert!(doc.contains(tag), "missing {tag}");
+    }
+    // Fraction of the quadratic formula: numerator with a radical, denominator 2a.
+    assert!(doc.contains(r#"<m:den><m:r><w:rPr><w:rFonts w:ascii="Cambria Math" w:hAnsi="Cambria Math"/>"#));
+    // Matrix and case distinction are kept as pictures.
+    assert_eq!(d.media, 2);
+    // Surrounding text is untouched.
+    assert!(text(doc).contains("Normal text continues after the equations."));
+}
+
+#[cfg(feature = "ocr")]
+#[test]
+fn ocr_detects_bold_italic_and_font_class() {
+    use pdf2word_core::model::{Generic, RawPage};
+    use pdf2word_core::ocr::{words_to_glyphs, OcrEngine, OcrSettings};
+
+    if !pdfium_available() {
+        return;
+    }
+    let Ok(mut engine) = OcrEngine::new(OcrSettings::default()) else { return };
+    let pdfium = pdf2word_core::load_pdfium(None).unwrap();
+    let doc = pdfium.load_pdf_from_file(&fixture("typography.pdf"), None).unwrap();
+    let page = doc.pages().get(0).unwrap();
+    let img = pdf2word_core::extract::render_page(&page, 200.0).unwrap();
+    let words = engine.recognize(&img, 200.0).unwrap();
+    let mut raw = RawPage { width: page.width().value, height: page.height().value, ..Default::default() };
+    words_to_glyphs(&mut raw, &words, &img, engine.settings());
+    // Style of the first glyph of each line, keyed by the line's first word.
+    let mut lines: Vec<(f32, String, (Generic, bool, bool))> = Vec::new();
+    for g in &raw.glyphs {
+        if !lines.iter().any(|(b, _, _)| (b - g.baseline).abs() < 3.0) {
+            let st = &raw.styles[g.style];
+            let word: String = raw
+                .glyphs
+                .iter()
+                .filter(|o| (o.baseline - g.baseline).abs() < 3.0 && o.bbox.x0 < g.bbox.x0 + 60.0)
+                .map(|o| o.ch)
+                .collect();
+            lines.push((g.baseline, word, (st.generic, st.bold, st.italic)));
+        }
+    }
+    lines.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let expected = [
+        (Generic::Serif, false, false),
+        (Generic::Serif, true, false),
+        (Generic::Serif, false, true),
+        (Generic::Sans, false, false),
+        (Generic::Sans, true, false),
+        (Generic::Sans, false, true),
+        (Generic::Mono, false, false),
+        (Generic::Mono, true, false),
+    ];
+    assert_eq!(lines.len(), expected.len(), "{lines:?}");
+    for ((_, word, got), want) in lines.iter().zip(expected) {
+        assert_eq!(*got, want, "line starting {word:?}");
+    }
 }

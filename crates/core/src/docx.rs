@@ -961,7 +961,7 @@ mod tests {
     #[test]
     fn writes_valid_zip() {
         let p = Paragraph {
-            inlines: vec![Inline::Text { text: "Hello & world".into(), style: TextStyle::default(), link: Some("https://example.com".into()), pdf_width: 0.0 }],
+            inlines: vec![Inline::Text { text: "Hello & world".into(), style: TextStyle::default(), link: Some("https://example.com".into()), pdf_width: 0.0, pdf_tracking: 0.0 }],
             line_pitch: Some(13.2),
             n_lines: 1,
             font_size: 11.0,
