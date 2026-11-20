@@ -27,6 +27,10 @@ has_rpath() {
   otool -l "$1" | awk '/LC_RPATH/ {getline; getline; print $2}' | grep -x "$2" > /dev/null
 }
 
+uses_rpath() {
+  otool -L "$1" | tail -n +2 | grep "@rpath/" > /dev/null
+}
+
 changed=1
 round=0
 while [ "$changed" -eq 1 ] && [ "$round" -lt 10 ]; do
@@ -46,7 +50,7 @@ while [ "$changed" -eq 1 ] && [ "$round" -lt 10 ]; do
           echo "bundling $name (needed by ${f##*/})"
           cp -L "$src" "$FW/$name"
           chmod u+w "$FW/$name"
-          install_name_tool -id "@rpath/$name" "$FW/$name"
+          install_name_tool -id "@rpath/$name" "$FW/$name" 2> /dev/null || true
           changed=1
         else
           echo "warning: $name (needed by ${f##*/}) not found" >&2
@@ -57,19 +61,23 @@ while [ "$changed" -eq 1 ] && [ "$round" -lt 10 ]; do
       case "$dep" in
         "$PREFIX"/* | /usr/local/* | /opt/homebrew/*)
           chmod u+w "$f"
-          install_name_tool -change "$dep" "@rpath/$name" "$f"
+          install_name_tool -change "$dep" "@rpath/$name" "$f" 2> /dev/null ||
+            echo "warning: could not redirect $name in ${f##*/}" >&2
           ;;
       esac
     done
-    # @rpath references resolve next to the library (libraries) or in
-    # Frameworks (executables).
+    # A bundled library resolves @rpath next to itself. (dyld also searches the
+    # executable's rpath, @executable_path/../Frameworks, which macdeployqt sets;
+    # executables and prebuilt libraries without header space are left alone.)
     case "$f" in
-      "$FW"/*) want="@loader_path" ;;
-      *) want="@executable_path/../Frameworks" ;;
+      "$FW"/*)
+        if uses_rpath "$f" && ! has_rpath "$f" "@loader_path" && ! has_rpath "$f" "@loader_path/../Frameworks" &&
+          ! has_rpath "$f" "@executable_path/../Frameworks"; then
+          chmod u+w "$f"
+          install_name_tool -add_rpath "@loader_path" "$f" 2> /dev/null ||
+            echo "note: no room for an rpath in ${f##*/}; relying on the executable's" >&2
+        fi
+        ;;
     esac
-    if ! has_rpath "$f" "$want"; then
-      chmod u+w "$f"
-      install_name_tool -add_rpath "$want" "$f"
-    fi
   done
 done
