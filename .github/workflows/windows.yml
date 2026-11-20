@@ -1,0 +1,100 @@
+name: Windows build
+
+on:
+  push:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  VCPKG_TRIPLET: x64-windows-release
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Qt 6
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.8.3"
+          arch: win64_msvc2022_64
+          cache: true
+
+      - name: Cache vcpkg packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}\vcpkg-cache
+          key: vcpkg-tesseract-${{ env.VCPKG_TRIPLET }}-v1
+
+      - name: Install Tesseract (vcpkg)
+        shell: pwsh
+        run: |
+          $cache = "${{ github.workspace }}\vcpkg-cache"
+          New-Item -ItemType Directory -Force $cache | Out-Null
+          $env:VCPKG_DEFAULT_BINARY_CACHE = $cache
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install "tesseract:$env:VCPKG_TRIPLET"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $root = "$env:VCPKG_INSTALLATION_ROOT\installed\$env:VCPKG_TRIPLET"
+          $lib = Get-ChildItem "$root\lib" -Filter "tesseract*.lib" | Select-Object -First 1
+          "TESSERACT_LIB_DIR=$root\lib" | Out-File -Append $env:GITHUB_ENV
+          "TESSERACT_LIB_NAME=$($lib.BaseName)" | Out-File -Append $env:GITHUB_ENV
+          "VCPKG_BIN=$root\bin" | Out-File -Append $env:GITHUB_ENV
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $env:QMAKE = "$env:QT_ROOT_DIR\bin\qmake.exe"
+          cargo build --release -p pdf2word -p pdf2word-gui
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $dist = "dist\pdf2word-windows-x64"
+          New-Item -ItemType Directory -Force $dist, "$dist\tessdata" | Out-Null
+          Copy-Item target\release\pdf2word.exe, target\release\pdf2word-gui.exe $dist
+          & "$env:QT_ROOT_DIR\bin\windeployqt.exe" --release --no-translations --qmldir crates\gui\qml "$dist\pdf2word-gui.exe"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Copy-Item "$env:VCPKG_BIN\*.dll" $dist
+          bash tools/fetch-pdfium.sh "$dist" win-x64
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Invoke-WebRequest https://github.com/tesseract-ocr/tessdata_fast/raw/main/eng.traineddata -OutFile "$dist\tessdata\eng.traineddata"
+          Invoke-WebRequest https://github.com/tesseract-ocr/tessdata_fast/raw/main/osd.traineddata -OutFile "$dist\tessdata\osd.traineddata"
+          Copy-Item packaging\windows\README.txt $dist
+          Get-ChildItem $dist | Format-Table Name, Length
+
+      - name: Smoke test (CLI, text and OCR)
+        shell: pwsh
+        run: |
+          $dist = "dist\pdf2word-windows-x64"
+          & "$dist\pdf2word.exe" crates\core\tests\fixtures\report.pdf -o smoke.docx
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          & "$dist\pdf2word.exe" crates\core\tests\fixtures\invoice.pdf -o smoke-ocr.docx --ocr always 2>&1 | Tee-Object ocr.log
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          if (Select-String -Path ocr.log -Pattern "OCR unavailable") { Write-Error "OCR not working"; exit 1 }
+          Get-Item smoke.docx, smoke-ocr.docx | Format-Table Name, Length
+
+      - name: Smoke test (GUI starts and loads its QML)
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path "dist\pdf2word-windows-x64\pdf2word-gui.exe").Path
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $env:QT_FORCE_STDERR_LOGGING = "1"
+          $p = Start-Process $exe -ArgumentList "crates\core\tests\fixtures\report.pdf" -PassThru -RedirectStandardError gui.err -RedirectStandardOutput gui.out
+          Start-Sleep -Seconds 15
+          $alive = -not $p.HasExited
+          if ($alive) { Stop-Process -Id $p.Id -Force }
+          Get-Content gui.err, gui.out -ErrorAction SilentlyContinue
+          if (-not $alive) { Write-Error "GUI exited early (code $($p.ExitCode))"; exit 1 }
+          if (Select-String -Path gui.err -Pattern "is not installed|failed to load|QQmlApplicationEngine failed|Cannot load library") { Write-Error "QML failed to load"; exit 1 }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pdf2word-windows-x64
+          path: dist
+          if-no-files-found: error

@@ -90,7 +90,8 @@ impl OcrEngine {
             anyhow::bail!("failed to create Tesseract instance");
         }
         let lang = CString::new(settings.language.clone())?;
-        let datapath = match &settings.tessdata {
+        let tessdata = settings.tessdata.clone().or_else(bundled_tessdata);
+        let datapath = match &tessdata {
             Some(p) => Some(CString::new(p.to_string_lossy().into_owned())?),
             None => None,
         };
@@ -181,6 +182,18 @@ impl OcrEngine {
     pub fn recognize(&mut self, _img: &DynamicImage, _dpi: f32) -> anyhow::Result<Vec<OcrWord>> {
         anyhow::bail!("OCR not available")
     }
+}
+
+/// A `tessdata` folder shipped next to the executable (portable Windows/macOS
+/// bundles), used unless `TESSDATA_PREFIX` is set.
+#[cfg_attr(not(feature = "ocr"), allow(dead_code))]
+fn bundled_tessdata() -> Option<std::path::PathBuf> {
+    if std::env::var_os("TESSDATA_PREFIX").is_some() {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    [dir.join("tessdata"), dir.join("../share/tessdata")].into_iter().find(|p| p.is_dir())
 }
 
 /// Parses Tesseract TSV output (level 5 rows are words).

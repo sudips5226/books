@@ -1,5 +1,8 @@
 //! Qt Quick desktop application for converting PDF files to Word documents.
 
+// No console window behind the GUI in Windows release builds.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod converter;
 
 use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QString, QUrl};
