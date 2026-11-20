@@ -15,6 +15,8 @@ use crate::model::*;
 #[derive(Clone, Copy, Debug)]
 pub struct PageTransform {
     rot: u8,
+    /// The page's own /Rotate (quarter turns); differs from `rot` when ignored.
+    page_rot: u8,
     ox: f32,
     oy: f32,
     w0: f32,
@@ -22,6 +24,42 @@ pub struct PageTransform {
 }
 
 impl PageTransform {
+    /// The transform that shows most of the page's text upright.
+    ///
+    /// `/Rotate` is used two ways: landscape pages whose content is drawn
+    /// rotated so that it displays upright (keep the rotation), and ordinary
+    /// pages that are merely displayed turned (ignore it, so the text stays
+    /// readable and editable).
+    pub fn for_text(page: &PdfPage) -> Self {
+        let tf = Self::new(page);
+        if tf.rot == 0 {
+            return tf;
+        }
+        let (mut display_upright, mut user_upright) = (0usize, 0usize);
+        if let Ok(text) = page.text() {
+            for ch in text.chars().iter().take(400) {
+                if ch.unicode_char().is_none_or(|c| c.is_whitespace()) {
+                    continue;
+                }
+                let a = ch.angle_degrees().unwrap_or(0.0).rem_euclid(360.0);
+                let near = |t: f32| {
+                    let d = (a - t).rem_euclid(360.0);
+                    d.min(360.0 - d) < 4.0
+                };
+                if near(0.0) {
+                    user_upright += 1;
+                } else if near(tf.rotation_degrees()) || near(360.0 - tf.rotation_degrees()) {
+                    display_upright += 1;
+                }
+            }
+        }
+        if user_upright > display_upright {
+            Self { rot: 0, ..tf }
+        } else {
+            tf
+        }
+    }
+
     pub fn new(page: &PdfPage) -> Self {
         let crop = page
             .boundaries()
@@ -37,6 +75,7 @@ impl PageTransform {
         };
         Self {
             rot,
+            page_rot: rot,
             ox: crop.left().value,
             oy: crop.bottom().value,
             w0: crop.width().value,
@@ -55,6 +94,27 @@ impl PageTransform {
     /// Rotation of the page in degrees (clockwise).
     pub fn rotation_degrees(&self) -> f32 {
         self.rot as f32 * 90.0
+    }
+
+    /// Renders the page in this transform's orientation at `scale` pixels per point.
+    pub fn render(&self, page: &PdfPage, scale: f32) -> anyhow::Result<DynamicImage> {
+        // PDFium always applies /Rotate: render as displayed, then turn the
+        // bitmap back by the part of the rotation this transform ignores.
+        let display_w = if self.page_rot % 2 == 1 { self.h0 } else { self.w0 };
+        let bitmap = page.render_with_config(
+            &PdfRenderConfig::new()
+                .set_target_width((display_w * scale).round() as i32)
+                .set_maximum_height(20000)
+                .render_form_data(true)
+                .set_clear_color(PdfColor::WHITE),
+        )?;
+        let img = bitmap.as_image()?;
+        Ok(match (self.page_rot + 4 - self.rot) % 4 {
+            1 => img.rotate270(),
+            2 => img.rotate180(),
+            3 => img.rotate90(),
+            _ => img,
+        })
     }
 
     pub fn point(&self, x: f32, y: f32) -> (f32, f32) {
@@ -143,7 +203,7 @@ pub fn extract_page(
     index: usize,
     opts: &ExtractOptions,
 ) -> anyhow::Result<(RawPage, PageStats)> {
-    let tf = PageTransform::new(page);
+    let tf = PageTransform::for_text(page);
     let mut raw = RawPage {
         index,
         width: tf.width(),
@@ -342,6 +402,29 @@ pub fn extract_page(
 
     classify_paths(&mut raw, &paths, &mut graphic_hints, &page_rect);
 
+    // Content outside the crop box is invisible: drop it, clip the rest.
+    let visible = page_rect.expand(0.5);
+    raw.glyphs.retain(|g| visible.contains_point(g.bbox.cx(), g.bbox.cy()));
+    raw.rotated.retain(|(g, _)| visible.contains_point(g.bbox.cx(), g.bbox.cy()));
+    raw.images.retain_mut(|im| {
+        let clipped = im.bbox.intersection(&page_rect);
+        let keep = !clipped.is_empty() && clipped.area() > 0.2 * im.bbox.area().max(1.0);
+        im.bbox = clipped;
+        keep
+    });
+    raw.rules.retain_mut(|r| {
+        let clipped = r.bbox.intersection(&visible);
+        let keep = clipped.width() > 0.0 && clipped.height() > 0.0;
+        r.bbox = clipped;
+        keep
+    });
+    raw.boxes.retain_mut(|b| {
+        let clipped = b.bbox.intersection(&page_rect);
+        let keep = !clipped.is_empty();
+        b.bbox = clipped;
+        keep
+    });
+
     // Equations before figure detection: fraction bars are not chart axes.
     let (equations, complex_math) = crate::math::extract_display_equations(&mut raw);
     raw.equations = equations;
@@ -356,7 +439,7 @@ pub fn extract_page(
         regions.extend(complex_math.into_iter().map(|r| (r, 0.0)));
     }
     if !regions.is_empty() {
-        if let Err(e) = rasterize_regions(page, &mut raw, &regions, opts) {
+        if let Err(e) = rasterize_regions(page, &tf, &mut raw, &regions, opts) {
             log::warn!("page {}: could not rasterise vector graphics: {e}", index + 1);
         }
     }
@@ -736,16 +819,8 @@ fn text_runs(raw: &RawPage) -> Vec<(Rect, usize)> {
 }
 
 /// Renders figure regions to images, removing the glyphs/images/rules they cover.
-fn rasterize_regions(page: &PdfPage, raw: &mut RawPage, regions: &[(Rect, f32)], opts: &ExtractOptions) -> anyhow::Result<()> {
-    let scale = opts.graphics_dpi / 72.0;
-    let target_w = (raw.width * scale).round() as i32;
-    let bitmap = page.render_with_config(
-        &PdfRenderConfig::new()
-            .set_target_width(target_w)
-            .render_form_data(true)
-            .set_clear_color(PdfColor::WHITE),
-    )?;
-    let full = bitmap.as_image()?;
+fn rasterize_regions(page: &PdfPage, tf: &PageTransform, raw: &mut RawPage, regions: &[(Rect, f32)], opts: &ExtractOptions) -> anyhow::Result<()> {
+    let full = tf.render(page, opts.graphics_dpi / 72.0)?;
     let (pw, ph) = full.dimensions();
     let sx = pw as f32 / raw.width;
     let sy = ph as f32 / raw.height;
@@ -772,16 +847,8 @@ fn rasterize_regions(page: &PdfPage, raw: &mut RawPage, regions: &[(Rect, f32)],
 
 /// Renders a full page to an RGB image at the given DPI (used by OCR).
 pub fn render_page(page: &PdfPage, dpi: f32) -> anyhow::Result<DynamicImage> {
-    let tf = PageTransform::new(page);
-    let target_w = (tf.width() * dpi / 72.0).round() as i32;
-    let bitmap = page.render_with_config(
-        &PdfRenderConfig::new()
-            .set_target_width(target_w)
-            .set_maximum_height(20000)
-            .render_form_data(true)
-            .set_clear_color(PdfColor::WHITE),
-    )?;
-    Ok(bitmap.as_image()?)
+    // Same orientation as the extracted text, so OCR and crops line up.
+    PageTransform::for_text(page).render(page, dpi / 72.0)
 }
 
 #[cfg(test)]

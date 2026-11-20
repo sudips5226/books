@@ -560,7 +560,8 @@ impl Writer {
         }
         out.push_str("</w:tblGrid>");
         for row in &t.rows {
-            out.push_str("<w:tr><w:trPr><w:cantSplit/>");
+            // Layout tables (columns) may break across pages; data rows stay together.
+            out.push_str(if t.layout_only { "<w:tr><w:trPr>" } else { "<w:tr><w:trPr><w:cantSplit/>" });
             if row.height > 0.0 && !t.layout_only {
                 let _ = write!(out, r#"<w:trHeight w:val="{}" w:hRule="atLeast"/>"#, tw(row.height));
             }
@@ -690,8 +691,9 @@ impl Writer {
         let orient = if page.width > page.height { r#" w:orient="landscape""# } else { "" };
         format!(
             r#"<w:sectPr><w:pgSz w:w="{}" w:h="{}"{orient}/><w:pgMar w:top="{}" w:right="{}" w:bottom="{}" w:left="{}" w:header="0" w:footer="0" w:gutter="0"/><w:cols w:space="720"/></w:sectPr>"#,
-            tw(page.width),
-            tw(page.height),
+            // Word refuses pages smaller than about a tenth of an inch.
+            tw(page.width).max(144),
+            tw(page.height).max(144),
             tw(page.margin_top),
             tw(page.margin_right),
             tw(page.margin_bottom),
@@ -727,6 +729,9 @@ impl Writer {
                 }
             }
             LayoutMode::Exact => {
+                // Frames attach to the paragraph before them: give every page its own
+                // (empty) anchor so frames cannot drift onto the previous page.
+                out.push_str(r#"<w:p><w:pPr><w:spacing w:before="0" w:after="0" w:line="20" w:lineRule="exact"/><w:rPr><w:sz w:val="2"/></w:rPr></w:pPr></w:p>"#);
                 for b in &page.blocks {
                     self.exact_block(&mut out, b, &mut anchors);
                 }

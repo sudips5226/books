@@ -1482,6 +1482,12 @@ impl Emitter<'_> {
             bounds.push((w[0].x1 + w[1].x0) / 2.0);
         }
         bounds.push(child_boxes.last().unwrap().x1.min(frame.x1).max(child_boxes.last().unwrap().x1));
+        // Never let a column collapse (content can stick out of the frame).
+        for i in 1..bounds.len() {
+            if bounds[i] < bounds[i - 1] + 6.0 {
+                bounds[i] = bounds[i - 1] + 6.0;
+            }
+        }
 
         // 2. Whitespace-aligned data table.
         if self.detect_tables && all_text {
@@ -2268,8 +2274,10 @@ pub fn analyse_page(raw_in: &RawPage, opts: &LayoutOptions) -> PageLayout {
     }
 
     let content = Rect::union_all(items.iter().map(|i| &i.bbox)).unwrap();
-    let margin_left = content.x0.clamp(0.0, raw.width / 2.0 - 36.0).max(0.0).floor();
-    let margin_right = (raw.width - content.x1).clamp(0.0, raw.width / 2.0 - 36.0).max(0.0).floor();
+    // Tiny pages (image-only PDFs at 72 dpi can be a few points wide) get no margins.
+    let max_margin = (raw.width / 2.0 - 36.0).max(0.0);
+    let margin_left = content.x0.clamp(0.0, max_margin).floor();
+    let margin_right = (raw.width - content.x1).clamp(0.0, max_margin).floor();
     let frame = Frame { x0: margin_left, x1: raw.width - margin_right };
 
     let ctx = Ctx { raw: &raw, segs: &segs, items: &items, body_size };
@@ -2289,7 +2297,7 @@ pub fn analyse_page(raw_in: &RawPage, opts: &LayoutOptions) -> PageLayout {
         None => 72.0,
     };
     layout.margin_top = top.min(raw.height / 2.0);
-    layout.margin_bottom = (raw.height - content.y1 - 4.0).clamp(0.0, 24.0);
+    layout.margin_bottom = (raw.height - content.y1 - 4.0).clamp(0.0, 24.0).min(raw.height / 4.0);
     layout.margin_left = margin_left;
     layout.margin_right = margin_right;
     layout.blocks = blocks;

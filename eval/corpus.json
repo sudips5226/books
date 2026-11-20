@@ -1,0 +1,198 @@
+[
+ {
+  "name": "minimal-latex",
+  "url": "https://raw.githubusercontent.com/py-pdf/sample-files/main/001-trivial/minimal-document.pdf",
+  "pages": null,
+  "notes": "pdfTeX one-pager",
+  "sha256": "f723638db6e763cf4ccadad38a3d38a02d9ecab95dab1f0bbf00e801991b5f92"
+ },
+ {
+  "name": "libreoffice-trivial",
+  "url": "https://raw.githubusercontent.com/py-pdf/sample-files/main/002-trivial-libre-office-writer/002-trivial-libre-office-writer.pdf",
+  "pages": null,
+  "notes": "LibreOffice Writer",
+  "sha256": "fc67ce4f76ffb44e818ebe4f673dbeb6002ad93a59f3856ff14fb1d3625f10a5"
+ },
+ {
+  "name": "latex-image",
+  "url": "https://raw.githubusercontent.com/py-pdf/sample-files/main/003-pdflatex-image/pdflatex-image.pdf",
+  "pages": null,
+  "notes": "pdfTeX with image",
+  "sha256": "64c5bc35008015936ef3ff60f6ad268a713b5271727b72ef308f87b9b495646f"
+ },
+ {
+  "name": "latex-4-pages",
+  "url": "https://raw.githubusercontent.com/py-pdf/sample-files/main/004-pdflatex-4-pages/pdflatex-4-pages.pdf",
+  "pages": null,
+  "notes": "pdfTeX, 4 pages",
+  "sha256": "f17a09190ad8a04964d78115d8ba7fc7a298557274fa14932ba58612342b7dec"
+ },
+ {
+  "name": "latex-outline",
+  "url": "https://raw.githubusercontent.com/py-pdf/sample-files/main/006-pdflatex-outline/pdflatex-outline.pdf",
+  "pages": null,
+  "notes": "pdfTeX with outline",
+  "sha256": "17b5a4dac75613b82749c7538fc93991a385a5d419cc9832fdba24c1726a031a"
+ },
+ {
+  "name": "imagemagick-images",
+  "url": "https://raw.githubusercontent.com/py-pdf/sample-files/main/007-imagemagick-images/imagemagick-images.pdf",
+  "pages": null,
+  "notes": "image-only pages",
+  "sha256": "0f2076573bfed1107300a2383b88bbbbc2b85a57f06b3ff478a0faa7ded57b4e"
+ },
+ {
+  "name": "reportlab-inline-image",
+  "url": "https://raw.githubusercontent.com/py-pdf/sample-files/main/008-reportlab-inline-image/inline-image.pdf",
+  "pages": null,
+  "notes": "ReportLab inline image",
+  "sha256": "db5c34fea270f38b152d8476e6f3bba855460958e957f69a0542002538cac1c2"
+ },
+ {
+  "name": "geotopo-book",
+  "url": "https://raw.githubusercontent.com/py-pdf/sample-files/main/009-pdflatex-geotopo/GeoTopo.pdf",
+  "pages": "1-12",
+  "notes": "LaTeX book (German, maths)",
+  "sha256": "a0b9242aef9b5a2c4850160cc9aaf64f5c7b8be705d6872ae28aebf5ab512540"
+ },
+ {
+  "name": "latex-forms",
+  "url": "https://raw.githubusercontent.com/py-pdf/sample-files/main/010-pdflatex-forms/pdflatex-forms.pdf",
+  "pages": null,
+  "notes": "AcroForm fields (pdfTeX)",
+  "sha256": "fc6265298caafffeee9dd2d7f3ae2e53ab9f61ec0561369429d442f731d339da"
+ },
+ {
+  "name": "google-docs",
+  "url": "https://raw.githubusercontent.com/py-pdf/sample-files/main/011-google-doc-document/google-doc-document.pdf",
+  "pages": null,
+  "notes": "Google Docs export",
+  "sha256": "69f6b7f493b1bc55d518942976cbeadc4ec0a36f6d8a6dc24feffc516d35b2c9"
+ },
+ {
+  "name": "libreoffice-form",
+  "url": "https://raw.githubusercontent.com/py-pdf/sample-files/main/012-libreoffice-form/libreoffice-form.pdf",
+  "pages": null,
+  "notes": "AcroForm fields (LibreOffice)",
+  "sha256": "9105eeef8c8cafdb141b7edd768a5e08adffe320d1d4f89e1a7112a2b37d1c57"
+ },
+ {
+  "name": "outlines",
+  "url": "https://raw.githubusercontent.com/py-pdf/sample-files/main/014-outlines/mistitled_outlines_example.pdf",
+  "pages": null,
+  "notes": "outline entries",
+  "sha256": "362dc3cc03538e864841a08d2b7365daf926651a2fe2c343669e03c8ac33b1af"
+ },
+ {
+  "name": "arabic",
+  "url": "https://raw.githubusercontent.com/py-pdf/sample-files/main/015-arabic/habibi.pdf",
+  "pages": null,
+  "notes": "Arabic (WeasyPrint)",
+  "sha256": "1017c4559eb7d0ccf7d151a3f051c8c1da27a7c1dc8050b2b687e3d3228e1b6f"
+ },
+ {
+  "name": "arabic-rotated",
+  "url": "https://raw.githubusercontent.com/py-pdf/sample-files/main/015-arabic/habibi-rotated.pdf",
+  "pages": null,
+  "notes": "rotated pages",
+  "sha256": "56329f1e3cff5358f1f2aadcfac03467cce51b36b2e2daab9c14cef26f7ea536"
+ },
+ {
+  "name": "libreoffice-link",
+  "url": "https://raw.githubusercontent.com/py-pdf/sample-files/main/016-libre-office-link/libre-office-link.pdf",
+  "pages": null,
+  "notes": "hyperlinks",
+  "sha256": "bc38b458acd125c09fb7603cf0cca5d8737eea9fe353c2aef2c42b3db9cf9076"
+ },
+ {
+  "name": "base14-annotator",
+  "url": "https://raw.githubusercontent.com/py-pdf/sample-files/main/018-base64-image/base64image.pdf",
+  "pages": null,
+  "notes": "PDF Annotator",
+  "sha256": "aaad90df16fce40ec768629d2135479b98f65b39bb27c7f80fb106393187d619"
+ },
+ {
+  "name": "pdfa-ghostscript",
+  "url": "https://raw.githubusercontent.com/py-pdf/sample-files/main/021-pdfa/crazyones-pdfa.pdf",
+  "pages": null,
+  "notes": "Ghostscript PDF/A",
+  "sha256": "f05f2738a1fa8c1d2e1147881fe1a62516a7f8caaf784067790731f56df626c4"
+ },
+ {
+  "name": "qt-pdf",
+  "url": "https://raw.githubusercontent.com/py-pdf/sample-files/main/022-pdfkit/pdfkit.pdf",
+  "pages": null,
+  "notes": "Qt-generated",
+  "sha256": "8820ba44cd62264fd561e921aacc214cee7ba76723f525d591cdb2104a87f0dd"
+ },
+ {
+  "name": "annotations",
+  "url": "https://raw.githubusercontent.com/py-pdf/sample-files/main/024-annotations/annotated_pdf.pdf",
+  "pages": null,
+  "notes": "annotations (FPDF2)",
+  "sha256": "c327f921abfba23a5c42d5c429ba99ded1cf5511521003aba6d2aff9c940d9cc"
+ },
+ {
+  "name": "latex-multicolumn",
+  "url": "https://raw.githubusercontent.com/py-pdf/sample-files/main/026-latex-multicolumn/multicolumn.pdf",
+  "pages": null,
+  "notes": "LaTeX multicol",
+  "sha256": "bdb495e95b3e1afae95013099dc59b0cea047f1fa70f677ee9cb33f10faa1c6c"
+ },
+ {
+  "name": "cropped-rotated-scaled",
+  "url": "https://raw.githubusercontent.com/py-pdf/sample-files/main/027-cropped-rotated-scaled/cropped-rotated-scaled.pdf",
+  "pages": null,
+  "notes": "crop boxes, /Rotate",
+  "sha256": "cc195eac510b81123de4f55ac9f8185f2120975a7b75a106460b98615737aacd"
+ },
+ {
+  "name": "libreoffice-3-pages",
+  "url": "https://raw.githubusercontent.com/py-pdf/sample-files/main/028-image-references-deduplication/wrong-references.pdf",
+  "pages": null,
+  "notes": "LibreOffice 25",
+  "sha256": "16cb8e10bd59e30b4d350f11d0ed9c7d0bd7e7bb962a46022c89836e2aa44f63"
+ },
+ {
+  "name": "tagged",
+  "url": "https://raw.githubusercontent.com/py-pdf/sample-files/main/030-tagged-pdf/tagged.pdf",
+  "pages": null,
+  "notes": "tagged PDF",
+  "sha256": "20fed4503acd72cc1646b1214f24a6b56b579199eb30e2351e0578c3dc324c79"
+ },
+ {
+  "name": "tracemonkey",
+  "url": "https://raw.githubusercontent.com/mozilla/pdf.js/master/test/pdfs/tracemonkey.pdf",
+  "pages": "1-6",
+  "notes": "two-column ACM paper",
+  "sha256": "3662ff519e485810520552bf301d8c3b2b917fd2f83303f4965d7abed367e113"
+ },
+ {
+  "name": "tam-review",
+  "url": "https://raw.githubusercontent.com/mozilla/pdf.js/master/test/pdfs/TAMReview.pdf",
+  "pages": null,
+  "notes": "journal article",
+  "sha256": "a6db6d2f5e4f97e1e28a5919a875a40b89e38d0229b33cc023ca4d353f3ab3ec"
+ },
+ {
+  "name": "alphatrans",
+  "url": "https://raw.githubusercontent.com/mozilla/pdf.js/master/test/pdfs/alphatrans.pdf",
+  "pages": null,
+  "notes": "transparency",
+  "sha256": "234c0ab8e9458f4d17133b08d2b66170eeb92be2a80e1508aa5117a2bf568f63"
+ },
+ {
+  "name": "form-widgets",
+  "url": "https://raw.githubusercontent.com/mozilla/pdf.js/master/test/pdfs/annotation-text-widget.pdf",
+  "pages": null,
+  "notes": "text widgets",
+  "sha256": "9f091ceb368ad0406094efaa6c50d5033735ee52f383e0973dc53a7467089d7c"
+ },
+ {
+  "name": "annotation-line",
+  "url": "https://raw.githubusercontent.com/mozilla/pdf.js/master/test/pdfs/annotation-line.pdf",
+  "pages": null,
+  "notes": "line annotations",
+  "sha256": "cea9ed8cf5726fa643da0c083bc8db8df790ab5e7ee9a2b62224aab73d9fa742"
+ }
+]

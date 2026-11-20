@@ -638,6 +638,24 @@ pub fn words_to_glyphs(raw: &mut RawPage, words: &[OcrWord], img: &DynamicImage,
         })
         .collect();
 
+    // Vertical or giant low-confidence "words" are rotated text or artwork that
+    // horizontal OCR misreads (e.g. a sideways logo): leave them out.
+    let mut heights: Vec<f32> = words.iter().map(|w| w.bbox.height()).collect();
+    heights.sort_by(|a, b| a.total_cmp(b));
+    let typical_h = heights.get(heights.len() / 2).copied().unwrap_or(10.0);
+    let keep: Vec<bool> = words
+        .iter()
+        .map(|w| {
+            let n = w.text.chars().count();
+            let tall = n >= 3 && w.bbox.height() > 1.5 * w.bbox.width();
+            let giant = w.bbox.height() > 3.0 * typical_h;
+            !((tall || giant) && w.confidence < 60.0)
+        })
+        .collect();
+    let filtered: Vec<OcrWord> = words.iter().zip(&keep).filter(|(_, k)| **k).map(|(w, _)| w.clone()).collect();
+    let words = &filtered[..];
+    let colors: Vec<Rgb> = colors.into_iter().zip(&keep).filter(|(_, k)| **k).map(|(c, _)| c).collect();
+
     // Lines → metrics → shapes.
     let mut line_groups: std::collections::BTreeMap<(u32, u32, u32), Vec<usize>> = Default::default();
     for (i, w) in words.iter().enumerate() {
@@ -732,7 +750,10 @@ pub fn words_to_glyphs(raw: &mut RawPage, words: &[OcrWord], img: &DynamicImage,
         for (k, &i) in order.iter().enumerate() {
             let w = &words[i];
             let (_, base) = metrics[i];
-            let size = line_size;
+            // A word far bigger or smaller than its line (Tesseract sometimes joins
+            // a heading or logo to a text line) keeps its own size.
+            let own = word_metrics(w).0;
+            let size = if own > 1.8 * line_size || own < 0.5 * line_size { ((own * 2.0).round() / 2.0).clamp(4.0, 96.0) } else { line_size };
             let sh = &shapes[i];
             log::trace!("ocr word {:?} size={size} {:?}", w.text, sh);
             let long = sh.letters >= 4;
