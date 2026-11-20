@@ -220,7 +220,9 @@ def cmd_run(args):
     # Render all DOCX files with one LibreOffice call per batch (much faster).
     docxs = [r["_docx"] for r in results if r["ok"]]
     for i in range(0, len(docxs), 20):
-        subprocess.run(["soffice", "--headless", "--convert-to", "pdf", "--outdir", str(work)] + docxs[i:i + 20],
+        # A private LibreOffice profile: does not clash with a running LibreOffice.
+        subprocess.run(["soffice", f"-env:UserInstallation=file://{work}/lo-profile", "--headless",
+                        "--convert-to", "pdf", "--outdir", str(work)] + docxs[i:i + 20],
                        capture_output=True, timeout=1800)
     for r in results:
         if not r["ok"]:

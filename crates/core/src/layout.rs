@@ -175,6 +175,37 @@ fn apply_decorations(raw: &mut RawPage) {
     let mut used_rules = vec![false; raw.rules.len()];
     let mut used_boxes = vec![false; raw.boxes.len()];
     let mut new_styles: Vec<(usize, TextStyle)> = Vec::new();
+    // A highlight hugs its text; a box reaching far beyond the text it holds
+    // is a cell or band background and stays a box.
+    let hugs: Vec<bool> = raw
+        .boxes
+        .iter()
+        .map(|b| {
+            // Horizontal coverage of the box by its text (word gaps bridged).
+            let mut spans: Vec<(f32, f32, f32)> = raw
+                .glyphs
+                .iter()
+                .filter(|g| b.bbox.contains_point(g.bbox.cx(), g.baseline - 0.3 * raw.styles[g.style].size))
+                .map(|g| (g.bbox.x0, g.bbox.x1, raw.styles[g.style].size))
+                .collect();
+            if spans.is_empty() {
+                return false;
+            }
+            spans.sort_by(|a, c| a.0.total_cmp(&c.0));
+            let mut covered = 0.0;
+            let mut cur = spans[0];
+            for sp in &spans[1..] {
+                if sp.0 <= cur.1 + 1.2 * cur.2 {
+                    cur.1 = cur.1.max(sp.1);
+                } else {
+                    covered += cur.1 - cur.0;
+                    cur = *sp;
+                }
+            }
+            covered += cur.1 - cur.0;
+            covered >= 0.6 * b.bbox.width()
+        })
+        .collect();
     for (gi, g) in raw.glyphs.iter().enumerate() {
         let st = &raw.styles[g.style];
         let size = st.size;
@@ -199,7 +230,7 @@ fn apply_decorations(raw: &mut RawPage) {
             }
         }
         for (bi, b) in raw.boxes.iter().enumerate() {
-            if b.bbox.height() > 2.5 * size || b.bbox.height() < 0.6 * size {
+            if !hugs[bi] || b.bbox.height() > 2.5 * size || b.bbox.height() < 0.6 * size {
                 continue;
             }
             if b.bbox.contains_point(g.bbox.cx(), g.baseline - 0.3 * size) && b.color != style.color {
@@ -466,6 +497,178 @@ fn detect_ruled_tables(raw: &RawPage) -> (Vec<RuledTable>, Vec<bool>) {
     }
     tables.sort_by(|a, b| a.bbox.y0.total_cmp(&b.bbox.y0));
     (tables, consumed_raw)
+}
+
+/// Tables drawn with horizontal rules only ("booktabs": a top rule, a rule
+/// under the header and a bottom rule). Columns come from the whitespace
+/// gutters of the text between the rules; cells crossing a gutter are spanned.
+fn detect_booktabs(raw: &RawPage, segs: &[Seg], tables: &mut Vec<RuledTable>, consumed: &mut [bool]) {
+    let rules: Vec<Rule> = merge_rules(&raw.rules)
+        .into_iter()
+        .filter(|r| r.orientation == RuleOrientation::Horizontal && r.bbox.width() >= 60.0)
+        .filter(|r| !tables.iter().any(|t| t.bbox.expand(3.0).contains_point(r.bbox.cx(), r.bbox.cy())))
+        .collect();
+    let verticals: Vec<&Rule> = raw.rules.iter().filter(|r| r.orientation == RuleOrientation::Vertical).collect();
+    let mut used = vec![false; rules.len()];
+    let mut order: Vec<usize> = (0..rules.len()).collect();
+    order.sort_by(|&a, &b| rules[a].bbox.cy().total_cmp(&rules[b].bbox.cy()));
+    for (k, &start) in order.iter().enumerate() {
+        if used[start] {
+            continue;
+        }
+        let top = rules[start];
+        let same_extent = |r: &Rule| (r.bbox.x0 - top.bbox.x0).abs() <= 4.0 && (r.bbox.x1 - top.bbox.x1).abs() <= 4.0;
+        // Text lines (segments) between two y positions, inside the rule's extent.
+        let segs_between = |y0: f32, y1: f32| -> Vec<usize> {
+            (0..segs.len())
+                .filter(|&s| {
+                    let b = segs[s].bbox;
+                    b.cy() > y0 && b.cy() < y1 && b.x0 >= top.bbox.x0 - 4.0 && b.x1 <= top.bbox.x1 + 4.0
+                })
+                .collect()
+        };
+        // Following rules with the same extent; stop at a large text-free gap.
+        let mut group = vec![start];
+        for &next in &order[k + 1..] {
+            let r = rules[next];
+            if used[next] || !same_extent(&r) {
+                continue;
+            }
+            let last = rules[*group.last().unwrap()];
+            let gap = r.bbox.cy() - last.bbox.cy();
+            if gap > 400.0 {
+                break;
+            }
+            // Text outside the rule's extent between them ends the table.
+            let crossing = segs.iter().any(|sg| sg.bbox.cy() > last.bbox.cy() && sg.bbox.cy() < r.bbox.cy() && (sg.bbox.x1 < top.bbox.x0 - 4.0 || sg.bbox.x0 > top.bbox.x1 + 4.0) && sg.bbox.x1 > top.bbox.x0 - 40.0 && sg.bbox.x0 < top.bbox.x1 + 40.0);
+            if crossing || segs_between(last.bbox.cy(), r.bbox.cy()).is_empty() {
+                break;
+            }
+            group.push(next);
+        }
+        if group.len() < 2 {
+            continue;
+        }
+        let y0 = top.bbox.cy();
+        let y1 = rules[*group.last().unwrap()].bbox.cy();
+        let bbox = Rect::new(top.bbox.x0, y0, top.bbox.x1, y1);
+        if verticals.iter().any(|v| v.bbox.intersects(&bbox.expand(-2.0))) {
+            continue;
+        }
+        let inside = segs_between(y0, y1);
+        if inside.len() < 4 {
+            continue;
+        }
+        // Text lines by baseline.
+        let mut lines: Vec<(f32, f32, f32, Vec<usize>)> = Vec::new(); // (y0, y1, baseline, segs)
+        let mut sorted = inside.clone();
+        sorted.sort_by(|&a, &b| segs[a].baseline.total_cmp(&segs[b].baseline));
+        for s in sorted {
+            let sg = &segs[s];
+            match lines.last_mut() {
+                Some(l) if (sg.baseline - l.2).abs() < 0.4 * sg.size => {
+                    l.0 = l.0.min(sg.bbox.y0);
+                    l.1 = l.1.max(sg.bbox.y1);
+                    l.3.push(s);
+                }
+                _ => lines.push((sg.bbox.y0, sg.bbox.y1, sg.baseline, vec![s])),
+            }
+        }
+        if lines.len() < 2 {
+            continue;
+        }
+        let size = {
+            let mut v: Vec<f32> = inside.iter().map(|&s| segs[s].size).collect();
+            median(&mut v).unwrap_or(10.0)
+        };
+        // Gutters: x ranges free of text in (almost) every line.
+        let (x0, x1) = (top.bbox.x0, top.bbox.x1);
+        let n = ((x1 - x0) / 0.5).ceil() as usize + 1;
+        let mut cover = vec![0usize; n];
+        for l in &lines {
+            let mut mark = vec![false; n];
+            for &s in &l.3 {
+                let b = segs[s].bbox;
+                let a = (((b.x0 - x0) / 0.5).floor().max(0.0) as usize).min(n - 1);
+                let e = (((b.x1 - x0) / 0.5).ceil().max(0.0) as usize).min(n - 1);
+                for m in mark.iter_mut().take(e + 1).skip(a) {
+                    *m = true;
+                }
+            }
+            for (c, m) in cover.iter_mut().zip(mark) {
+                *c += m as usize;
+            }
+        }
+        let allowed = lines.len() / 4; // spanning header cells may cross a gutter
+        let min_gap = (0.9 * size).max(5.0);
+        let mut gutters: Vec<(f32, f32)> = Vec::new();
+        let mut run: Option<usize> = None;
+        let text_start = cover.iter().position(|&c| c > 0).unwrap_or(0);
+        let text_end = cover.iter().rposition(|&c| c > 0).unwrap_or(n - 1);
+        for i in text_start..=text_end {
+            let free = cover[i] <= allowed;
+            match (free, run) {
+                (true, None) => run = Some(i),
+                (false, Some(a)) => {
+                    let (ga, gb) = (x0 + a as f32 * 0.5, x0 + i as f32 * 0.5);
+                    if gb - ga >= min_gap {
+                        gutters.push((ga, gb));
+                    }
+                    run = None;
+                }
+                _ => {}
+            }
+        }
+        if gutters.is_empty() || gutters.len() > 15 {
+            continue;
+        }
+        let mut xs = vec![x0];
+        xs.extend(gutters.iter().map(|g| (g.0 + g.1) / 2.0));
+        xs.push(x1);
+        // Rows: rule positions plus the midpoints between text lines.
+        let rule_ys: Vec<f32> = group.iter().map(|&i| rules[i].bbox.cy()).collect();
+        let mut ys = rule_ys.clone();
+        for w in lines.windows(2) {
+            let mid = (w[0].1 + w[1].0) / 2.0;
+            if !rule_ys.iter().any(|&ry| ry > w[0].2 - 1.0 && ry < w[1].0 + 1.0) {
+                ys.push(mid);
+            }
+        }
+        ys.sort_by(f32::total_cmp);
+        ys.dedup_by(|a, b| (*a - *b).abs() < 2.0);
+        let (nc, nr) = (xs.len() - 1, ys.len() - 1);
+        if nc < 2 || nr < 2 {
+            continue;
+        }
+        let border_at = |y: f32| group.iter().map(|&i| rules[i]).find(|r| (r.bbox.cy() - y).abs() < 2.0).map(|r| Border { color: r.color, width: r.width });
+        let mut cells = Vec::new();
+        for r in 0..nr {
+            let (ry0, ry1) = (ys[r], ys[r + 1]);
+            // Text crossing a gutter in this row spans those columns.
+            let row_segs: Vec<&Seg> = inside.iter().map(|&s| &segs[s]).filter(|sg| sg.bbox.cy() > ry0 && sg.bbox.cy() < ry1).collect();
+            let mut c = 0;
+            while c < nc {
+                let mut span = 1;
+                while c + span < nc && row_segs.iter().any(|sg| sg.bbox.x0 < xs[c + span] - 1.0 && sg.bbox.x1 > xs[c + span] + 1.0 && sg.bbox.x0 < xs[c + span + 1] && sg.bbox.x1 > xs[c]) {
+                    span += 1;
+                }
+                let rect = Rect::new(xs[c], ry0, xs[c + span], ry1);
+                cells.push(GridCell { rect, row: r, col: c, row_span: 1, col_span: span, borders: [border_at(ry0), border_at(ry1), None, None], shading: None });
+                c += span;
+            }
+        }
+        for &i in &group {
+            used[i] = true;
+        }
+        // Shorter rules inside the table (partial header rules) belong to it as well.
+        for (i, r) in raw.rules.iter().enumerate() {
+            if r.bbox.fraction_inside(&bbox.expand(3.0)) > 0.9 {
+                consumed[i] = true;
+            }
+        }
+        tables.push(RuledTable { bbox, xs, ys, cells });
+    }
+    tables.sort_by(|a, b| a.bbox.y0.total_cmp(&b.bbox.y0));
 }
 
 // ---------------------------------------------------------------------------
@@ -1075,8 +1278,9 @@ impl Emitter<'_> {
         let mut inlines: Vec<Inline> = Vec::new();
         // Lines that end well before the container's right edge were broken on purpose
         // (addresses, poetry, centred titles): keep those breaks in flow layout too.
+        // Justified lines end at a common edge: that is wrapping in a narrower measure.
         let hard_breaks = matches!(align, Align::Center | Align::Right)
-            || lines[..n - 1].iter().all(|l| l.bbox.x1 < frame.x1 - (3.0 * size).max(0.15 * fw));
+            || (align != Align::Justify && lines[..n - 1].iter().all(|l| l.bbox.x1 < frame.x1 - (3.0 * size).max(0.15 * fw)));
         for (k, l) in lines.iter().enumerate() {
             let li = self.line_inlines(l, frame, allow_tabs, rtl, &mut tabs);
             if k > 0 {
@@ -1156,6 +1360,8 @@ impl Emitter<'_> {
             bbox: if rtl { mirror_rect(bbox, frame) } else { bbox },
             shading: None,
             rtl,
+            style: None,
+            list: None,
         }
     }
 
@@ -1445,6 +1651,7 @@ impl Emitter<'_> {
             bbox: rt.bbox,
             layout_only: false,
             bidi: false,
+            header_rows: 0,
         };
         normalize_column_alignment(&mut table);
         table
@@ -1515,6 +1722,7 @@ impl Emitter<'_> {
             bbox,
             layout_only: true,
             bidi: false,
+            header_rows: 0,
         };
         if self.cols_rtl(&child_items) {
             make_table_rtl(&mut table, frame);
@@ -1659,6 +1867,7 @@ impl Emitter<'_> {
             bbox: Rect::new(bounds[0], tbbox.y0, *bounds.last().unwrap(), tbbox.y1),
             layout_only: false,
             bidi: false,
+            header_rows: 0,
         };
         normalize_column_alignment(&mut table);
         if self.cols_rtl(child_items) {
@@ -1720,7 +1929,10 @@ fn normalize_column_alignment(table: &mut Table) {
         let max_x1 = paras.iter().map(|p| p.1).fold(f32::MIN, f32::max);
         let left = paras.iter().filter(|p| (p.0 - min_x0).abs() <= tol).count();
         let right = paras.iter().filter(|p| (max_x1 - p.1).abs() <= tol).count();
-        let align = if left >= right { Align::Left } else { Align::Right };
+        // Ties (every cell fits both edges) go to the edge with less spread.
+        let dev_left: f32 = paras.iter().map(|p| (p.0 - min_x0).abs()).sum();
+        let dev_right: f32 = paras.iter().map(|p| (max_x1 - p.1).abs()).sum();
+        let align = if left > right || (left == right && dev_left <= dev_right) { Align::Left } else { Align::Right };
         for row in &mut table.rows {
             let mut col = 0;
             for cell in &mut row.cells {
@@ -2186,7 +2398,10 @@ pub fn analyse_page(raw_in: &RawPage, opts: &LayoutOptions) -> PageLayout {
     let mut char_sizes: Vec<f32> = raw.glyphs.iter().map(|g| raw.styles[g.style].size).collect();
     let body_size = median(&mut char_sizes).unwrap_or(11.0);
 
-    let (tables, consumed_rules) = if opts.detect_tables { detect_ruled_tables(&raw) } else { (vec![], vec![false; raw.rules.len()]) };
+    let (mut tables, mut consumed_rules) = if opts.detect_tables { detect_ruled_tables(&raw) } else { (vec![], vec![false; raw.rules.len()]) };
+    if opts.detect_tables {
+        detect_booktabs(&raw, &segs, &mut tables, &mut consumed_rules);
+    }
 
     // Background images (large, under a lot of text) float behind the text.
     let page_area = raw.width * raw.height;

@@ -25,6 +25,14 @@ fn pdfium_available() -> bool {
 struct Docx {
     document: String,
     media: usize,
+    /// Other XML parts by name (word/footer1.xml, word/numbering.xml …).
+    parts: std::collections::HashMap<String, String>,
+}
+
+impl Docx {
+    fn part(&self, name: &str) -> &str {
+        self.parts.get(name).map(|s| s.as_str()).unwrap_or("")
+    }
 }
 
 fn run(name: &str, mode: LayoutMode) -> Docx {
@@ -36,8 +44,18 @@ fn run(name: &str, mode: LayoutMode) -> Docx {
     let mut document = String::new();
     zip.by_name("word/document.xml").unwrap().read_to_string(&mut document).unwrap();
     let media = (0..zip.len()).filter(|&i| zip.by_index(i).unwrap().name().starts_with("word/media/")).count();
+    let mut parts = std::collections::HashMap::new();
+    for i in 0..zip.len() {
+        let mut f = zip.by_index(i).unwrap();
+        let name = f.name().to_string();
+        if name.ends_with(".xml") || name.ends_with(".rels") {
+            let mut s = String::new();
+            f.read_to_string(&mut s).unwrap();
+            parts.insert(name, s);
+        }
+    }
     let _ = std::fs::remove_file(&out);
-    Docx { document, media }
+    Docx { document, media, parts }
 }
 
 /// Concatenated text of the document (runs only).
@@ -83,8 +101,21 @@ fn report_structure_and_formatting() {
     assert_eq!(d.media, 2);
     // One section per page.
     assert_eq!(d.document.matches("<w:sectPr>").count(), 2);
-    // Footer with a right tab stop for the page number.
-    assert!(d.document.contains(r#"<w:tab w:val="right""#));
+    // The repeated footer is a Word footer with a page-number field after a right tab.
+    let footer = d.part("word/footer1.xml");
+    assert!(footer.contains("Quarterly Report - Confidential"), "footer missing");
+    assert!(footer.contains(r#"<w:tab w:val="right""#));
+    assert!(footer.contains(r#"<w:fldSimple w:instr=" PAGE ">"#));
+    assert!(!t.contains("Confidential"), "footer text left in the body");
+    assert!(d.document.contains("<w:footerReference"));
+    // Bullets are a real Word list (marker removed from the text).
+    assert!(d.document.contains("<w:numPr>"));
+    assert!(d.part("word/numbering.xml").contains(r#"<w:numFmt w:val="bullet"/>"#));
+    assert!(!t.contains('•'));
+    // Paragraph styles: Normal carries the body font, the caption is styled.
+    let styles = d.part("word/styles.xml");
+    assert!(styles.contains(r#"w:styleId="Normal"><w:name w:val="Normal"/><w:qFormat/><w:rPr>"#));
+    assert!(d.document.contains(r#"<w:pStyle w:val="Caption"/>"#));
     // Reading order.
     let a = t.find("Executive Summary").unwrap();
     let b = t.find("Financial Results").unwrap();
@@ -331,5 +362,81 @@ fn ocr_detects_bold_italic_and_font_class() {
     assert_eq!(lines.len(), expected.len(), "{lines:?}");
     for ((_, word, got), want) in lines.iter().zip(expected) {
         assert_eq!(*got, want, "line starting {word:?}");
+    }
+}
+
+#[test]
+fn headers_footers_lists_and_footnotes() {
+    if !pdfium_available() {
+        return;
+    }
+    let d = run("structure.pdf", LayoutMode::Flow);
+    let t = text(&d.document);
+    // Header on pages 2-3 only: a distinct, empty first-page header; the footer is on every page.
+    assert!(d.part("word/header1.xml").contains("Annual Review 2025"));
+    assert!(!d.part("word/header2.xml").contains("Annual Review"));
+    assert!(d.part("word/footer2.xml").contains(r#"w:instr=" PAGE ""#), "first-page footer must keep the page number");
+    assert!(d.document.contains("<w:titlePg/>"));
+    assert_eq!(d.document.matches("<w:titlePg/>").count(), 1, "only the first section has a title page");
+    let footer = d.part("word/footer1.xml");
+    assert!(footer.contains(r#"w:instr=" PAGE ""#) && footer.contains(r#"w:instr=" NUMPAGES ""#));
+    assert!(!t.contains("Annual Review") && !t.contains("of 3"), "header/footer text left in the body");
+    // Nested numbered list: decimal level 0, lower-letter level 1, numbering continues after the nested items.
+    let numbering = d.part("word/numbering.xml");
+    assert!(numbering.contains(r#"<w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/>"#));
+    assert!(numbering.contains(r#"<w:numFmt w:val="lowerLetter"/><w:lvlText w:val="%2)"/>"#));
+    assert!(d.document.contains(r#"<w:ilvl w:val="1"/>"#));
+    assert!(!t.contains("a)") && !t.contains("3. Third"), "typed list markers left in the text");
+    // Footnotes: six notes, referenced from the body, removed from the page bottom.
+    let notes = d.part("word/footnotes.xml");
+    assert!(notes.contains("Source for the first fact on page 1."));
+    assert!(notes.contains("Explanation of the second claim on page 3."));
+    assert!(d.document.contains(r#"<w:footnoteReference w:id="6"/>"#));
+    assert!(!t.contains("Source for the first fact"));
+    assert!(d.part("word/settings.xml").contains("<w:footnotePr>"));
+}
+
+#[test]
+fn booktabs_and_header_rows() {
+    if !pdfium_available() {
+        return;
+    }
+    let d = run("tables.pdf", LayoutMode::Flow);
+    let t = text(&d.document);
+    // The booktabs table (horizontal rules only) is one table with its header row inside.
+    let first_table = &d.document[d.document.find("<w:tbl>").unwrap()..d.document.find("</w:tbl>").unwrap()];
+    assert!(text(first_table).contains("Accuracy") && text(first_table).contains("0.903"));
+    assert_eq!(first_table.matches("<w:tr>").count(), 5);
+    assert!(!first_table.contains(r#"<w:left w:val="single""#), "booktabs tables have no vertical borders");
+    // Numeric columns are right-aligned.
+    assert!(first_table.contains(r#"<w:jc w:val="right"/>"#));
+    // The shaded, bold first row of the inventory repeats on every page.
+    assert!(d.document.contains("<w:tblHeader/>"));
+    assert!(d.document.contains(r#"<w:shd w:val="clear" w:color="auto" w:fill="D9E2F3"/></w:tcPr>"#), "header shading belongs to the cells");
+    assert!(t.contains("A-045"));
+}
+
+#[test]
+fn continuous_mode_joins_pages_and_columns() {
+    if !pdfium_available() {
+        return;
+    }
+    // A table broken over two pages becomes one table; the repeated header row is dropped.
+    let d = run("tables.pdf", LayoutMode::Continuous);
+    assert_eq!(d.document.matches("<w:tbl>").count(), 2);
+    assert_eq!(text(&d.document).matches("Description").count(), 1);
+    assert!(d.document.contains("<w:tblHeader/>"));
+    // No page-per-section structure.
+    assert_eq!(d.document.matches("<w:sectPr>").count(), 1);
+
+    // Two text columns become a Word column section; paragraphs split by a column or page break are joined.
+    let d = run("twocol.pdf", LayoutMode::Continuous);
+    assert!(d.document.contains(r#"<w:cols w:num="2""#));
+    assert!(d.document.contains(r#"<w:type w:val="continuous"/>"#));
+    let paragraphs: Vec<String> = d.document.split("</w:p>").map(text).collect();
+    for i in 1..=14 {
+        let start = format!("Section {i}.");
+        let p = paragraphs.iter().find(|p| p.contains(&start)).unwrap_or_else(|| panic!("{start} missing"));
+        assert!(p.trim_end().ends_with("separate lines."), "{start} was not joined: {p}");
     }
 }

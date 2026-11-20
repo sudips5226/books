@@ -341,11 +341,102 @@ pub enum Inline {
     },
     /// An equation (Office Math).
     Math(Vec<MathNode>),
+    /// A Word field (page number, page count) with the text it showed in the PDF.
+    Field { kind: FieldKind, text: String, style: TextStyle },
+    /// Reference mark of a footnote (index into the document's footnotes).
+    FootnoteRef(usize),
     Tab,
     LineBreak,
     /// End of a line in the source PDF. Flow layout joins the lines,
     /// exact layout keeps the break.
     SoftBreak(Joiner),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldKind {
+    PageNumber,
+    PageCount,
+}
+
+/// Numbering format of a list level.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NumFormat {
+    Bullet,
+    Decimal,
+    LowerLetter,
+    UpperLetter,
+    LowerRoman,
+    UpperRoman,
+}
+
+/// A paragraph's membership in a Word list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ListRef {
+    /// Index into the document's list definitions.
+    pub list: usize,
+    pub level: u8,
+}
+
+/// One level of a list definition.
+#[derive(Clone, Debug)]
+pub struct ListLevel {
+    pub format: NumFormat,
+    /// Level text pattern, e.g. "%1." or "(%1)" or "•" (the level's own
+    /// number is always `%n` with n = level + 1).
+    pub text: String,
+    pub start: u32,
+    pub marker_style: TextStyle,
+    pub indent_left: f32,
+    pub hanging: f32,
+}
+
+/// A list definition (one abstract numbering per list).
+#[derive(Clone, Debug, Default)]
+pub struct ListDef {
+    pub levels: Vec<ListLevel>,
+}
+
+/// Header or footer content.
+#[derive(Clone, Debug, Default)]
+pub struct HeaderFooter {
+    pub blocks: Vec<Block>,
+    /// Distance from the page edge (top for headers, bottom for footers), points.
+    pub distance: f32,
+    /// Height of the content on the source page, points.
+    pub height: f32,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Footnote {
+    pub blocks: Vec<Block>,
+}
+
+/// Formatting carried by a named style.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StyleDef {
+    pub id: String,
+    pub name: String,
+    pub font: String,
+    pub size: f32,
+    pub bold: bool,
+    pub italic: bool,
+    pub color: Rgb,
+    /// Outline level for headings (0-based).
+    pub outline: Option<u8>,
+}
+
+/// Document-wide structures beyond the page bodies.
+#[derive(Clone, Debug, Default)]
+pub struct DocStructure {
+    pub header: Option<HeaderFooter>,
+    pub footer: Option<HeaderFooter>,
+    /// The first page lacks the header / the footer that the other pages have.
+    pub blank_first_header: bool,
+    pub blank_first_footer: bool,
+    pub lists: Vec<ListDef>,
+    pub footnotes: Vec<Footnote>,
+    /// Paragraph styles; the first one is "Normal".
+    pub styles: Vec<StyleDef>,
 }
 
 /// A node of an equation tree (serialised as OMML).
@@ -476,6 +567,10 @@ pub struct Paragraph {
     /// Right-to-left paragraph (Arabic, Hebrew …). Indents and alignment are
     /// then expressed relative to the reading direction (left = start).
     pub rtl: bool,
+    /// Named paragraph style (id), if any.
+    pub style: Option<String>,
+    /// Word list membership (the marker text has been removed).
+    pub list: Option<ListRef>,
 }
 
 impl Paragraph {
@@ -485,6 +580,8 @@ impl Paragraph {
             match i {
                 Inline::Text { text, .. } => s.push_str(text),
                 Inline::Math(m) => s.push_str(&MathNode::plain(m)),
+                Inline::Field { text, .. } => s.push_str(text),
+                Inline::FootnoteRef(_) => {}
                 Inline::Tab => s.push('\t'),
                 Inline::LineBreak => s.push('\n'),
                 Inline::SoftBreak(Joiner::Space) => s.push(' '),
@@ -549,6 +646,8 @@ pub struct Table {
     /// Right-to-left table: columns are stored in reading order (right to left)
     /// and `indent` is measured from the right edge.
     pub bidi: bool,
+    /// Leading rows that repeat at the top of every page the table spans.
+    pub header_rows: usize,
 }
 
 #[derive(Clone, Debug)]

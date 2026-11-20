@@ -18,7 +18,9 @@ struct Args {
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    /// Layout strategy: `flow` (editable paragraphs) or `exact` (positioned frames).
+    /// Layout strategy: `flow` (editable paragraphs, page by page), `continuous`
+    /// (one flowing document: Word columns, paragraphs and tables joined across
+    /// pages) or `exact` (positioned frames).
     #[arg(short, long, default_value = "flow")]
     mode: LayoutMode,
 
@@ -75,6 +77,22 @@ struct Args {
     #[arg(long)]
     no_embed_fonts: bool,
 
+    /// Keep repeated page tops/bottoms in the body instead of Word headers/footers.
+    #[arg(long)]
+    no_headers_footers: bool,
+
+    /// Keep list markers as typed text instead of Word numbering.
+    #[arg(long)]
+    no_lists: bool,
+
+    /// Keep notes at the bottom of the page instead of Word footnotes.
+    #[arg(long)]
+    no_footnotes: bool,
+
+    /// Do not build paragraph styles (every run carries its full formatting).
+    #[arg(long)]
+    no_styles: bool,
+
     /// Path to the PDFium shared library (file or directory).
     #[arg(long)]
     pdfium: Option<PathBuf>,
@@ -106,6 +124,10 @@ fn run(args: Args) -> anyhow::Result<()> {
         detect_headings: !args.no_headings,
         compensate_widths: !args.no_width_compensation,
         embed_fonts: !args.no_embed_fonts,
+        headers_footers: !args.no_headers_footers,
+        word_lists: !args.no_lists,
+        footnotes: !args.no_footnotes,
+        paragraph_styles: !args.no_styles,
         pdfium_path: args.pdfium.clone(),
         ..Default::default()
     };

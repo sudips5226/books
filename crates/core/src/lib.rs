@@ -27,6 +27,8 @@ pub mod math;
 pub mod metrics;
 pub mod model;
 pub mod ocr;
+pub mod reflow;
+pub mod structure;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -70,7 +72,8 @@ impl std::str::FromStr for LayoutMode {
         match s.to_ascii_lowercase().as_str() {
             "flow" | "editable" => Ok(LayoutMode::Flow),
             "exact" | "fixed" | "positioned" => Ok(LayoutMode::Exact),
-            _ => bail!("invalid layout mode '{s}' (expected flow or exact)"),
+            "continuous" | "reflow" => Ok(LayoutMode::Continuous),
+            _ => bail!("invalid layout mode '{s}' (expected flow, continuous or exact)"),
         }
     }
 }
@@ -93,6 +96,14 @@ pub struct ConvertOptions {
     pub compensate_widths: bool,
     /// Embed the PDF's TrueType fonts into the DOCX when their licence allows it.
     pub embed_fonts: bool,
+    /// Move repeated page tops/bottoms into Word headers and footers.
+    pub headers_footers: bool,
+    /// Turn typed list markers into Word lists.
+    pub word_lists: bool,
+    /// Turn notes at the page bottom into Word footnotes.
+    pub footnotes: bool,
+    /// Use named paragraph styles (Normal, Heading n, Caption …).
+    pub paragraph_styles: bool,
     /// Explicit path to the PDFium library (file or directory).
     pub pdfium_path: Option<PathBuf>,
 }
@@ -111,6 +122,10 @@ impl Default for ConvertOptions {
             detect_headings: true,
             compensate_widths: true,
             embed_fonts: true,
+            headers_footers: true,
+            word_lists: true,
+            footnotes: true,
+            paragraph_styles: true,
             pdfium_path: None,
         }
     }
@@ -289,7 +304,7 @@ pub fn convert(
     let mut report = ConvertReport::default();
     let mut ocr_engine: Option<ocr::OcrEngine> = None;
     let mut ocr_failed = false;
-    let mut layouts = Vec::with_capacity(selection.len());
+    let mut raws: Vec<model::RawPage> = Vec::with_capacity(selection.len());
 
     for (done, &index) in selection.iter().enumerate() {
         if cancel.is_some_and(|c| c.is_cancelled()) {
@@ -371,15 +386,74 @@ pub fn convert(
             }
         }
 
-        let layout = layout::analyse_page(&raw, &opts.layout);
-        count_blocks(&layout.blocks, &mut report);
-        report.images += layout.floating.len();
-        layouts.push(layout);
+        raws.push(raw);
         progress(Progress::PageDone { page: index + 1, done: done + 1, total: selection.len(), ocr: did_ocr });
+    }
+
+    // Repeated page tops and bottoms become the Word header and footer.
+    let mut structure = model::DocStructure::default();
+    // Page counts are only meaningful when the whole document is converted.
+    let total_pages = if selection.len() == total { total } else { 0 };
+    let mut hf_layouts: Vec<(bool, f32, f32)> = Vec::new(); // (footer, margin_left, margin_right)
+    let mut number_offset = 0i64;
+    if opts.headers_footers {
+        let hf = structure::extract_headers_footers(&mut raws);
+        number_offset = hf.number_offset;
+        let mut build = |(raw, src): (model::RawPage, usize), footer: bool| {
+            let l = layout::analyse_page(&raw, &opts.layout);
+            let mut blocks = l.blocks;
+            let printed = (src as i64 + 1 + hf.number_offset).max(1) as usize;
+            structure::insert_page_fields(&mut blocks, printed, total_pages);
+            let boxes = || raw.glyphs.iter().map(|g| g.bbox).chain(raw.rules.iter().map(|r| r.bbox)).chain(raw.images.iter().map(|i| i.bbox));
+            let content_top = boxes().map(|b| b.y0).fold(f32::MAX, f32::min);
+            let content_bottom = boxes().map(|b| b.y1).fold(0.0, f32::max);
+            structure::unwrap_single_cell_tables(&mut blocks);
+            let height = (content_bottom - content_top).max(0.0).max(structure::blocks_height(&blocks));
+            let distance = if footer { (raw.height - content_bottom).max(0.0) } else { l.margin_top };
+            hf_layouts.push((footer, l.margin_left, l.margin_right));
+            model::HeaderFooter { blocks, distance, height }
+        };
+        structure.header = hf.header.map(|h| build(h, false));
+        structure.footer = hf.footer.map(|f| build(f, true));
+        structure.blank_first_header = hf.blank_first_header;
+        structure.blank_first_footer = hf.blank_first_footer;
+    }
+
+    let mut layouts: Vec<model::PageLayout> = raws.iter().map(|raw| layout::analyse_page(raw, &opts.layout)).collect();
+    drop(raws);
+    for l in &layouts {
+        count_blocks(&l.blocks, &mut report);
+        report.images += l.floating.len();
+    }
+    // Header/footer indents are relative to the body margins in Word.
+    if !layouts.is_empty() {
+        let median = |mut v: Vec<f32>| {
+            v.sort_by(f32::total_cmp);
+            v[v.len() / 2]
+        };
+        let ml = median(layouts.iter().map(|l| l.margin_left).collect());
+        let mr = median(layouts.iter().map(|l| l.margin_right).collect());
+        for (footer, l, r) in hf_layouts {
+            let target = if footer { structure.footer.as_mut() } else { structure.header.as_mut() };
+            if let Some(hf) = target {
+                structure::shift_blocks(&mut hf.blocks, l - ml, r - mr);
+            }
+        }
     }
 
     if opts.detect_headings {
         layout::detect_headings(&mut layouts);
+    }
+    structure::mark_header_rows(&mut layouts);
+    if opts.word_lists {
+        structure.lists = structure::detect_lists(&mut layouts);
+    }
+    if opts.footnotes {
+        let body = body_font_size(&layouts);
+        structure.footnotes = structure::detect_footnotes(&mut layouts, body);
+    }
+    if opts.paragraph_styles {
+        structure.styles = structure::assign_styles(&mut layouts, &mut structure.footnotes);
     }
     let mut embedded = Vec::new();
     if opts.embed_fonts {
@@ -396,6 +470,12 @@ pub fn convert(
             }
         }
         metrics::compensate(&mut layouts, &library);
+        for hf in [structure.header.as_mut(), structure.footer.as_mut()].into_iter().flatten() {
+            metrics::compensate_blocks(&mut hf.blocks, &library);
+        }
+        for f in &mut structure.footnotes {
+            metrics::compensate_blocks(&mut f.blocks, &library);
+        }
     }
     report.embedded_fonts = embedded.iter().map(|f| f.family.clone()).collect();
     report.embedded_fonts.dedup();
@@ -403,6 +483,8 @@ pub fn convert(
     progress(Progress::Writing);
     let mut meta = document_meta(&document, input);
     meta.fonts = embedded;
+    meta.structure = structure;
+    meta.first_page_number = (selection.first().map(|p| *p as i64 + 1).unwrap_or(1) + number_offset).max(1) as usize;
     let tmp = output.with_extension("docx.part");
     {
         let file = std::fs::File::create(&tmp).with_context(|| format!("cannot create {}", tmp.display()))?;
@@ -428,8 +510,24 @@ fn document_meta(document: &PdfDocument, input: &Path) -> DocMeta {
         author: get(PdfDocumentMetadataTagType::Author),
         subject: get(PdfDocumentMetadataTagType::Subject),
         keywords: get(PdfDocumentMetadataTagType::Keywords),
-        fonts: Vec::new(),
+        ..Default::default()
     }
+}
+
+/// The most common font size of the document's text (by characters).
+fn body_font_size(pages: &[model::PageLayout]) -> f32 {
+    let mut hist: std::collections::HashMap<i32, usize> = Default::default();
+    let mut pages = pages.to_vec();
+    for p in &mut pages {
+        structure::for_each_paragraph(&mut p.blocks, &mut |par: &mut model::Paragraph| {
+            for i in &par.inlines {
+                if let model::Inline::Text { text, style, .. } = i {
+                    *hist.entry((style.size * 2.0).round() as i32).or_default() += text.len();
+                }
+            }
+        });
+    }
+    hist.into_iter().max_by_key(|(_, n)| *n).map(|(s, _)| s as f32 / 2.0).unwrap_or(11.0)
 }
 
 /// Basic information about a PDF (used by front-ends).

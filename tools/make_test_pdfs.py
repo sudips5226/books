@@ -390,6 +390,104 @@ def rotated(path):
     c.save()
 
 
+def structure(path):
+    """Header (not on the first page), "Page N of M" footer, nested numbered
+    list and footnotes: exercises Word headers/footers, lists and footnotes."""
+    ss = getSampleStyleSheet()
+    body = ParagraphStyle("sbody", parent=ss["BodyText"], fontName="Times-Roman", fontSize=11, leading=14,
+                          alignment=TA_JUSTIFY)
+    c = canvas.Canvas(path, pagesize=letter)
+    w, h = letter
+    pages = 3
+    for n in range(1, pages + 1):
+        if n > 1:
+            c.setFont("Helvetica", 9)
+            c.drawString(72, h - 42, "Annual Review 2025")
+            c.drawRightString(w - 72, h - 42, "Structure sample")
+            c.setLineWidth(0.5)
+            c.line(72, h - 48, w - 72, h - 48)
+        c.setFont("Helvetica", 9)
+        c.drawCentredString(w / 2, 36, f"Page {n} of {pages}")
+        y = h - 90
+        if n == 1:
+            c.setFont("Helvetica-Bold", 20)
+            c.drawString(72, y, "Document structure test")
+            y -= 36
+        text = (f"This is body paragraph one on page {n}. It mentions a fact that needs a source<super>{2 * n - 1}</super> "
+                "and continues with enough words to wrap over more than one line so that it is recognised as a "
+                f"paragraph. A second claim follows here<super>{2 * n}</super> and the sentence ends normally.")
+        p = Paragraph(text, body)
+        _, ph = p.wrap(w - 144, 200)
+        p.drawOn(c, 72, y - ph)
+        y -= ph + 18
+        c.setFont("Times-Roman", 11)
+        items = [(0, f"{k}.", t) for k, t in enumerate(["First numbered item", "Second numbered item"], 1)]
+        items += [(1, "a)", "Nested letter item"), (1, "b)", "Another nested item"), (0, "3.", "Third numbered item")]
+        for level, marker, t in items:
+            x = 90 + level * 24
+            c.drawString(x, y, marker)
+            c.drawString(x + 18, y, t + f" on page {n}")
+            y -= 16
+        y -= 12
+        p = Paragraph("A closing paragraph without notes keeps the page balanced and gives the layout analysis "
+                      "a regular body paragraph after the list.", body)
+        _, ph = p.wrap(w - 144, 200)
+        p.drawOn(c, 72, y - ph)
+        # Footnotes above the footer, under a short separator.
+        c.setLineWidth(0.5)
+        c.line(72, 112, 216, 112)
+        for k, note in enumerate([f"Source for the first fact on page {n}.", f"Explanation of the second claim on page {n}."]):
+            by = 100 - k * 12
+            c.setFont("Times-Roman", 6)
+            c.drawString(72, by + 3, str(2 * n - 1 + k))
+            c.setFont("Times-Roman", 9)
+            c.drawString(78, by, note)
+        c.showPage()
+    c.save()
+
+
+def tables(path):
+    """A booktabs table (horizontal rules only) and a long ruled table that
+    breaks across pages and repeats its header row."""
+    ss = getSampleStyleSheet()
+    body = ParagraphStyle("tbody", parent=ss["BodyText"], fontName="Times-Roman", fontSize=11, leading=14)
+    head = ParagraphStyle("thead", parent=ss["Heading2"], fontName="Helvetica-Bold", fontSize=14, leading=18)
+    doc = SimpleDocTemplate(path, pagesize=letter, leftMargin=72, rightMargin=72, topMargin=72, bottomMargin=72)
+    story = [Paragraph("Results", head),
+             Paragraph("Table 1 summarises the measurements. It uses the booktabs style with three horizontal "
+                       "rules and no vertical lines.", body), Spacer(1, 10)]
+    data = [["Method", "Accuracy", "Recall", "F1", "Time (s)"],
+            ["Baseline", "0.812", "0.774", "0.792", "12.4"],
+            ["Variant A", "0.845", "0.801", "0.822", "14.9"],
+            ["Variant B", "0.861", "0.836", "0.848", "18.2"],
+            ["Ours", "0.903", "0.889", "0.896", "16.7"]]
+    t = Table(data, colWidths=[110, 70, 70, 70, 70])
+    t.setStyle(TableStyle([
+        ("FONT", (0, 0), (-1, 0), "Times-Bold", 10.5),
+        ("FONT", (0, 1), (-1, -1), "Times-Roman", 10.5),
+        ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
+        ("LINEABOVE", (0, 0), (-1, 0), 1.0, colors.black),
+        ("LINEBELOW", (0, 0), (-1, 0), 0.5, colors.black),
+        ("LINEBELOW", (0, -1), (-1, -1), 1.0, colors.black),
+    ]))
+    story += [t, Spacer(1, 18),
+              Paragraph("The inventory below is long enough to continue on the next page, where its header row is "
+                        "repeated.", body), Spacer(1, 10)]
+    rows = [["Item", "Description", "Qty", "Price"]]
+    for i in range(1, 46):
+        rows.append([f"A-{i:03d}", f"Component number {i}", str((i * 7) % 23 + 1), f"{(i * 3.25):.2f}"])
+    t = Table(rows, colWidths=[70, 220, 50, 70], repeatRows=1)
+    t.setStyle(TableStyle([
+        ("FONT", (0, 0), (-1, 0), "Helvetica-Bold", 10),
+        ("FONT", (0, 1), (-1, -1), "Helvetica", 10),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#D9E2F3")),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("ALIGN", (2, 0), (-1, -1), "RIGHT"),
+    ]))
+    story += [t, Spacer(1, 12), Paragraph("End of the inventory.", body)]
+    doc.build(story)
+
+
 def scanned(src_pdf, path, workdir):
     if not shutil.which("pdftoppm"):
         print("pdftoppm not found; skipping scanned.pdf")
@@ -418,6 +516,8 @@ def main():
     typography(os.path.join(out, "typography.pdf"))
     rtl(os.path.join(out, "rtl.pdf"))
     rotated(os.path.join(out, "rotated.pdf"))
+    structure(os.path.join(out, "structure.pdf"))
+    tables(os.path.join(out, "tables.pdf"))
     rtl_office(os.path.join(out, "rtl-office.pdf"), out)
     scanned(os.path.join(out, "typography.pdf"), os.path.join(out, "typography-scan.pdf"), out)
     print("written to", out)

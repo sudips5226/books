@@ -223,7 +223,7 @@ ApplicationWindow {
                         anchors.fill: parent
                         ComboBox {
                             Layout.fillWidth: true
-                            model: ["Flowing text (editable)", "Exact positions (frames)"]
+                            model: ["Flowing text, page by page", "Continuous text (reflow)", "Exact positions (frames)"]
                             currentIndex: conv.layoutMode
                             onActivated: (index) => conv.layoutMode = index
                         }
@@ -232,9 +232,11 @@ ApplicationWindow {
                             wrapMode: Text.WordWrap
                             color: window.subtle
                             font.pointSize: 9
-                            text: conv.layoutMode === 0
-                                ? "Paragraphs, columns, lists, tables and equations are rebuilt with the original fonts, indents and spacing. Best for editing."
-                                : "Every text block is placed in a frame at its exact position on the page. Best visual fidelity, harder to edit."
+                            text: [
+                                "Paragraphs, columns, lists, tables and equations are rebuilt with the original fonts, indents and spacing; every PDF page stays a page. Best for editing.",
+                                "One flowing document: page breaks are dropped, text columns become Word columns, and paragraphs and tables split across pages are joined. Best for reusing the text.",
+                                "Every text block is placed in a frame at its exact position on the page. Best visual fidelity, harder to edit."
+                            ][conv.layoutMode] || ""
                         }
                     }
                 }

@@ -288,7 +288,11 @@ impl qobject::Converter {
 
     fn options(&self) -> ConvertOptions {
         let mut o = ConvertOptions {
-            layout_mode: if *self.layout_mode() == 1 { LayoutMode::Exact } else { LayoutMode::Flow },
+            layout_mode: match *self.layout_mode() {
+                1 => LayoutMode::Continuous,
+                2 => LayoutMode::Exact,
+                _ => LayoutMode::Flow,
+            },
             ocr_mode: match *self.ocr_mode() {
                 1 => OcrMode::Always,
                 2 => OcrMode::Never,

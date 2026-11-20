@@ -337,6 +337,15 @@ fn system_font(family: &str, bold: bool, italic: bool) -> Option<Arc<FontData>> 
 // Compensation
 // ---------------------------------------------------------------------------
 
+/// Width compensation for loose blocks (headers, footers, footnotes).
+pub fn compensate_blocks(blocks: &mut [Block], lib: &FontLibrary) {
+    let mut page = PageLayout { blocks: std::mem::take(&mut blocks.to_vec()), ..Default::default() };
+    compensate(std::slice::from_mut(&mut page), lib);
+    for (dst, src) in blocks.iter_mut().zip(page.blocks) {
+        *dst = src;
+    }
+}
+
 /// Adjusts character spacing / scaling of every run so that it keeps its PDF width.
 pub fn compensate(pages: &mut [PageLayout], lib: &FontLibrary) {
     fn inlines(v: &mut [Inline], lib: &FontLibrary) {
