@@ -368,9 +368,16 @@ pub fn compensate(pages: &mut [PageLayout], lib: &FontLibrary) {
     }
 }
 
+/// Scripts whose glyphs are shaped (joined, reordered, combined): their
+/// width cannot be predicted from per-character advances.
+fn needs_shaping(c: char) -> bool {
+    matches!(c as u32,
+        0x0591..=0x08FF | 0x0900..=0x0DFF | 0x0E00..=0x0FFF | 0x1000..=0x109F | 0x1780..=0x17FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF)
+}
+
 fn adjust(text: &str, style: &mut TextStyle, pdf_width: f32, lib: &FontLibrary) {
     let n = text.chars().filter(|c| !c.is_whitespace()).count();
-    if pdf_width <= 0.0 || n < 2 || style.small_caps {
+    if pdf_width <= 0.0 || n < 2 || style.small_caps || text.chars().any(needs_shaping) {
         return;
     }
     let Some((word_w, unknown)) = lib.measure(text, style) else { return };

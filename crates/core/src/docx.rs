@@ -37,6 +37,10 @@ pub struct DocMeta {
     pub fonts: Vec<crate::embed::EmbeddedFont>,
 }
 
+fn is_rtl_char(c: char) -> bool {
+    matches!(unicode_bidi::bidi_class(c), unicode_bidi::BidiClass::R | unicode_bidi::BidiClass::AL)
+}
+
 fn tw(pt: f32) -> i64 {
     (pt * 20.0).round() as i64
 }
@@ -265,7 +269,10 @@ impl Writer {
     }
 
     fn text_run(&mut self, out: &mut String, text: &str, st: &TextStyle) {
-        let rpr = self.run_props(st);
+        let mut rpr = self.run_props(st);
+        if text.chars().any(is_rtl_char) {
+            rpr = rpr.replace("</w:rPr>", "<w:rtl/></w:rPr>");
+        }
         let _ = write!(out, r#"<w:r>{rpr}<w:t xml:space="preserve">{}</w:t></w:r>"#, esc(text));
     }
 
@@ -345,6 +352,9 @@ impl Writer {
         if let Some(shd) = p.shading {
             let _ = write!(out, r#"<w:shd w:val="clear" w:color="auto" w:fill="{}"/>"#, shd.hex());
         }
+        if p.rtl {
+            out.push_str("<w:bidi/>");
+        }
         if !p.tabs.is_empty() {
             out.push_str("<w:tabs>");
             for t in &p.tabs {
@@ -374,6 +384,14 @@ impl Writer {
                     let _ = write!(out, r#"<w:ind w:left="0" w:firstLine="{}"/>"#, tw(first));
                 }
             }
+        } else if p.rtl {
+            // Right-to-left: indents are logical (start = right edge).
+            let _ = write!(out, r#"<w:ind w:start="{}" w:end="{}""#, tw(p.indent_left), tw(p.indent_right));
+            if p.indent_first >= 0.0 {
+                let _ = write!(out, r#" w:firstLine="{}"/>"#, tw(p.indent_first));
+            } else {
+                let _ = write!(out, r#" w:hanging="{}"/>"#, tw(-p.indent_first));
+            }
         } else {
             let _ = write!(out, r#"<w:ind w:left="{}" w:right="{}""#, tw(p.indent_left), tw(p.indent_right));
             if p.indent_first >= 0.0 {
@@ -382,11 +400,14 @@ impl Writer {
                 let _ = write!(out, r#" w:hanging="{}"/>"#, tw(-p.indent_first));
             }
         }
-        let jc = match p.align {
-            Align::Left => "left",
-            Align::Center => "center",
-            Align::Right => "right",
-            Align::Justify => "both",
+        let jc = match (p.align, p.rtl) {
+            (Align::Left, false) => "left",
+            (Align::Right, false) => "right",
+            // Right-to-left paragraphs were analysed mirrored: left = start.
+            (Align::Left, true) => "start",
+            (Align::Right, true) => "end",
+            (Align::Center, _) => "center",
+            (Align::Justify, _) => "both",
         };
         let _ = write!(out, r#"<w:jc w:val="{jc}"/>"#);
         if let Some(s) = sect {
@@ -493,6 +514,9 @@ impl Writer {
                 tw(y)
             );
         }
+        if t.bidi {
+            out.push_str("<w:bidiVisual/>");
+        }
         let _ = write!(out, r#"<w:tblW w:w="{}" w:type="dxa"/>"#, tw(total));
         if float_at.is_none() {
             let _ = write!(out, r#"<w:tblInd w:w="{}" w:type="dxa"/>"#, tw(t.indent));
@@ -588,7 +612,13 @@ impl Writer {
                     .map(|t| TabStop { pos: t.pos + container_x0 - p.bbox.x0, kind: t.kind })
                     .filter(|t| t.pos > 0.0)
                     .collect();
-                self.paragraph(out, &q, Some((p.bbox.x0, top.max(0.0), width, height)), None);
+                // Anchor the (slightly wider) frame on the side the text is aligned to.
+                let x = match (p.align, p.rtl) {
+                    (Align::Center, _) => p.bbox.cx() - width / 2.0,
+                    (Align::Right, false) | (Align::Left, true) | (Align::Justify, true) => p.bbox.x1 - width,
+                    _ => p.bbox.x0,
+                };
+                self.paragraph(out, &q, Some((x.max(0.0), top.max(0.0), width, height)), None);
             }
             Block::Table(t) if t.layout_only => {
                 for row in &t.rows {

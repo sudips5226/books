@@ -873,8 +873,14 @@ impl Emitter<'_> {
     }
 
     /// Builds the inline content of one line.
-    fn line_inlines(&self, line: &Line, frame: Frame, allow_tabs: bool, tabs: &mut Vec<TabStop>) -> Vec<Inline> {
+    fn line_inlines(&self, line: &Line, frame: Frame, allow_tabs: bool, rtl: bool, tabs: &mut Vec<TabStop>) -> Vec<Inline> {
         let atoms = self.line_atoms(line, frame, allow_tabs, tabs);
+        // Glyphs are in visual order; right-to-left runs are put into reading order.
+        let atoms = if rtl || atoms.iter().any(|a| matches!(a, Atom::Char { text, .. } if text.chars().any(|c| char_dir(c) == Dir::R))) {
+            visual_to_logical(atoms, rtl)
+        } else {
+            atoms
+        };
         atoms_to_inlines(atoms)
     }
 
@@ -929,7 +935,7 @@ impl Emitter<'_> {
                     }
                 }
                 out.push(Atom::Char {
-                    text: expand_ligature(g.ch),
+                    text: normalize_presentation_form(&expand_ligature(g.ch)),
                     style,
                     link: g.link.and_then(|l| raw.links.get(l)).cloned(),
                     width: g.bbox.width(),
@@ -942,7 +948,8 @@ impl Emitter<'_> {
         out
     }
 
-    fn make_paragraph(&self, lines: &[&Line], frame: Frame) -> Paragraph {
+    /// Builds a paragraph from lines; for `rtl` the line boxes are mirrored.
+    fn make_paragraph_dir(&self, lines: &[&Line], frame: Frame, rtl: bool) -> Paragraph {
         let n = lines.len();
         let bbox = Rect::union_all(lines.iter().map(|l| &l.bbox)).unwrap();
         let size = lines.iter().map(|l| l.size).fold(0.0, f32::max);
@@ -998,14 +1005,14 @@ impl Emitter<'_> {
         };
 
         let mut tabs = Vec::new();
-        let allow_tabs = n == 1 || align == Align::Left;
+        let allow_tabs = (n == 1 || align == Align::Left) && !rtl;
         let mut inlines: Vec<Inline> = Vec::new();
         // Lines that end well before the container's right edge were broken on purpose
         // (addresses, poetry, centred titles): keep those breaks in flow layout too.
         let hard_breaks = matches!(align, Align::Center | Align::Right)
             || lines[..n - 1].iter().all(|l| l.bbox.x1 < frame.x1 - (3.0 * size).max(0.15 * fw));
         for (k, l) in lines.iter().enumerate() {
-            let li = self.line_inlines(l, frame, allow_tabs, &mut tabs);
+            let li = self.line_inlines(l, frame, allow_tabs, rtl, &mut tabs);
             if k > 0 {
                 if hard_breaks {
                     strip_trailing_space(&mut inlines);
@@ -1080,23 +1087,89 @@ impl Emitter<'_> {
             font_size: size,
             tabs,
             heading: None,
-            bbox,
+            bbox: if rtl { mirror_rect(bbox, frame) } else { bbox },
             shading: None,
-            rtl: false,
+            rtl,
         }
     }
 
     /// Lays out the text segments of a container into paragraphs.
     fn paragraphs(&self, seg_ids: &[usize], frame: Frame) -> Vec<Paragraph> {
-        let lines = self.make_lines(seg_ids);
+        let mut lines = self.make_lines(seg_ids);
+        // Right-to-left text is analysed in mirrored coordinates, so that
+        // "left" in the analysis means the reading start (the right edge).
+        let rtl = self.lines_rtl(&lines.iter().collect::<Vec<_>>());
+        if rtl {
+            for l in &mut lines {
+                mirror_line(l, frame);
+            }
+        }
         let groups = self.group_paragraphs(&lines, frame);
         groups
             .iter()
             .map(|g| {
                 let ls: Vec<&Line> = g.iter().map(|&i| &lines[i]).collect();
-                self.make_paragraph(&ls, frame)
+                self.make_paragraph_dir(&ls, frame, rtl)
             })
             .collect()
+    }
+
+    /// Strong right-to-left vs left-to-right characters of a line.
+    fn line_direction_counts(&self, line: &Line) -> (usize, usize) {
+        let raw = self.raw();
+        let (mut r, mut l) = (0, 0);
+        for &s in &line.segs {
+            for &g in &self.ctx.segs[s].glyphs {
+                match char_dir(raw.glyphs[g].ch) {
+                    Dir::R => r += 1,
+                    Dir::L => l += 1,
+                    _ => {}
+                }
+            }
+        }
+        (r, l)
+    }
+
+    /// True if the lines are predominantly right-to-left.
+    fn lines_rtl(&self, lines: &[&Line]) -> bool {
+        let (r, l) = lines.iter().map(|l| self.line_direction_counts(l)).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+        r > l
+    }
+
+    /// True if the text of a set of XY-cut items is predominantly right-to-left.
+    fn cols_rtl(&self, child_items: &[Vec<usize>]) -> bool {
+        let raw = self.raw();
+        let (mut r, mut l) = (0, 0);
+        for &i in child_items.iter().flatten() {
+            if let ItemKind::Seg(s) = self.ctx.items[i].kind {
+                for &g in &self.ctx.segs[s].glyphs {
+                    match char_dir(raw.glyphs[g].ch) {
+                        Dir::R => r += 1,
+                        Dir::L => l += 1,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        r > l
+    }
+
+    /// Builds a paragraph, handling right-to-left lines.
+    fn make_paragraph(&self, lines: &[&Line], frame: Frame) -> Paragraph {
+        if self.lines_rtl(lines) {
+            let mirrored: Vec<Line> = lines
+                .iter()
+                .map(|l| {
+                    let mut m = (*l).clone();
+                    mirror_line(&mut m, frame);
+                    m
+                })
+                .collect();
+            let refs: Vec<&Line> = mirrored.iter().collect();
+            self.make_paragraph_dir(&refs, frame, true)
+        } else {
+            self.make_paragraph_dir(lines, frame, false)
+        }
     }
 
     fn place_paragraph(&self, mut p: Paragraph, cursor: &mut Cursor, out: &mut Vec<Block>) {
@@ -1279,6 +1352,7 @@ impl Emitter<'_> {
             space_before: (rt.bbox.y0 - cursor.y).max(0.0),
             bbox: rt.bbox,
             layout_only: false,
+            bidi: false,
         };
         normalize_column_alignment(&mut table);
         table
@@ -1335,14 +1409,18 @@ impl Emitter<'_> {
             self.emit(child, cframe, &mut cur, &mut blocks);
             row.cells.push(Cell { blocks, col_span: 1, ..Default::default() });
         }
-        let table = Table {
+        let mut table = Table {
             col_widths: bounds.windows(2).map(|w| w[1] - w[0]).collect(),
             rows: vec![row],
             indent: bounds[0] - frame.x0,
             space_before: (bbox.y0 - cursor.y).max(0.0),
             bbox,
             layout_only: true,
+            bidi: false,
         };
+        if self.cols_rtl(&child_items) {
+            make_table_rtl(&mut table, frame);
+        }
         cursor.y = cursor.y.max(bbox.y1);
         out.push(Block::Table(table));
     }
@@ -1482,8 +1560,12 @@ impl Emitter<'_> {
             space_before: (tbbox.y0 - cursor.y).max(0.0),
             bbox: Rect::new(bounds[0], tbbox.y0, *bounds.last().unwrap(), tbbox.y1),
             layout_only: false,
+            bidi: false,
         };
         normalize_column_alignment(&mut table);
+        if self.cols_rtl(child_items) {
+            make_table_rtl(&mut table, frame);
+        }
         Some(table)
     }
 }
@@ -1574,6 +1656,144 @@ fn right_guess(lines: &[Line]) -> f32 {
     v.sort_by(|a, b| b.total_cmp(a));
     // Use the 2nd largest right edge when available (robust to one overlong line).
     v.get(1).or(v.first()).copied().unwrap_or(0.0)
+}
+
+/// Bidirectional class of a character, simplified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Dir {
+    /// Strong left-to-right.
+    L,
+    /// Strong right-to-left (Hebrew, Arabic …).
+    R,
+    /// Digits (laid out left to right inside right-to-left text).
+    Num,
+    /// Spaces and punctuation.
+    Neutral,
+}
+
+fn char_dir(c: char) -> Dir {
+    use unicode_bidi::BidiClass::*;
+    match unicode_bidi::bidi_class(c) {
+        L => Dir::L,
+        R | AL => Dir::R,
+        EN | AN => Dir::Num,
+        _ => Dir::Neutral,
+    }
+}
+
+/// Arabic presentation forms (contextual glyph variants) → base letters.
+fn normalize_presentation_form(s: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    if s.chars().any(|c| matches!(c as u32, 0xFB50..=0xFDFF | 0xFE70..=0xFEFF)) {
+        s.nfkc().collect()
+    } else {
+        s.to_string()
+    }
+}
+
+fn mirror_char(c: char) -> char {
+    match c {
+        '(' => ')',
+        ')' => '(',
+        '[' => ']',
+        ']' => '[',
+        '{' => '}',
+        '}' => '{',
+        '<' => '>',
+        '>' => '<',
+        '«' => '»',
+        '»' => '«',
+        '‹' => '›',
+        '›' => '‹',
+        c => c,
+    }
+}
+
+/// Reorders atoms from visual (left-to-right) order into logical order.
+///
+/// Within a right-to-left paragraph the visual order is reversed, except for
+/// runs of left-to-right text and numbers which keep their internal order;
+/// in a left-to-right paragraph only right-to-left runs are reversed.
+/// Mirrored characters (brackets) are swapped inside right-to-left runs.
+fn visual_to_logical(atoms: Vec<Atom>, para_rtl: bool) -> Vec<Atom> {
+    let dir_of = |a: &Atom| -> Dir {
+        match a {
+            Atom::Char { text, .. } => text.chars().map(char_dir).find(|d| *d != Dir::Neutral).unwrap_or(Dir::Neutral),
+            _ => Dir::Neutral,
+        }
+    };
+    let dirs: Vec<Dir> = atoms.iter().map(dir_of).collect();
+    let n = atoms.len();
+    // Resolve to "is this atom part of a right-to-left run?".
+    let strong_rtl = |d: Dir| -> Option<bool> {
+        match d {
+            Dir::R => Some(true),
+            Dir::L | Dir::Num => Some(false),
+            Dir::Neutral => None,
+        }
+    };
+    let mut resolved = vec![para_rtl; n];
+    for i in 0..n {
+        resolved[i] = match strong_rtl(dirs[i]) {
+            Some(v) => v,
+            None => {
+                let left = (0..i).rev().find_map(|j| strong_rtl(dirs[j]));
+                let right = (i + 1..n).find_map(|j| strong_rtl(dirs[j]));
+                match (left, right) {
+                    (Some(a), Some(b)) if a == b => a,
+                    _ => para_rtl,
+                }
+            }
+        };
+    }
+    // Group into runs of equal direction.
+    let mut runs: Vec<(bool, Vec<Atom>)> = Vec::new();
+    for (a, r) in atoms.into_iter().zip(resolved) {
+        match runs.last_mut() {
+            Some((dir, v)) if *dir == r => v.push(a),
+            _ => runs.push((r, vec![a])),
+        }
+    }
+    for (rtl, v) in &mut runs {
+        if *rtl {
+            v.reverse();
+            for a in v.iter_mut() {
+                if let Atom::Char { text, .. } = a {
+                    *text = text.chars().map(mirror_char).collect();
+                }
+            }
+        }
+    }
+    if para_rtl {
+        runs.reverse();
+    }
+    runs.into_iter().flat_map(|(_, v)| v).collect()
+}
+
+fn mirror_rect(r: Rect, frame: Frame) -> Rect {
+    let m = frame.x0 + frame.x1;
+    Rect::new(m - r.x1, r.y0, m - r.x0, r.y1)
+}
+
+fn mirror_line(l: &mut Line, frame: Frame) {
+    l.bbox = mirror_rect(l.bbox, frame);
+    // List markers are not reconstructed for right-to-left text.
+    l.marker_text_x = None;
+    l.starts_with_marker = false;
+}
+
+/// Turns a left-to-right ordered table into a right-to-left (bidiVisual) one.
+fn make_table_rtl(t: &mut Table, frame: Frame) {
+    t.bidi = true;
+    t.col_widths.reverse();
+    for row in &mut t.rows {
+        row.cells.reverse();
+        for c in &mut row.cells {
+            std::mem::swap(&mut c.border_left, &mut c.border_right);
+        }
+    }
+    // Indent from the right edge of the container.
+    t.indent = (frame.x1 - t.bbox.x1).max(0.0);
 }
 
 /// One element of a line before it is merged into runs.
@@ -1953,6 +2173,50 @@ mod tests {
             }
         }
         v
+    }
+
+    fn chars(atoms: &[Atom]) -> String {
+        atoms
+            .iter()
+            .map(|a| match a {
+                Atom::Char { text, .. } => text.clone(),
+                Atom::Space => " ".into(),
+                _ => "|".into(),
+            })
+            .collect()
+    }
+
+    fn atoms_of(visual: &str) -> Vec<Atom> {
+        visual
+            .chars()
+            .map(|c| {
+                if c == ' ' {
+                    Atom::Space
+                } else {
+                    Atom::Char { text: c.to_string(), style: TextStyle::default(), link: None, width: 1.0, glyph: 0 }
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bidi_visual_to_logical() {
+        // Hebrew "שלום עולם" drawn visually (reversed) in a right-to-left paragraph.
+        let logical = visual_to_logical(atoms_of("םלוע םולש"), true);
+        assert_eq!(chars(&logical), "שלום עולם");
+        // Numbers and Latin keep their internal order; brackets are mirrored.
+        // Visual order of logical "ראשון (שלום) English 2024": the Latin/number run
+        // stays left to right, and the brackets are drawn mirrored.
+        let logical = visual_to_logical(atoms_of("English 2024 (םולש) ןושאר"), true);
+        assert_eq!(chars(&logical), "ראשון (שלום) English 2024");
+        // A number between right-to-left words.
+        let logical = visual_to_logical(atoms_of("תא 2024 רפסמה"), true);
+        assert_eq!(chars(&logical), "המספר 2024 את");
+        // A Hebrew word inside left-to-right text.
+        let logical = visual_to_logical(atoms_of("word םולש here"), false);
+        assert_eq!(chars(&logical), "word שלום here");
+        // Arabic presentation forms become base letters.
+        assert_eq!(normalize_presentation_form("\u{FEFB}"), "\u{644}\u{627}");
     }
 
     #[test]

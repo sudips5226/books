@@ -271,6 +271,80 @@ def typography(path):
     c.save()
 
 
+def rtl(path):
+    """Hebrew and Arabic paragraphs drawn in visual order (as many generators do)."""
+    try:
+        from bidi.algorithm import get_display
+        import arabic_reshaper
+    except ImportError:
+        print("python-bidi / arabic-reshaper not installed; skipping rtl.pdf")
+        return
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont as RLTTFont
+    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    if not os.path.exists(font_path):
+        print("DejaVu Sans not installed; skipping rtl.pdf")
+        return
+    pdfmetrics.registerFont(RLTTFont("DejaVuSans", font_path))
+    c = canvas.Canvas(path, pagesize=A4)
+    w, h = A4
+    right, width = w - 72, w - 144
+    y = h - 90
+
+    def lines_of(text, size):
+        out, line = [], []
+        for word in text.split():
+            cand = " ".join(line + [word])
+            if c.stringWidth(get_display(arabic_reshaper.reshape(cand)), "DejaVuSans", size) > width and line:
+                out.append(" ".join(line))
+                line = [word]
+            else:
+                line.append(word)
+        out.append(" ".join(line))
+        return out
+
+    def para(text, size=12, leading=17, align="right"):
+        nonlocal y
+        for ln in lines_of(text, size):
+            vis = get_display(arabic_reshaper.reshape(ln))
+            c.setFont("DejaVuSans", size)
+            if align == "center":
+                c.drawCentredString(w / 2, y, vis)
+            else:
+                c.drawRightString(right, y, vis)
+            y -= leading
+        y -= 10
+
+    para("מסמך לדוגמה בעברית", 20, 26, "center")
+    para("זוהי פסקה ארוכה בעברית שנועדה לבדוק את ההמרה של טקסט מימין לשמאל. היא כוללת את המספר 2024 "
+         "ואת המילה English באמצע המשפט, וממשיכה מספיק זמן כדי לעבור לשורה הבאה ולבדוק את סדר המילים.")
+    para("نص عربي تجريبي", 20, 26, "center")
+    para("هذه فقرة طويلة باللغة العربية لاختبار تحويل النص من اليمين إلى اليسار. تحتوي على الرقم 2024 "
+         "وكلمة English في منتصف الجملة، وتستمر لفترة كافية للانتقال إلى السطر التالي.")
+    c.showPage()
+    c.save()
+
+
+def rtl_office(path, workdir):
+    """The same kind of content exported by LibreOffice (real shaping and bidi)."""
+    if not shutil.which("soffice"):
+        print("LibreOffice not installed; skipping rtl-office.pdf")
+        return
+    html = os.path.join(workdir, "rtl-office.html")
+    with open(html, "w", encoding="utf-8") as f:
+        f.write("""<html><head><meta charset="utf-8"></head><body style="font-family:'DejaVu Sans'">
+<h1 dir="rtl" style="text-align:center">מסמך לדוגמה בעברית</h1>
+<p dir="rtl" style="text-align:justify">זוהי פסקה ארוכה בעברית שנועדה לבדוק את ההמרה של טקסט מימין לשמאל. היא כוללת את המספר 2024
+ואת המילה English באמצע המשפט (בסוגריים), וממשיכה מספיק זמן כדי לעבור לשורה הבאה ולבדוק את סדר המילים.</p>
+<p dir="rtl">هذه فقرة طويلة باللغة العربية لاختبار تحويل النص من اليمين إلى اليسار. تحتوي على الرقم 2024
+وكلمة English في منتصف الجملة، وتستمر لفترة كافية للانتقال إلى السطر التالي.</p>
+<p>An English paragraph with a Hebrew word שלום in the middle stays left to right.</p>
+</body></html>""")
+    subprocess.run(["soffice", "--headless", "--convert-to", "pdf:writer_web_pdf_Export", "--outdir", workdir, html],
+                   check=True, capture_output=True)
+    os.replace(os.path.join(workdir, "rtl-office.pdf"), path)
+
+
 def scanned(src_pdf, path, workdir):
     if not shutil.which("pdftoppm"):
         print("pdftoppm not found; skipping scanned.pdf")
@@ -297,6 +371,8 @@ def main():
     embedded_font(os.path.join(out, "embedded.pdf"), out)
     scanned(os.path.join(out, "report.pdf"), os.path.join(out, "scanned.pdf"), out)
     typography(os.path.join(out, "typography.pdf"))
+    rtl(os.path.join(out, "rtl.pdf"))
+    rtl_office(os.path.join(out, "rtl-office.pdf"), out)
     scanned(os.path.join(out, "typography.pdf"), os.path.join(out, "typography-scan.pdf"), out)
     print("written to", out)
 

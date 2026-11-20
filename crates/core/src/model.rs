@@ -540,6 +540,9 @@ pub struct Table {
     pub bbox: Rect,
     /// A layout table (multi-column text) rather than a data table.
     pub layout_only: bool,
+    /// Right-to-left table: columns are stored in reading order (right to left)
+    /// and `indent` is measured from the right edge.
+    pub bidi: bool,
 }
 
 #[derive(Clone, Debug)]
