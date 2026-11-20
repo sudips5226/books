@@ -50,6 +50,11 @@ fn is_rtl_char(c: char) -> bool {
     matches!(unicode_bidi::bidi_class(c), unicode_bidi::BidiClass::R | unicode_bidi::BidiClass::AL)
 }
 
+/// `descr` attribute with a picture's alternative text.
+fn alt_attr(pic: &Picture) -> String {
+    pic.alt.as_ref().map(|a| format!(r#" descr="{}""#, esc(a).replace('\n', "&#10;"))).unwrap_or_default()
+}
+
 fn tw(pt: f32) -> i64 {
     (pt * 20.0).round() as i64
 }
@@ -756,9 +761,10 @@ impl Writer {
         self.next_drawing += 1;
         let (cx, cy) = (emu(pic.width.max(1.0)), emu(pic.height.max(1.0)));
         let g = self.graphic_xml(pic, id);
+        let descr = alt_attr(pic);
         let frame = move |g: &str, id: usize| {
             format!(
-                r#"<w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="{cx}" cy="{cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/><wp:docPr id="{id}" name="Picture {id}"/><wp:cNvGraphicFramePr><a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/></wp:cNvGraphicFramePr>{g}</wp:inline></w:drawing>"#
+                r#"<w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="{cx}" cy="{cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/><wp:docPr id="{id}" name="Picture {id}"{descr}/><wp:cNvGraphicFramePr><a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/></wp:cNvGraphicFramePr>{g}</wp:inline></w:drawing>"#
             )
         };
         let drawing = frame(&g, id);
@@ -782,9 +788,10 @@ impl Writer {
         let x = emu(pic.bbox.x0);
         let y = emu(dy.unwrap_or(pic.bbox.y0));
         let vrel = if dy.is_some() { "paragraph" } else { "page" };
+        let descr = alt_attr(pic);
         let frame = move |g: &str, id: usize| {
             format!(
-                r#"<w:drawing><wp:anchor distT="0" distB="0" distL="57150" distR="57150" simplePos="0" relativeHeight="{rh}" behindDoc="{bd}" locked="0" layoutInCell="1" allowOverlap="1"><wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="page"><wp:posOffset>{x}</wp:posOffset></wp:positionH><wp:positionV relativeFrom="{vrel}"><wp:posOffset>{y}</wp:posOffset></wp:positionV><wp:extent cx="{cx}" cy="{cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/>{wrap}<wp:docPr id="{id}" name="Picture {id}"/><wp:cNvGraphicFramePr><a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/></wp:cNvGraphicFramePr>{g}</wp:anchor></w:drawing>"#,
+                r#"<w:drawing><wp:anchor distT="0" distB="0" distL="57150" distR="57150" simplePos="0" relativeHeight="{rh}" behindDoc="{bd}" locked="0" layoutInCell="1" allowOverlap="1"><wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="page"><wp:posOffset>{x}</wp:posOffset></wp:positionH><wp:positionV relativeFrom="{vrel}"><wp:posOffset>{y}</wp:posOffset></wp:positionV><wp:extent cx="{cx}" cy="{cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/>{wrap}<wp:docPr id="{id}" name="Picture {id}"{descr}/><wp:cNvGraphicFramePr><a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/></wp:cNvGraphicFramePr>{g}</wp:anchor></w:drawing>"#,
                 rh = rh_base + id,
             )
         };

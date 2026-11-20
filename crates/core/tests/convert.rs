@@ -473,3 +473,51 @@ fn outline_links_toc_comments_forms_and_shapes() {
     assert!(doc.contains("Week 3"));
     assert!(doc.contains(r#"relativeHeight="2517"#));
 }
+
+#[test]
+fn ocr_straightens_turned_and_skewed_scans() {
+    use pdf2word_core::model::RawPage;
+    use pdf2word_core::ocr::{process_scan, OcrEngine, OcrSettings};
+    use pdf2word_core::scan;
+
+    if !pdfium_available() {
+        return;
+    }
+    let Ok(mut engine) = OcrEngine::new(OcrSettings::default()) else { return };
+    let pdfium = pdf2word_core::load_pdfium(None).unwrap();
+    let doc = pdfium.load_pdf_from_file(&fixture("report.pdf"), None).unwrap();
+    let page = doc.pages().get(0).unwrap();
+    let dpi = 150.0;
+    let upright = pdf2word_core::extract::render_page(&page, dpi).unwrap();
+    // Scanned sideways and slightly crooked.
+    let scan_img = scan::rotate(&scan::quarter_turn(&upright, 1), 2.0);
+    let (w, h) = (page.width().value, page.height().value);
+    let mut raw = RawPage { width: h, height: w, ..Default::default() };
+    let rep = process_scan(&mut engine, &mut raw, scan_img, dpi, &Default::default(), true).unwrap();
+    assert_eq!(rep.quarter_turns, 3, "{rep:?}");
+    assert!((rep.deskew + 2.0).abs() < 0.5, "{rep:?}");
+    assert_eq!((raw.width, raw.height), (w, h), "page not turned upright");
+    let text: String = raw.glyphs.iter().map(|g| g.ch).collect();
+    assert!(text.contains("ExecutiveSummary") || text.contains("Executive"), "{text}");
+}
+
+#[test]
+fn parallel_ocr_with_automatic_language() {
+    if !pdfium_available() || pdf2word_core::ocr::OcrEngine::new(Default::default()).is_err() {
+        return;
+    }
+    let out = std::env::temp_dir().join(format!("pdf2word-test-{}-parallel-ocr.docx", std::process::id()));
+    let mut opts = ConvertOptions { ocr_mode: OcrMode::Always, threads: Some(2), ..Default::default() };
+    opts.ocr.language = "auto".into();
+    let report = convert(&fixture("report.pdf"), &out, &opts, None, &mut |_| {}).expect("conversion failed");
+    assert_eq!(report.ocr_pages, vec![1, 2]);
+    assert_eq!(report.ocr_language.as_deref(), Some("eng"));
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(&out).unwrap()).unwrap();
+    let mut doc = String::new();
+    zip.by_name("word/document.xml").unwrap().read_to_string(&mut doc).unwrap();
+    let t = text(&doc);
+    assert!(t.contains("Executive Summary") && t.contains("Outlook"), "{t}");
+    // Pages keep their order.
+    assert!(t.find("Executive Summary").unwrap() < t.find("Outlook").unwrap());
+    let _ = std::fs::remove_file(&out);
+}

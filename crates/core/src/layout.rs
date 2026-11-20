@@ -1003,6 +1003,19 @@ impl Emitter<'_> {
     }
 
     /// Splits lines (top to bottom) into paragraph groups.
+    /// The line ends with leader dots followed by a page number.
+    fn ends_with_leader(&self, line: &Line) -> bool {
+        let raw = self.raw();
+        let text: String = line.segs.iter().map(|&s| seg_text(raw, &self.ctx.segs[s])).collect::<Vec<_>>().join(" ");
+        let t = text.trim_end();
+        let number = t.rsplit(|c: char| c.is_whitespace() || c == '.').next().unwrap_or("");
+        if number.is_empty() || number.len() > 5 || !(number.chars().all(|c| c.is_ascii_digit()) || number.chars().all(|c| "ivxlcIVXLC".contains(c))) {
+            return false;
+        }
+        let before = t[..t.len() - number.len()].trim_end();
+        before.chars().rev().take_while(|c| matches!(c, '.' | ' ' | '·' | '…')).filter(|&c| c != ' ').count() >= 3
+    }
+
     fn group_paragraphs(&self, lines: &[Line], frame: Frame) -> Vec<Vec<usize>> {
         if lines.is_empty() {
             return vec![];
@@ -1040,6 +1053,10 @@ impl Emitter<'_> {
             }
             // New list item.
             if cur.starts_with_marker {
+                brk = true;
+            }
+            // A table-of-contents line (leader dots and a page number) ends its entry.
+            if self.ends_with_leader(prev) {
                 brk = true;
             }
             // Previous line ended well before the right edge → end of paragraph.
@@ -1581,6 +1598,7 @@ impl Emitter<'_> {
             behind_text: img.behind_text,
             overlay: false,
             vector: img.vector.clone(),
+            alt: img.alt.clone(),
         }
     }
 
@@ -2424,6 +2442,7 @@ pub fn analyse_page(raw_in: &RawPage, opts: &LayoutOptions) -> PageLayout {
                 behind_text: false,
                 overlay: true,
                 vector: None,
+                alt: None,
             });
         } else if img.behind_text || (img.bbox.area() > 0.15 * page_area && text_inside > 20) {
             floating.push(Picture {
@@ -2437,6 +2456,7 @@ pub fn analyse_page(raw_in: &RawPage, opts: &LayoutOptions) -> PageLayout {
                 behind_text: true,
                 overlay: false,
                 vector: None,
+                alt: None,
             });
         } else {
             image_items.push(i);
@@ -2458,6 +2478,7 @@ pub fn analyse_page(raw_in: &RawPage, opts: &LayoutOptions) -> PageLayout {
                     behind_text: true,
                     overlay: false,
                     vector: None,
+                    alt: None,
                 },
             );
         }

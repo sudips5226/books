@@ -28,8 +28,9 @@ struct Args {
     #[arg(long, default_value = "auto")]
     ocr: OcrMode,
 
-    /// Tesseract language(s), e.g. `eng` or `eng+deu`.
-    #[arg(short, long, default_value = "eng")]
+    /// Tesseract language(s), e.g. `eng` or `eng+deu`; `auto` detects the
+    /// language from the document among the installed ones.
+    #[arg(short, long, default_value = "auto")]
     lang: String,
 
     /// Directory containing Tesseract `*.traineddata` files.
@@ -105,6 +106,18 @@ struct Args {
     #[arg(long)]
     no_shapes: bool,
 
+    /// Do not turn scans upright or straighten skewed scans before OCR.
+    #[arg(long)]
+    no_straighten: bool,
+
+    /// Do not recognise text in pictures (used as their alternative text).
+    #[arg(long)]
+    no_picture_text: bool,
+
+    /// Worker threads for OCR and layout (default: number of CPUs, at most 8).
+    #[arg(long)]
+    threads: Option<usize>,
+
     /// Path to the PDFium shared library (file or directory).
     #[arg(long)]
     pdfium: Option<PathBuf>,
@@ -115,6 +128,7 @@ struct Args {
 }
 
 fn main() {
+    pdf2word_core::ocr::limit_openmp_threads();
     let args = Args::parse();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(if args.quiet { "warn" } else { "info" }))
         .format_timestamp(None)
@@ -141,6 +155,9 @@ fn run(args: Args) -> anyhow::Result<()> {
         footnotes: !args.no_footnotes,
         paragraph_styles: !args.no_styles,
         navigation: !args.no_navigation,
+        straighten_scans: !args.no_straighten,
+        picture_text: !args.no_picture_text,
+        threads: args.threads,
         annotations: !args.no_comments,
         pdfium_path: args.pdfium.clone(),
         ..Default::default()

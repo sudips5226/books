@@ -8,6 +8,7 @@ mod converter;
 use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QString, QUrl};
 
 fn main() {
+    pdf2word_core::ocr::limit_openmp_threads();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     // A consistent, desktop-like look on every platform unless the user overrides it.

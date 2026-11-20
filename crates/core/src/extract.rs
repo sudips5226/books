@@ -543,7 +543,7 @@ fn collect_object(
             match decoded {
                 Ok(di) => {
                     if let Some(data) = encode_image(&di, opts.max_image_px) {
-                        raw.images.push(RawImage { bbox, data, behind_text: false, overlay: false, vector: None });
+                        raw.images.push(RawImage { bbox, data, behind_text: false, overlay: false, vector: None, alt: None });
                     }
                 }
                 Err(e) => log::debug!("skipping undecodable image: {e}"),
@@ -979,7 +979,7 @@ fn rasterize_regions(page: &PdfPage, tf: &PageTransform, raw: &mut RawPage, regi
         raw.images.retain(|im| im.bbox.fraction_inside(&r) < 0.9);
         raw.rules.retain(|ru| ru.bbox.fraction_inside(&r.expand(1.0)) < 0.9);
         raw.boxes.retain(|b| b.bbox.fraction_inside(&r.expand(1.0)) < 0.9);
-        raw.images.push(RawImage { bbox: r, data, behind_text: false, overlay: false, vector });
+        raw.images.push(RawImage { bbox: r, data, behind_text: false, overlay: false, vector, alt: None });
     }
     Ok(())
 }
@@ -1033,6 +1033,7 @@ fn render_overlays(page: &PdfPage, tf: &PageTransform, raw: &mut RawPage, rects:
             behind_text: false,
             overlay: true,
             vector: None,
+            alt: None,
         });
     }
     Ok(())

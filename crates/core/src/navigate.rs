@@ -360,14 +360,22 @@ pub fn detect_toc(pages: &mut [PageLayout], field: bool) -> Vec<StyleDef> {
                 if field && pos == 0 {
                     inlines.push(Inline::FieldBegin(r#" TOC \o "1-3" \h \z \u "#.into()));
                 }
-                inlines.push(Inline::Text { text: title.clone(), style: first_style.clone(), link: link.clone(), pdf_width: 0.0, pdf_tracking: 0.0 });
+                // Section numbers set apart by a tab keep it (and its stop).
+                for (k, piece) in title.split('\t').enumerate() {
+                    if k > 0 {
+                        inlines.push(Inline::Tab);
+                    }
+                    inlines.push(Inline::Text { text: piece.trim().to_string(), style: first_style.clone(), link: link.clone(), pdf_width: 0.0, pdf_tracking: 0.0 });
+                }
                 inlines.push(Inline::Tab);
                 inlines.push(Inline::Text { text: number.clone(), style: last_style, link, pdf_width: 0.0, pdf_tracking: 0.0 });
                 if field && pos + 1 == n {
                     inlines.push(Inline::FieldEnd);
                 }
                 p.inlines = inlines;
-                p.tabs = vec![TabStop { pos: right, kind: TabKind::Right, leader: dots }];
+                let mut tabs: Vec<TabStop> = p.tabs.iter().copied().filter(|t| t.pos < right - 12.0 && t.kind == TabKind::Left).take(title.matches('\t').count()).collect();
+                tabs.push(TabStop { pos: right, kind: TabKind::Right, leader: dots });
+                p.tabs = tabs;
                 p.align = Align::Left;
                 p.indent_first = 0.0;
                 p.indent_right = 0.0;

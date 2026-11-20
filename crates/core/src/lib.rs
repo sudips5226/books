@@ -30,6 +30,7 @@ pub mod navigate;
 pub mod model;
 pub mod ocr;
 pub mod reflow;
+pub mod scan;
 pub mod structure;
 
 use std::path::{Path, PathBuf};
@@ -111,6 +112,12 @@ pub struct ConvertOptions {
     pub navigation: bool,
     /// Annotations become Word comments; form fields become content controls.
     pub annotations: bool,
+    /// Turn scans upright and straighten skewed scans before OCR.
+    pub straighten_scans: bool,
+    /// Recognise text in pictures and use it as their alternative text.
+    pub picture_text: bool,
+    /// Worker threads for OCR and layout analysis (None = number of CPUs, at most 8).
+    pub threads: Option<usize>,
     /// Explicit path to the PDFium library (file or directory).
     pub pdfium_path: Option<PathBuf>,
 }
@@ -135,6 +142,9 @@ impl Default for ConvertOptions {
             paragraph_styles: true,
             navigation: true,
             annotations: true,
+            straighten_scans: true,
+            picture_text: true,
+            threads: None,
             pdfium_path: None,
         }
     }
@@ -163,6 +173,8 @@ pub struct ConvertReport {
     pub warnings: Vec<String>,
     /// Font families embedded into the DOCX.
     pub embedded_fonts: Vec<String>,
+    /// Language used for OCR, if any page was recognised.
+    pub ocr_language: Option<String>,
 }
 
 /// Cooperative cancellation flag.
@@ -311,92 +323,154 @@ pub fn convert(
     };
 
     let mut report = ConvertReport::default();
-    let mut ocr_engine: Option<ocr::OcrEngine> = None;
-    let mut ocr_failed = false;
-    let mut raws: Vec<model::RawPage> = Vec::with_capacity(selection.len());
+    let mut slots: Vec<Option<model::RawPage>> = (0..selection.len()).map(|_| None).collect();
+    let workers = opts.threads.unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2)).clamp(1, 8);
+    let mut ocr_settings = opts.ocr.clone();
+    let mut ocr_unavailable = false;
+    let warn = |report: &mut ConvertReport, progress: &mut dyn FnMut(Progress), msg: String| {
+        progress(Progress::Warning(msg.clone()));
+        report.warnings.push(msg);
+    };
 
-    for (done, &index) in selection.iter().enumerate() {
-        if cancel.is_some_and(|c| c.is_cancelled()) {
-            bail!("conversion cancelled");
-        }
-        progress(Progress::PageStarted { page: index + 1, done, total: selection.len() });
-        let page = document.pages().get(index as PdfPageIndex)?;
-        let (mut raw, stats) = extract::extract_page(&document, &page, index, &opts.extract)
-            .with_context(|| format!("page {}", index + 1))?;
-
-        // A scanned page with an invisible OCR text layer: drop the scan image, keep the text.
-        if stats.invisible_chars > stats.visible_chars && stats.invisible_chars > 0 {
-            let area = raw.width * raw.height;
-            raw.images.retain(|im| im.bbox.area() < 0.5 * area);
-        }
-
-        let want_ocr = match opts.ocr_mode {
-            OcrMode::Never => false,
-            OcrMode::Always => true,
-            OcrMode::Auto => stats.looks_scanned(),
-        };
-        let mut did_ocr = false;
-        if want_ocr && !ocr_failed {
-            if ocr_engine.is_none() {
-                match ocr::OcrEngine::new(opts.ocr.clone()) {
-                    Ok(e) => ocr_engine = Some(e),
-                    Err(e) => {
-                        ocr_failed = true;
-                        let msg = format!("OCR unavailable: {e}");
-                        progress(Progress::Warning(msg.clone()));
-                        report.warnings.push(msg);
+    // Pages are extracted (and scans rendered) here, PDFium being single-threaded;
+    // OCR runs on worker threads fed through a bounded queue, which caps the
+    // number of page images held in memory.
+    struct Job {
+        slot: usize,
+        index: usize,
+        raw: model::RawPage,
+        img: image::DynamicImage,
+    }
+    struct Done {
+        slot: usize,
+        index: usize,
+        raw: model::RawPage,
+        result: Result<ocr::ScanReport, String>,
+        engine_failed: bool,
+    }
+    std::thread::scope(|scope| -> anyhow::Result<()> {
+        let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<Job>(workers);
+        let job_rx = std::sync::Arc::new(std::sync::Mutex::new(job_rx));
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<Done>();
+        let mut spawned = false;
+        let mut finished = 0usize;
+        let handle = |d: Done, slots: &mut Vec<Option<model::RawPage>>, report: &mut ConvertReport, progress: &mut dyn FnMut(Progress), unavailable: &mut bool, finished: &mut usize| {
+            match &d.result {
+                Ok(r) => {
+                    report.ocr_pages.push(d.index + 1);
+                    if r.quarter_turns != 0 {
+                        log::info!("page {}: turned upright ({}°)", d.index + 1, r.quarter_turns as u32 * 90);
                     }
                 }
+                Err(e) if d.engine_failed => {
+                    if !*unavailable {
+                        warn(report, progress, format!("OCR unavailable: {e}"));
+                    }
+                    *unavailable = true;
+                }
+                Err(e) => warn(report, progress, format!("page {}: OCR failed: {e}", d.index + 1)),
             }
-            if let Some(engine) = ocr_engine.as_mut() {
-                progress(Progress::PageOcr { page: index + 1 });
+            let ocr = d.result.is_ok();
+            slots[d.slot] = Some(d.raw);
+            *finished += 1;
+            progress(Progress::PageDone { page: d.index + 1, done: *finished, total: selection.len(), ocr });
+        };
+        for (done, &index) in selection.iter().enumerate() {
+            if cancel.is_some_and(|c| c.is_cancelled()) {
+                bail!("conversion cancelled");
+            }
+            progress(Progress::PageStarted { page: index + 1, done, total: selection.len() });
+            let page = document.pages().get(index as PdfPageIndex)?;
+            let (mut raw, stats) = extract::extract_page(&document, &page, index, &opts.extract).with_context(|| format!("page {}", index + 1))?;
+
+            // A scanned page with an invisible OCR text layer: drop the scan image, keep the text.
+            if stats.invisible_chars > stats.visible_chars && stats.invisible_chars > 0 {
+                let area = raw.width * raw.height;
+                raw.images.retain(|im| im.bbox.area() < 0.5 * area);
+            }
+            let want_ocr = match opts.ocr_mode {
+                OcrMode::Never => false,
+                OcrMode::Always => true,
+                OcrMode::Auto => stats.looks_scanned(),
+            };
+            if want_ocr && !ocr_unavailable {
                 let img = extract::render_page(&page, opts.ocr_dpi)?;
-                match engine.recognize(&img, opts.ocr_dpi) {
-                    Ok(words) => {
-                        let settings = engine.settings().clone();
-                        ocr::words_to_glyphs(&mut raw, &words, &img, &settings);
-                        raw.equations.clear();
-                        // Table rulings and underlines of a scan only exist as pixels.
-                        let scanned = raw.rules.is_empty();
-                        if scanned {
-                            raw.rules = ocr::detect_rules(&img, opts.ocr_dpi, &words);
-                        }
-                        // The scan itself is replaced by the recognised text.
-                        let area = raw.width * raw.height;
-                        raw.images.retain(|im| im.bbox.area() < 0.5 * area);
-                        // Pictures inside the scan are cropped out of the rendering.
-                        if opts.extract.extract_images && scanned {
-                            let (iw, ih) = (img.width() as f32, img.height() as f32);
-                            for r in ocr::detect_figures(&img, opts.ocr_dpi, &words, &raw.rules) {
-                                if raw.images.iter().any(|im| im.bbox.intersects(&r)) {
-                                    continue;
-                                }
-                                let (sx, sy) = (iw / raw.width, ih / raw.height);
-                                let crop = img.crop_imm(
-                                    (r.x0 * sx) as u32,
-                                    (r.y0 * sy) as u32,
-                                    ((r.width() * sx) as u32).max(1),
-                                    ((r.height() * sy) as u32).max(1),
-                                );
-                                if let Some(data) = extract::encode_image(&crop, opts.extract.max_image_px) {
-                                    raw.images.push(model::RawImage { bbox: r, data, behind_text: false, overlay: false, vector: None });
+                if !spawned {
+                    // Language: as given, or detected from the document.
+                    if ocr_settings.language.eq_ignore_ascii_case("auto") {
+                        let lang = choose_language(&document, &selection, &img, opts, &mut |m| warn(&mut report, progress, m));
+                        log::info!("OCR language: {lang}");
+                        ocr_settings.language = lang;
+                    }
+                    report.ocr_language = Some(ocr_settings.language.clone());
+                    for _ in 0..workers {
+                        let rx = job_rx.clone();
+                        let tx = done_tx.clone();
+                        let settings = ocr_settings.clone();
+                        let (dpi, eopts, straighten) = (opts.ocr_dpi, &opts.extract, opts.straighten_scans);
+                        scope.spawn(move || {
+                            let mut engine: Option<Result<ocr::OcrEngine, String>> = None;
+                            loop {
+                                let job = rx.lock().map_err(|_| ()).and_then(|r| r.recv().map_err(|_| ()));
+                                let Ok(mut job) = job else { break };
+                                let e = engine.get_or_insert_with(|| ocr::OcrEngine::new(settings.clone()).map_err(|e| e.to_string()));
+                                let (result, engine_failed) = match e {
+                                    Ok(e) => (ocr::process_scan(e, &mut job.raw, job.img, dpi, eopts, straighten).map_err(|e| e.to_string()), false),
+                                    Err(msg) => (Err(msg.clone()), true),
+                                };
+                                if tx.send(Done { slot: job.slot, index: job.index, raw: job.raw, result, engine_failed }).is_err() {
+                                    break;
                                 }
                             }
-                        }
-                        did_ocr = true;
-                        report.ocr_pages.push(index + 1);
+                        });
                     }
-                    Err(e) => {
-                        let msg = format!("page {}: OCR failed: {e}", index + 1);
-                        progress(Progress::Warning(msg.clone()));
-                        report.warnings.push(msg);
-                    }
+                    spawned = true;
                 }
+                progress(Progress::PageOcr { page: index + 1 });
+                // Blocks while the workers are busy: at most `workers` images wait.
+                if job_tx.send(Job { slot: done, index, raw, img }).is_err() {
+                    bail!("OCR workers stopped");
+                }
+            } else {
+                slots[done] = Some(raw);
+                finished += 1;
+                progress(Progress::PageDone { page: index + 1, done: finished, total: selection.len(), ocr: false });
+            }
+            while let Ok(d) = done_rx.try_recv() {
+                handle(d, &mut slots, &mut report, progress, &mut ocr_unavailable, &mut finished);
             }
         }
+        drop(job_tx);
+        drop(done_tx);
+        for d in done_rx {
+            handle(d, &mut slots, &mut report, progress, &mut ocr_unavailable, &mut finished);
+        }
+        Ok(())
+    })?;
+    let mut raws: Vec<model::RawPage> = slots.into_iter().flatten().collect();
+    report.ocr_pages.sort_unstable();
 
-        raws.push(raw);
-        progress(Progress::PageDone { page: index + 1, done: done + 1, total: selection.len(), ocr: did_ocr });
+    // Text in pictures becomes their alternative text.
+    if opts.ocr_mode != OcrMode::Never && opts.picture_text && !ocr_unavailable {
+        let jobs: Vec<(usize, usize)> = raws
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| !r.ocr)
+            .flat_map(|(pi, r)| r.images.iter().enumerate().filter(|(_, im)| !im.overlay && im.vector.is_none() && im.bbox.width() >= 40.0 && im.bbox.height() >= 14.0).map(move |(ii, _)| (pi, ii)))
+            .take(60)
+            .collect();
+        if !jobs.is_empty() {
+            if ocr_settings.language.eq_ignore_ascii_case("auto") {
+                let text: String = raws.iter().flat_map(|r| r.glyphs.iter().map(|g| g.ch)).take(20000).collect();
+                let installed = scan::available_languages(ocr_settings.tessdata.as_deref());
+                ocr_settings.language = scan::detect_language(&text).filter(|l| installed.contains(l)).unwrap_or_else(|| default_language(&installed));
+            }
+            let datas: Vec<model::ImageData> = jobs.iter().map(|&(pi, ii)| raws[pi].images[ii].data.clone()).collect();
+            let texts = par_map(&datas, workers, || ocr::OcrEngine::new(ocr_settings.clone()).ok(), |engine, data| engine.as_mut().and_then(|e| ocr::picture_text(e, data)));
+            for (&(pi, ii), t) in jobs.iter().zip(texts) {
+                raws[pi].images[ii].alt = t;
+            }
+        }
     }
 
     // Repeated page tops and bottoms become the Word header and footer.
@@ -434,7 +508,7 @@ pub fn convert(
         structure.blank_first_footer = hf.blank_first_footer;
     }
 
-    let mut layouts: Vec<model::PageLayout> = raws.iter().map(|raw| layout::analyse_page(raw, &opts.layout)).collect();
+    let mut layouts: Vec<model::PageLayout> = par_map(&raws, workers, || (), |_, raw| layout::analyse_page(raw, &opts.layout));
     // Review comments and form fields of each page (by PDF page index).
     let mut comments: Vec<(usize, model::RawComment)> = Vec::new();
     let mut fields: std::collections::HashMap<usize, Vec<model::FormControl>> = Default::default();
@@ -555,6 +629,84 @@ pub fn convert(
     report.pages = layouts.len();
     progress(Progress::Finished { output: output.to_path_buf() });
     Ok(report)
+}
+
+/// Maps `f` over `items` on up to `workers` threads, each with its own state
+/// from `init` (e.g. an OCR engine); results keep the input order.
+fn par_map<T: Sync, R: Send, S>(items: &[T], workers: usize, init: impl Fn() -> S + Sync, f: impl Fn(&mut S, &T) -> R + Sync) -> Vec<R> {
+    let n = items.len();
+    if n <= 1 || workers <= 1 {
+        let mut st = init();
+        return items.iter().map(|it| f(&mut st, it)).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results: std::sync::Mutex<Vec<Option<R>>> = std::sync::Mutex::new((0..n).map(|_| None).collect());
+    std::thread::scope(|scope| {
+        for _ in 0..workers.min(n) {
+            scope.spawn(|| {
+                let mut st = init();
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= n {
+                        break;
+                    }
+                    let r = f(&mut st, &items[i]);
+                    results.lock().unwrap()[i] = Some(r);
+                }
+            });
+        }
+    });
+    results.into_inner().unwrap().into_iter().map(|r| r.expect("every item is processed")).collect()
+}
+
+fn default_language(installed: &[String]) -> String {
+    if installed.is_empty() || installed.iter().any(|l| l == "eng") {
+        "eng".into()
+    } else {
+        installed[0].clone()
+    }
+}
+
+/// OCR language for `auto`: from the document's own text, or from a quick
+/// recognition of the first scanned page, limited to installed languages.
+fn choose_language(document: &PdfDocument, selection: &[usize], first_scan: &image::DynamicImage, opts: &ConvertOptions, warn: &mut dyn FnMut(String)) -> String {
+    let installed = scan::available_languages(opts.ocr.tessdata.as_deref());
+    let fallback = default_language(&installed);
+    // Text layers of the converted pages.
+    let mut text = String::new();
+    for &i in selection.iter().take(20) {
+        if let Ok(page) = document.pages().get(i as PdfPageIndex) {
+            if let Ok(t) = page.text() {
+                text.push_str(&t.all());
+                text.push(' ');
+            }
+        }
+        if text.len() > 20000 {
+            break;
+        }
+    }
+    let mut detected = if text.chars().filter(|c| c.is_alphabetic()).count() >= 200 { scan::detect_language(&text) } else { None };
+    // Otherwise a first look at the scan.
+    if detected.is_none() {
+        let settings = ocr::OcrSettings { language: fallback.clone(), ..opts.ocr.clone() };
+        if let Ok(mut engine) = ocr::OcrEngine::new(settings) {
+            let k = (150.0 / opts.ocr_dpi).min(1.0);
+            let (w, h) = (first_scan.width(), first_scan.height());
+            let small = first_scan.resize(((w as f32 * k) as u32).max(1), ((h as f32 * k) as u32).max(1), image::imageops::FilterType::Triangle);
+            if let Ok(words) = engine.recognize(&small, opts.ocr_dpi * k) {
+                let t: Vec<&str> = words.iter().filter(|w| w.confidence > 40.0).map(|w| w.text.as_str()).collect();
+                detected = scan::detect_language(&t.join(" "));
+            }
+        }
+    }
+    match detected {
+        Some(l) if installed.is_empty() || installed.contains(&l) => l,
+        Some(l) => {
+            warn(format!("the document seems to be in '{l}', but Tesseract has no data for it; using '{fallback}'"));
+            fallback
+        }
+        None => fallback,
+    }
 }
 
 fn document_meta(document: &PdfDocument, input: &Path) -> DocMeta {

@@ -260,6 +260,8 @@ pub struct RawImage {
     pub overlay: bool,
     /// Editable shapes for a vector figure (the image is their fallback).
     pub vector: Option<Box<VectorDrawing>>,
+    /// Text recognised in the picture (alternative text).
+    pub alt: Option<String>,
 }
 
 /// One drawing command of a vector path (coordinates relative to the drawing).
@@ -768,6 +770,8 @@ pub struct Picture {
     pub overlay: bool,
     /// Editable shapes (the picture is their fallback).
     pub vector: Option<Box<VectorDrawing>>,
+    /// Alternative text (recognised text of the picture).
+    pub alt: Option<String>,
 }
 
 /// A horizontal separator line.

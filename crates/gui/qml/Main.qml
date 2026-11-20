@@ -261,7 +261,7 @@ ApplicationWindow {
                         TextField {
                             Layout.fillWidth: true
                             text: conv.ocrLanguage
-                            placeholderText: "eng or eng+deu"
+                            placeholderText: "auto, eng or eng+deu"
                             onEditingFinished: conv.ocrLanguage = text
                             enabled: conv.ocrMode !== 2
                         }

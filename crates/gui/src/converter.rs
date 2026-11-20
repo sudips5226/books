@@ -139,7 +139,7 @@ impl Default for ConverterRust {
             last_output: QString::default(),
             layout_mode: 0,
             ocr_mode: 0,
-            ocr_language: QString::from("eng"),
+            ocr_language: QString::from("auto"),
             ocr_dpi: 300,
             page_range: QString::default(),
             password: QString::default(),
@@ -306,7 +306,7 @@ impl qobject::Converter {
             compensate_widths: *self.keep_widths(),
             ..Default::default()
         };
-        o.ocr.language = opt_string(self.ocr_language()).unwrap_or_else(|| "eng".into());
+        o.ocr.language = opt_string(self.ocr_language()).unwrap_or_else(|| "auto".into());
         o.extract.extract_images = *self.extract_images();
         o.extract.rasterize_vector_graphics = *self.vector_figures() && *self.extract_images();
         o.layout.detect_tables = *self.detect_tables();

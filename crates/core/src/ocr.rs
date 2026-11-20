@@ -294,7 +294,7 @@ impl OcrEngine {
 /// A `tessdata` folder shipped next to the executable (portable Windows/macOS
 /// bundles), used unless `TESSDATA_PREFIX` is set.
 #[cfg_attr(not(feature = "ocr"), allow(dead_code))]
-fn bundled_tessdata() -> Option<std::path::PathBuf> {
+pub fn bundled_tessdata() -> Option<std::path::PathBuf> {
     if std::env::var_os("TESSDATA_PREFIX").is_some() {
         return None;
     }
@@ -594,6 +594,148 @@ fn bimodal_threshold(values: &[f32], min_ratio: f32) -> Option<f32> {
 }
 
 /// Converts OCR words into glyphs and styles on `raw` (replacing existing text).
+/// Tesseract builds that use OpenMP start several threads per page, which
+/// oversubscribes the CPU when pages are recognised in parallel (and gains
+/// little even alone). Their thread limit is read when the process starts, so
+/// this sets `OMP_THREAD_LIMIT=1` and re-executes the program once. Call it
+/// first thing in `main`; it returns when nothing needs to be done.
+pub fn limit_openmp_threads() {
+    #[cfg(all(unix, feature = "ocr"))]
+    {
+        use std::os::unix::process::CommandExt;
+        if std::env::var_os("OMP_THREAD_LIMIT").is_some() || std::env::var_os("PDF2WORD_NO_REEXEC").is_some() {
+            return;
+        }
+        let Ok(exe) = std::env::current_exe() else { return };
+        let err = std::process::Command::new(exe)
+            .args(std::env::args_os().skip(1))
+            .env("OMP_THREAD_LIMIT", "1")
+            .env("PDF2WORD_NO_REEXEC", "1")
+            .exec();
+        log::debug!("could not restart with OMP_THREAD_LIMIT: {err}");
+    }
+}
+
+/// What happened to a scanned page.
+#[derive(Clone, Debug, Default)]
+pub struct ScanReport {
+    /// Quarter turns (counter-clockwise) applied to make the text upright.
+    pub quarter_turns: u8,
+    /// Skew correction applied, in degrees.
+    pub deskew: f32,
+}
+
+/// OCR of a rendered page: straightens the scan (orientation, skew), then
+/// recognises it and replaces the page content by the recognised text, the
+/// table rulings and the pictures found in the image. Runs without PDFium,
+/// so it can run on worker threads.
+pub fn process_scan(engine: &mut OcrEngine, raw: &mut RawPage, img: DynamicImage, dpi: f32, opts: &crate::extract::ExtractOptions, straighten: bool) -> anyhow::Result<ScanReport> {
+    let mut img = img;
+    let mut report = ScanReport::default();
+    if straighten {
+        let skew = crate::scan::estimate_skew(&img);
+        if skew != 0.0 {
+            img = crate::scan::rotate(&img, -skew);
+            report.deskew = -skew;
+        }
+    }
+    let mut words = engine.recognize(&img, dpi)?;
+    if straighten {
+        // A poor result may be sideways or upside down: compare quarter turns on a thumbnail.
+        let chars: usize = words.iter().map(|w| w.text.chars().filter(|c| c.is_alphanumeric()).count()).sum();
+        let mean_conf = if words.is_empty() { 0.0 } else { words.iter().map(|w| w.confidence).sum::<f32>() / words.len() as f32 };
+        if chars < 40 || mean_conf < 65.0 {
+            let k = (110.0 / dpi).min(1.0);
+            let (w, h) = img.dimensions();
+            let thumb = img.resize(((w as f32 * k) as u32).max(1), ((h as f32 * k) as u32).max(1), image::imageops::FilterType::Triangle);
+            let tdpi = dpi * k;
+            let mut scores = [0.0f32; 4];
+            for (q, s) in scores.iter_mut().enumerate() {
+                *s = crate::scan::ocr_score(&engine.recognize(&crate::scan::quarter_turn(&thumb, q as u8), tdpi)?);
+            }
+            let best = (1..4).max_by(|&a, &b| scores[a].total_cmp(&scores[b])).unwrap();
+            if scores[best] > 1.5 * scores[0] + 10.0 {
+                img = crate::scan::quarter_turn(&img, best as u8);
+                report.quarter_turns = best as u8;
+                // Sideways lines hide the skew: measure it again upright.
+                let skew = crate::scan::estimate_skew(&img);
+                if skew != 0.0 {
+                    img = crate::scan::rotate(&img, -skew);
+                    report.deskew -= skew;
+                }
+                if best % 2 == 1 {
+                    std::mem::swap(&mut raw.width, &mut raw.height);
+                }
+                // Content placed in the old orientation no longer fits.
+                raw.images.clear();
+                raw.rules.clear();
+                raw.boxes.clear();
+                raw.glyphs.clear();
+                raw.rotated.clear();
+                words = engine.recognize(&img, dpi)?;
+            }
+        }
+    }
+    let settings = engine.settings().clone();
+    words_to_glyphs(raw, &words, &img, &settings);
+    raw.equations.clear();
+    // Table rulings and underlines of a scan only exist as pixels.
+    let scanned = raw.rules.is_empty();
+    if scanned {
+        raw.rules = detect_rules(&img, dpi, &words);
+    }
+    // The scan itself is replaced by the recognised text.
+    let area = raw.width * raw.height;
+    raw.images.retain(|im| im.bbox.area() < 0.5 * area);
+    // Pictures inside the scan are cropped out of the rendering.
+    if opts.extract_images && scanned {
+        let (iw, ih) = (img.width() as f32, img.height() as f32);
+        for r in detect_figures(&img, dpi, &words, &raw.rules) {
+            if raw.images.iter().any(|im| im.bbox.intersects(&r)) {
+                continue;
+            }
+            let (sx, sy) = (iw / raw.width, ih / raw.height);
+            let crop = img.crop_imm((r.x0 * sx) as u32, (r.y0 * sy) as u32, ((r.width() * sx) as u32).max(1), ((r.height() * sy) as u32).max(1));
+            if let Some(data) = crate::extract::encode_image(&crop, opts.max_image_px) {
+                raw.images.push(RawImage { bbox: r, data, behind_text: false, overlay: false, vector: None, alt: None });
+            }
+        }
+    }
+    raw.ocr = true;
+    Ok(report)
+}
+
+/// Text found in a picture, if it holds a meaningful amount of confident text.
+pub fn picture_text(engine: &mut OcrEngine, data: &ImageData) -> Option<String> {
+    let img = image::load_from_memory(&data.bytes).ok()?;
+    let (w, h) = img.dimensions();
+    if w < 60 || h < 20 {
+        return None;
+    }
+    // Small pictures are enlarged: Tesseract wants text at least ~20 px high.
+    let img = if w.max(h) < 1000 { img.resize(w * 2, h * 2, image::imageops::FilterType::CatmullRom) } else { img };
+    let words = engine.recognize(&img, 144.0).ok()?;
+    let good: Vec<&OcrWord> = words.iter().filter(|w| w.confidence >= 60.0 && w.text.chars().any(|c| c.is_alphanumeric())).collect();
+    if good.len() < 3 {
+        return None;
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut last_key = None;
+    for wd in good {
+        if last_key == Some(wd.line_key) {
+            if let Some(l) = lines.last_mut() {
+                l.push(' ');
+                l.push_str(&wd.text);
+            }
+        } else {
+            lines.push(wd.text.clone());
+        }
+        last_key = Some(wd.line_key);
+    }
+    let text = lines.join("\n");
+    Some(text.chars().take(2000).collect())
+}
+
 pub fn words_to_glyphs(raw: &mut RawPage, words: &[OcrWord], img: &DynamicImage, settings: &OcrSettings) {
     raw.glyphs.clear();
     raw.ocr = true;

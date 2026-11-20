@@ -21,6 +21,7 @@ ttf-parser = "0.25"
 unicode-normalization = "0.1"
 unicode-bidi = "0.3"
 lopdf = { version = "0.47", default-features = false }
+whatlang = "0.16"
 
 
 [build-dependencies]
