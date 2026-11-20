@@ -256,7 +256,77 @@ pub struct RawImage {
     pub data: ImageData,
     /// The image sits behind text (e.g. a watermark or a background).
     pub behind_text: bool,
+    /// Drawn over the page (graphic annotations): placed in front of the text without wrapping.
+    pub overlay: bool,
+    /// Editable shapes for a vector figure (the image is their fallback).
+    pub vector: Option<Box<VectorDrawing>>,
 }
+
+/// One drawing command of a vector path (coordinates relative to the drawing).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PathCmd {
+    MoveTo(f32, f32),
+    LineTo(f32, f32),
+    CurveTo(f32, f32, f32, f32, f32, f32),
+    Close,
+}
+
+#[derive(Clone, Debug)]
+pub struct VectorShape {
+    /// Bounds of the path within the drawing.
+    pub bbox: Rect,
+    pub cmds: Vec<PathCmd>,
+    pub fill: Option<Rgb>,
+    /// Stroke colour and width.
+    pub stroke: Option<(Rgb, f32)>,
+}
+
+#[derive(Clone, Debug)]
+pub struct VectorLabel {
+    /// Bounds of the text within the drawing.
+    pub bbox: Rect,
+    pub text: String,
+    pub style: TextStyle,
+}
+
+/// A simple vector figure rebuilt as editable shapes and text boxes.
+#[derive(Clone, Debug, Default)]
+pub struct VectorDrawing {
+    pub width: f32,
+    pub height: f32,
+    pub shapes: Vec<VectorShape>,
+    pub labels: Vec<VectorLabel>,
+}
+
+/// A review comment found as a PDF annotation.
+#[derive(Clone, Debug, Default)]
+pub struct RawComment {
+    /// Where it points on the page.
+    pub bbox: Rect,
+    pub author: String,
+    pub text: String,
+    /// ISO 8601 date, if known.
+    pub date: Option<String>,
+}
+
+/// An interactive form field.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ControlKind {
+    Text { value: String, multiline: bool },
+    Check { checked: bool },
+    Dropdown { items: Vec<String>, value: String },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FormControl {
+    pub name: String,
+    pub kind: ControlKind,
+    /// Width of the widget on the page (points).
+    pub width: f32,
+}
+
+/// First code point used to stand for form fields inside the text (plane 15 private use).
+pub const CONTROL_BASE: u32 = 0xF0000;
 
 #[derive(Clone, Debug)]
 pub struct ImageData {
@@ -310,6 +380,10 @@ pub struct RawPage {
     pub rotated: Vec<(Glyph, f32)>,
     /// Display equations found on the page (their glyphs are removed).
     pub equations: Vec<crate::math::DisplayEquation>,
+    /// Review comments (notes, commented markup).
+    pub comments: Vec<RawComment>,
+    /// Form fields; each one stands in the text as the character `CONTROL_BASE + index`.
+    pub fields: Vec<FormControl>,
 }
 
 impl RawPage {
@@ -345,6 +419,12 @@ pub enum Inline {
     Field { kind: FieldKind, text: String, style: TextStyle },
     /// Reference mark of a footnote (index into the document's footnotes).
     FootnoteRef(usize),
+    /// An interactive form field (content control).
+    Control { control: FormControl, style: TextStyle },
+    /// Start of a complex field spanning paragraphs (instruction text), e.g. a TOC.
+    FieldBegin(String),
+    /// End of the complex field started by [`Inline::FieldBegin`].
+    FieldEnd,
     Tab,
     LineBreak,
     /// End of a line in the source PDF. Flow layout joins the lines,
@@ -430,13 +510,23 @@ pub struct StyleDef {
 pub struct DocStructure {
     pub header: Option<HeaderFooter>,
     pub footer: Option<HeaderFooter>,
+    /// Even-page variants (two-sided layouts); `header`/`footer` then serve odd pages.
+    pub header_even: Option<HeaderFooter>,
+    pub footer_even: Option<HeaderFooter>,
     /// The first page lacks the header / the footer that the other pages have.
     pub blank_first_header: bool,
     pub blank_first_footer: bool,
+    /// PDF page indices whose page has no header / footer (page-by-page layouts).
+    pub pages_without_header: Vec<usize>,
+    pub pages_without_footer: Vec<usize>,
+    /// Printed page numbers (value, roman numerals) by PDF page index.
+    pub page_numbers: std::collections::HashMap<usize, (i64, bool)>,
     pub lists: Vec<ListDef>,
     pub footnotes: Vec<Footnote>,
     /// Paragraph styles; the first one is "Normal".
     pub styles: Vec<StyleDef>,
+    /// Review comments; paragraphs refer to them by index.
+    pub comments: Vec<RawComment>,
 }
 
 /// A node of an equation tree (serialised as OMML).
@@ -536,6 +626,8 @@ pub struct TabStop {
     /// Position relative to the paragraph's container left edge, in points.
     pub pos: f32,
     pub kind: TabKind,
+    /// Dot leader (tables of contents).
+    pub leader: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -571,6 +663,10 @@ pub struct Paragraph {
     pub style: Option<String>,
     /// Word list membership (the marker text has been removed).
     pub list: Option<ListRef>,
+    /// Bookmark names starting at this paragraph (targets of links and of the TOC).
+    pub bookmarks: Vec<String>,
+    /// Comments (indices into the document's comments) anchored to this paragraph.
+    pub comments: Vec<usize>,
 }
 
 impl Paragraph {
@@ -581,7 +677,12 @@ impl Paragraph {
                 Inline::Text { text, .. } => s.push_str(text),
                 Inline::Math(m) => s.push_str(&MathNode::plain(m)),
                 Inline::Field { text, .. } => s.push_str(text),
-                Inline::FootnoteRef(_) => {}
+                Inline::FootnoteRef(_) | Inline::FieldBegin(_) | Inline::FieldEnd => {}
+                Inline::Control { control, .. } => match &control.kind {
+                    ControlKind::Text { value, .. } => s.push_str(value),
+                    ControlKind::Check { checked } => s.push(if *checked { '☒' } else { '☐' }),
+                    ControlKind::Dropdown { value, .. } => s.push_str(value),
+                },
                 Inline::Tab => s.push('\t'),
                 Inline::LineBreak => s.push('\n'),
                 Inline::SoftBreak(Joiner::Space) => s.push(' '),
@@ -663,6 +764,10 @@ pub struct Picture {
     /// text (true) or with square text wrapping (false). Only used for
     /// pictures in [`PageLayout::floating`].
     pub behind_text: bool,
+    /// Floating in front of the text without wrapping (graphic annotations).
+    pub overlay: bool,
+    /// Editable shapes (the picture is their fallback).
+    pub vector: Option<Box<VectorDrawing>>,
 }
 
 /// A horizontal separator line.
@@ -730,6 +835,8 @@ pub struct PageLayout {
     /// Rotated or vertical text placed in text boxes.
     pub text_boxes: Vec<TextBox>,
     pub ocr: bool,
+    /// Lowest point of the body content on the page (points from the top).
+    pub content_bottom: f32,
 }
 
 #[cfg(test)]

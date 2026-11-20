@@ -93,6 +93,18 @@ struct Args {
     #[arg(long)]
     no_styles: bool,
 
+    /// Ignore the PDF outline, internal links and tables of contents.
+    #[arg(long)]
+    no_navigation: bool,
+
+    /// Do not turn annotations into Word comments.
+    #[arg(long)]
+    no_comments: bool,
+
+    /// Keep vector figures as pictures only (no editable shapes).
+    #[arg(long)]
+    no_shapes: bool,
+
     /// Path to the PDFium shared library (file or directory).
     #[arg(long)]
     pdfium: Option<PathBuf>,
@@ -128,6 +140,8 @@ fn run(args: Args) -> anyhow::Result<()> {
         word_lists: !args.no_lists,
         footnotes: !args.no_footnotes,
         paragraph_styles: !args.no_styles,
+        navigation: !args.no_navigation,
+        annotations: !args.no_comments,
         pdfium_path: args.pdfium.clone(),
         ..Default::default()
     };
@@ -137,6 +151,7 @@ fn run(args: Args) -> anyhow::Result<()> {
     opts.extract.extract_images = !args.no_images;
     opts.extract.rasterize_vector_graphics = !args.no_figures && !args.no_images;
     opts.layout.detect_tables = !args.no_tables;
+    opts.extract.vector_shapes = !args.no_shapes;
 
     let multi = args.inputs.len() > 1;
     if multi {

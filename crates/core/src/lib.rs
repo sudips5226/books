@@ -18,6 +18,7 @@
 // Geometry code indexes several parallel arrays; explicit index loops read better there.
 #![allow(clippy::needless_range_loop)]
 
+pub mod annots;
 pub mod docx;
 pub mod embed;
 pub mod extract;
@@ -25,6 +26,7 @@ pub mod fonts;
 pub mod layout;
 pub mod math;
 pub mod metrics;
+pub mod navigate;
 pub mod model;
 pub mod ocr;
 pub mod reflow;
@@ -104,6 +106,11 @@ pub struct ConvertOptions {
     pub footnotes: bool,
     /// Use named paragraph styles (Normal, Heading n, Caption …).
     pub paragraph_styles: bool,
+    /// Heading levels and bookmarks from the PDF outline, internal links and
+    /// the table of contents as Word bookmarks, hyperlinks and a TOC field.
+    pub navigation: bool,
+    /// Annotations become Word comments; form fields become content controls.
+    pub annotations: bool,
     /// Explicit path to the PDFium library (file or directory).
     pub pdfium_path: Option<PathBuf>,
 }
@@ -126,6 +133,8 @@ impl Default for ConvertOptions {
             word_lists: true,
             footnotes: true,
             paragraph_styles: true,
+            navigation: true,
+            annotations: true,
             pdfium_path: None,
         }
     }
@@ -370,7 +379,7 @@ pub fn convert(
                                     ((r.height() * sy) as u32).max(1),
                                 );
                                 if let Some(data) = extract::encode_image(&crop, opts.extract.max_image_px) {
-                                    raw.images.push(model::RawImage { bbox: r, data, behind_text: false });
+                                    raw.images.push(model::RawImage { bbox: r, data, behind_text: false, overlay: false, vector: None });
                                 }
                             }
                         }
@@ -394,12 +403,13 @@ pub fn convert(
     let mut structure = model::DocStructure::default();
     // Page counts are only meaningful when the whole document is converted.
     let total_pages = if selection.len() == total { total } else { 0 };
-    let mut hf_layouts: Vec<(bool, f32, f32)> = Vec::new(); // (footer, margin_left, margin_right)
+    let mut hf_layouts: Vec<(usize, f32, f32)> = Vec::new(); // (which, margin_left, margin_right)
     let mut number_offset = 0i64;
     if opts.headers_footers {
         let hf = structure::extract_headers_footers(&mut raws);
         number_offset = hf.number_offset;
-        let mut build = |(raw, src): (model::RawPage, usize), footer: bool| {
+        let mut build = |(raw, src): (model::RawPage, usize), which: usize| {
+            let footer = which % 2 == 1;
             let l = layout::analyse_page(&raw, &opts.layout);
             let mut blocks = l.blocks;
             let printed = (src as i64 + 1 + hf.number_offset).max(1) as usize;
@@ -410,16 +420,30 @@ pub fn convert(
             structure::unwrap_single_cell_tables(&mut blocks);
             let height = (content_bottom - content_top).max(0.0).max(structure::blocks_height(&blocks));
             let distance = if footer { (raw.height - content_bottom).max(0.0) } else { l.margin_top };
-            hf_layouts.push((footer, l.margin_left, l.margin_right));
+            hf_layouts.push((which, l.margin_left, l.margin_right));
             model::HeaderFooter { blocks, distance, height }
         };
-        structure.header = hf.header.map(|h| build(h, false));
-        structure.footer = hf.footer.map(|f| build(f, true));
+        structure.header = hf.header.map(|h| build(h, 0));
+        structure.footer = hf.footer.map(|f| build(f, 1));
+        structure.header_even = hf.header_even.map(|h| build(h, 2));
+        structure.footer_even = hf.footer_even.map(|f| build(f, 3));
+        structure.pages_without_header = hf.pages_without_header.clone();
+        structure.page_numbers = hf.page_numbers.clone();
+        structure.pages_without_footer = hf.pages_without_footer.clone();
         structure.blank_first_header = hf.blank_first_header;
         structure.blank_first_footer = hf.blank_first_footer;
     }
 
     let mut layouts: Vec<model::PageLayout> = raws.iter().map(|raw| layout::analyse_page(raw, &opts.layout)).collect();
+    // Review comments and form fields of each page (by PDF page index).
+    let mut comments: Vec<(usize, model::RawComment)> = Vec::new();
+    let mut fields: std::collections::HashMap<usize, Vec<model::FormControl>> = Default::default();
+    for raw in &mut raws {
+        comments.extend(std::mem::take(&mut raw.comments).into_iter().map(|c| (raw.index, c)));
+        if !raw.fields.is_empty() {
+            fields.insert(raw.index, std::mem::take(&mut raw.fields));
+        }
+    }
     drop(raws);
     for l in &layouts {
         count_blocks(&l.blocks, &mut report);
@@ -433,8 +457,13 @@ pub fn convert(
         };
         let ml = median(layouts.iter().map(|l| l.margin_left).collect());
         let mr = median(layouts.iter().map(|l| l.margin_right).collect());
-        for (footer, l, r) in hf_layouts {
-            let target = if footer { structure.footer.as_mut() } else { structure.header.as_mut() };
+        for (which, l, r) in hf_layouts {
+            let target = match which {
+                0 => structure.header.as_mut(),
+                1 => structure.footer.as_mut(),
+                2 => structure.header_even.as_mut(),
+                _ => structure.footer_even.as_mut(),
+            };
             if let Some(hf) = target {
                 structure::shift_blocks(&mut hf.blocks, l - ml, r - mr);
             }
@@ -444,16 +473,45 @@ pub fn convert(
     if opts.detect_headings {
         layout::detect_headings(&mut layouts);
     }
+    if opts.navigation {
+        let outline = annots::outline(&document);
+        if !outline.is_empty() {
+            let n = navigate::apply_outline(&mut layouts, &outline);
+            log::debug!("outline: {n} of {} entries matched", outline.len());
+        }
+    }
     structure::mark_header_rows(&mut layouts);
+    navigate::insert_controls(&mut layouts, &fields);
+    if opts.annotations {
+        navigate::attach_comments(&mut layouts, comments, &mut structure);
+    }
     if opts.word_lists {
         structure.lists = structure::detect_lists(&mut layouts);
     }
-    if opts.footnotes {
+    // Footnotes cannot live in the positioned frames of exact layout.
+    if opts.footnotes && opts.layout_mode != LayoutMode::Exact {
         let body = body_font_size(&layouts);
         structure.footnotes = structure::detect_footnotes(&mut layouts, body);
     }
+    let mut toc_styles = Vec::new();
+    if opts.navigation {
+        navigate::resolve_internal_links(&mut layouts, &mut structure);
+        toc_styles = navigate::detect_toc(&mut layouts, opts.layout_mode != LayoutMode::Exact);
+    } else {
+        // Unresolved jumps inside the document are dropped.
+        navigate::for_all_paragraphs(&mut layouts, &mut structure, &mut |p: &mut model::Paragraph| {
+            for i in p.inlines.iter_mut() {
+                if let model::Inline::Text { link, .. } = i {
+                    if link.as_ref().is_some_and(|l| l.starts_with('#')) {
+                        *link = None;
+                    }
+                }
+            }
+        });
+    }
     if opts.paragraph_styles {
         structure.styles = structure::assign_styles(&mut layouts, &mut structure.footnotes);
+        structure.styles.extend(toc_styles);
     }
     let mut embedded = Vec::new();
     if opts.embed_fonts {
@@ -470,7 +528,7 @@ pub fn convert(
             }
         }
         metrics::compensate(&mut layouts, &library);
-        for hf in [structure.header.as_mut(), structure.footer.as_mut()].into_iter().flatten() {
+        for hf in [structure.header.as_mut(), structure.footer.as_mut(), structure.header_even.as_mut(), structure.footer_even.as_mut()].into_iter().flatten() {
             metrics::compensate_blocks(&mut hf.blocks, &library);
         }
         for f in &mut structure.footnotes {

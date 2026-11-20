@@ -9,7 +9,7 @@ For every document the PDF is converted, the DOCX is rendered back to PDF with
 LibreOffice, and both are compared:
 
 * visual  – symmetric ink agreement of the rendered pages (blurred masks, 0..1)
-* text_f1 – bag-of-words F1 between the PDF text and the DOCX text
+* text_f1 – bag-of-words F1 between the PDF text and the text of the rendered DOCX
 * order   – similarity of the word sequences (reading order)
 * pages   – page-count agreement (min/max)
 * lines   – share of PDF lines whose break is reproduced (flow mode only)
@@ -95,7 +95,7 @@ def pdf_text(pdf, pages=None):
 def docx_text(path):
     parts = []
     with zipfile.ZipFile(path) as z:
-        names = [n for n in z.namelist() if re.match(r"word/(document|header\d*|footer\d*|footnotes|comments)\.xml$", n)]
+        names = [n for n in z.namelist() if re.match(r"word/(document|footnotes)\.xml$", n)]
         for n in sorted(names, key=lambda n: (n != "word/document.xml", n)):
             xml = z.read(n).decode("utf-8", "replace")
             xml = re.sub(r"</w:p>", "\n", xml)
@@ -204,7 +204,7 @@ def cmd_run(args):
         for mode in modes:
             name = f"{d['name']}.{mode}"
             docx = work / f"{name}.docx"
-            cmd = [args.bin, "-q", "-m", mode, str(src), "-o", str(docx)]
+            cmd = [args.bin, "-q", "-m", mode, str(src), "-o", str(docx)] + (args.args.split() if args.args else [])
             if d.get("pages"):
                 cmd += ["-p", d["pages"]]
             t0 = time.time()
@@ -235,7 +235,11 @@ def cmd_run(args):
         tag = f"{r['name']}.{r['mode']}"
         oi = render(src, out / "img", tag + ".orig", pages)
         ci = render(conv_pdf, out / "img", tag + ".conv")
-        f1, order = text_scores(pdf_text(src, pages), docx_text(r["_docx"]))
+        # Words a reader sees (headers and footers on every page, page-number fields
+        # resolved) from the rendering; reading order from the document's logical text.
+        orig_text = pdf_text(src, pages)
+        f1, _ = text_scores(orig_text, pdf_text(conv_pdf))
+        _, order = text_scores(orig_text, docx_text(r["_docx"]))
         po, pc = page_count(src, pages), page_count(conv_pdf)
         r.update(
             visual=visual_score(oi, ci),
@@ -320,6 +324,7 @@ def main():
     r.add_argument("--bin", default=str(ROOT / "target" / "release" / "pdf2word"))
     r.add_argument("--modes", default="flow,exact")
     r.add_argument("--only")
+    r.add_argument("--args", help="extra converter arguments, e.g. \"--no-lists\"")
     r.add_argument("--out", default=str(EVAL / "report"))
     c = sub.add_parser("compare")
     c.add_argument("results")

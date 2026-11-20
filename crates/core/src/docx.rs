@@ -90,6 +90,10 @@ struct SectGeom<'a> {
     columns: &'a [crate::reflow::ColumnDef],
     /// Starts on the same page as the previous section.
     continuous: bool,
+    /// Free space below the body content on the source page.
+    free_bottom: Option<f32>,
+    /// Source page (page-by-page layouts).
+    page: Option<usize>,
 }
 
 /// (rId, type, target, external)
@@ -115,9 +119,16 @@ struct Writer {
     header_room: f32,
     footer_room: f32,
     blank_first: (bool, bool),
+    /// Pages without header / footer, and the blank parts their sections use.
+    no_header: std::collections::HashSet<usize>,
+    no_footer: std::collections::HashSet<usize>,
+    blank_refs: String,
+    page_numbers: std::collections::HashMap<usize, (i64, bool)>,
     title_page: bool,
     first_page_number: usize,
     sections: usize,
+    control_id: usize,
+    bookmark_id: usize,
 }
 
 const REL_IMAGE: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image";
@@ -141,9 +152,15 @@ impl Writer {
             header_room: 0.0,
             footer_room: 0.0,
             blank_first: (false, false),
+            no_header: Default::default(),
+            no_footer: Default::default(),
+            blank_refs: String::new(),
+            page_numbers: Default::default(),
             title_page: false,
             first_page_number: 1,
             sections: 0,
+            control_id: 0,
+            bookmark_id: 0,
         }
     }
 
@@ -350,8 +367,94 @@ impl Writer {
         let _ = write!(out, r#"<w:r>{rpr}<w:t xml:space="preserve">{}</w:t></w:r>"#, esc(text));
     }
 
+    /// Tabs and line ends (also inside hyperlinks).
+    fn break_inline(&mut self, out: &mut String, inl: &Inline, last_style: &Option<TextStyle>) {
+        match inl {
+            Inline::Tab => {
+                let rpr = last_style.clone().map(|s| self.run_props(&s)).unwrap_or_default();
+                let _ = write!(out, "<w:r>{rpr}<w:tab/></w:r>");
+            }
+            Inline::LineBreak => out.push_str("<w:r><w:br/></w:r>"),
+            Inline::SoftBreak(j) => {
+                let st = last_style.clone().unwrap_or_default();
+                if self.mode == LayoutMode::Exact {
+                    if *j == Joiner::Hyphen {
+                        self.text_run(out, "-", &st);
+                    }
+                    let rpr = self.run_props(&st);
+                    let _ = write!(out, "<w:r>{rpr}<w:br/></w:r>");
+                } else if *j == Joiner::Space {
+                    self.text_run(out, " ", &st);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A form field as a content control.
+    fn control(&mut self, out: &mut String, c: &FormControl, style: &TextStyle) {
+        self.control_id += 1;
+        let id = self.control_id;
+        let name = esc(&c.name);
+        let rpr = self.run_props(style);
+        let _ = write!(out, r#"<w:sdt><w:sdtPr><w:alias w:val="{name}"/><w:tag w:val="{name}"/><w:id w:val="{id}"/>"#);
+        match &c.kind {
+            ControlKind::Text { value, multiline } => {
+                let empty = value.trim().is_empty();
+                if empty {
+                    out.push_str("<w:showingPlcHdr/>");
+                }
+                let _ = write!(out, r#"<w:text{}/></w:sdtPr><w:sdtContent>"#, if *multiline { r#" w:multiLine="1""# } else { "" });
+                // A light box shows where to type; empty fields keep their width.
+                let rpr = rpr.replace("</w:rPr>", r#"<w:bdr w:val="single" w:sz="4" w:space="0" w:color="A0A0A0"/></w:rPr>"#);
+                let text = if empty {
+                    let n = (c.width / (style.size.max(4.0) * 0.5)).clamp(2.0, 80.0) as usize;
+                    "\u{2002}".repeat(n)
+                } else {
+                    value.clone()
+                };
+                let _ = write!(out, r#"<w:r>{rpr}<w:t xml:space="preserve">{}</w:t></w:r>"#, esc(&text));
+            }
+            ControlKind::Check { checked } => {
+                let _ = write!(
+                    out,
+                    r#"<w14:checkbox><w14:checked w14:val="{}"/><w14:checkedState w14:val="2612" w14:font="MS Gothic"/><w14:uncheckedState w14:val="2610" w14:font="MS Gothic"/></w14:checkbox></w:sdtPr><w:sdtContent>"#,
+                    *checked as u8
+                );
+                self.fonts.entry("MS Gothic".into()).or_insert(Generic::Sans);
+                let rpr = rpr.replace("<w:rPr>", r#"<w:rPr><w:rFonts w:ascii="MS Gothic" w:eastAsia="MS Gothic" w:hAnsi="MS Gothic" w:hint="eastAsia"/>"#);
+                // run_props may have written the text font first: the later rFonts would be ignored.
+                let rpr = match rpr.find("<w:rFonts w:ascii=\"MS Gothic\"") {
+                    Some(_) => {
+                        let mut r = rpr.clone();
+                        if let (Some(a), Some(b)) = (r.rfind("<w:rFonts w:ascii="), r.rfind("<w:rFonts w:ascii=\"MS Gothic\"")) {
+                            if a != b {
+                                let end = r[a..].find("/>").map(|e| a + e + 2).unwrap_or(a);
+                                r.replace_range(a..end, "");
+                            }
+                        }
+                        r
+                    }
+                    None => rpr,
+                };
+                let _ = write!(out, r#"<w:r>{rpr}<w:t>{}</w:t></w:r>"#, if *checked { '☒' } else { '☐' });
+            }
+            ControlKind::Dropdown { items, value } => {
+                out.push_str("<w:dropDownList>");
+                for it in items {
+                    let e = esc(it);
+                    let _ = write!(out, r#"<w:listItem w:displayText="{e}" w:value="{e}"/>"#);
+                }
+                out.push_str("</w:dropDownList></w:sdtPr><w:sdtContent>");
+                let rpr = rpr.replace("</w:rPr>", r#"<w:bdr w:val="single" w:sz="4" w:space="0" w:color="A0A0A0"/></w:rPr>"#);
+                let shown = if value.is_empty() { items.first().cloned().unwrap_or_default() } else { value.clone() };
+                let _ = write!(out, r#"<w:r>{rpr}<w:t xml:space="preserve">{}</w:t></w:r>"#, esc(&shown));
+            }
+        }
+        out.push_str("</w:sdtContent></w:sdt>");
+    }
+
     fn inlines(&mut self, out: &mut String, inlines: &[Inline]) {
-        let exact = self.mode == LayoutMode::Exact;
         let mut last_style: Option<TextStyle> = None;
         let mut i = 0;
         while i < inlines.len() {
@@ -362,15 +465,26 @@ impl Writer {
                 }
                 Inline::Text { text, style, link, .. } => {
                     if let Some(url) = link {
-                        let id = self.add_rel(REL_LINK, url.clone(), true);
-                        let _ = write!(out, r#"<w:hyperlink r:id="{id}" w:history="1">"#);
-                        // Group consecutive runs with the same link.
+                        // Internal targets ("#name") are bookmarks; others are external.
+                        if let Some(anchor) = url.strip_prefix('#') {
+                            let _ = write!(out, r#"<w:hyperlink w:anchor="{}" w:history="1">"#, esc(anchor));
+                        } else {
+                            let id = self.add_rel(REL_LINK, url.clone(), true);
+                            let _ = write!(out, r#"<w:hyperlink r:id="{id}" w:history="1">"#);
+                        }
+                        // Group consecutive runs with the same link (tabs and line ends included).
                         let mut j = i;
                         while j < inlines.len() {
                             match &inlines[j] {
                                 Inline::Text { text, style, link: Some(l), .. } if l == url => {
                                     self.text_run(out, text, style);
                                     last_style = Some(style.clone());
+                                    j += 1;
+                                }
+                                inl @ (Inline::Tab | Inline::SoftBreak(_) | Inline::LineBreak)
+                                    if inlines[j + 1..].iter().find(|x| !matches!(x, Inline::Tab | Inline::SoftBreak(_) | Inline::LineBreak)).is_some_and(|x| matches!(x, Inline::Text { link: Some(l), .. } if l == url)) =>
+                                {
+                                    self.break_inline(out, inl, &last_style);
                                     j += 1;
                                 }
                                 _ => break,
@@ -383,11 +497,7 @@ impl Writer {
                     self.text_run(out, text, style);
                     last_style = Some(style.clone());
                 }
-                Inline::Tab => {
-                    let rpr = last_style.clone().map(|s| self.run_props(&s)).unwrap_or_default();
-                    let _ = write!(out, "<w:r>{rpr}<w:tab/></w:r>");
-                }
-                Inline::LineBreak => out.push_str("<w:r><w:br/></w:r>"),
+                inl @ (Inline::Tab | Inline::LineBreak | Inline::SoftBreak(_)) => self.break_inline(out, inl, &last_style),
                 Inline::Field { kind, text, style } => {
                     let instr = match kind {
                         FieldKind::PageNumber => " PAGE ",
@@ -400,18 +510,18 @@ impl Writer {
                 Inline::FootnoteRef(id) => {
                     let _ = write!(out, r#"<w:r><w:rPr><w:rStyle w:val="FootnoteReference"/></w:rPr><w:footnoteReference w:id="{}"/></w:r>"#, id + 1);
                 }
-                Inline::SoftBreak(j) => {
-                    let st = last_style.clone().unwrap_or_default();
-                    if exact {
-                        if *j == Joiner::Hyphen {
-                            self.text_run(out, "-", &st);
-                        }
-                        let rpr = self.run_props(&st);
-                        let _ = write!(out, "<w:r>{rpr}<w:br/></w:r>");
-                    } else if *j == Joiner::Space {
-                        self.text_run(out, " ", &st);
-                    }
+                Inline::Control { control, style } => {
+                    self.control(out, control, style);
+                    last_style = Some(style.clone());
                 }
+                Inline::FieldBegin(instr) => {
+                    let _ = write!(
+                        out,
+                        r#"<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve">{}</w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r>"#,
+                        esc(instr)
+                    );
+                }
+                Inline::FieldEnd => out.push_str(r#"<w:r><w:fldChar w:fldCharType="end"/></w:r>"#),
             }
             i += 1;
         }
@@ -451,7 +561,8 @@ impl Writer {
                     TabKind::Right => "right",
                     TabKind::Center => "center",
                 };
-                let _ = write!(out, r#"<w:tab w:val="{kind}" w:pos="{}"/>"#, tw(t.pos.max(0.0)));
+                let leader = if t.leader { r#" w:leader="dot""# } else { "" };
+                let _ = write!(out, r#"<w:tab w:val="{kind}"{leader} w:pos="{}"/>"#, tw(t.pos.max(0.0)));
             }
             out.push_str("</w:tabs>");
         }
@@ -505,10 +616,24 @@ impl Writer {
             out.push_str(s);
         }
         out.push_str("</w:pPr>");
+        let first_bookmark = self.bookmark_id;
+        for name in &p.bookmarks {
+            let _ = write!(out, r#"<w:bookmarkStart w:id="{}" w:name="{}"/>"#, self.bookmark_id, esc(name));
+            self.bookmark_id += 1;
+        }
+        for c in &p.comments {
+            let _ = write!(out, r#"<w:commentRangeStart w:id="{c}"/>"#);
+        }
         let style = self.style_of(p);
         let saved = std::mem::replace(&mut self.base, style);
         self.inlines(out, &p.inlines);
         self.base = saved;
+        for c in &p.comments {
+            let _ = write!(out, r#"<w:commentRangeEnd w:id="{c}"/><w:r><w:rPr><w:rStyle w:val="CommentReference"/></w:rPr><w:commentReference w:id="{c}"/></w:r>"#);
+        }
+        for id in first_bookmark..self.bookmark_id {
+            let _ = write!(out, r#"<w:bookmarkEnd w:id="{id}"/>"#);
+        }
         out.push_str("</w:p>");
     }
 
@@ -545,14 +670,99 @@ impl Writer {
         )
     }
 
+    /// A vector figure as a group of shapes and text boxes (DrawingML).
+    fn group_graphic(&mut self, v: &VectorDrawing, w: f32, h: f32) -> String {
+        let (cx, cy) = (emu(w.max(1.0)), emu(h.max(1.0)));
+        let (sx, sy) = (w / v.width.max(0.01), h / v.height.max(0.01));
+        let mut s = format!(
+            r#"<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingGroup"><wpg:wgp><wpg:cNvGrpSpPr/><wpg:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/><a:chOff x="0" y="0"/><a:chExt cx="{cx}" cy="{cy}"/></a:xfrm></wpg:grpSpPr>"#
+        );
+        for shape in &v.shapes {
+            let id = self.next_drawing;
+            self.next_drawing += 1;
+            let b = shape.bbox;
+            let (ew, eh) = (emu(b.width() * sx).max(1), emu(b.height() * sy).max(1));
+            let pt = |x: f32, y: f32| format!(r#"<a:pt x="{}" y="{}"/>"#, emu((x - b.x0) * sx).clamp(0, ew), emu((y - b.y0) * sy).clamp(0, eh));
+            let mut path = String::new();
+            for c in &shape.cmds {
+                match *c {
+                    PathCmd::MoveTo(x, y) => {
+                        let _ = write!(path, "<a:moveTo>{}</a:moveTo>", pt(x, y));
+                    }
+                    PathCmd::LineTo(x, y) => {
+                        let _ = write!(path, "<a:lnTo>{}</a:lnTo>", pt(x, y));
+                    }
+                    PathCmd::CurveTo(x1, y1, x2, y2, x3, y3) => {
+                        let _ = write!(path, "<a:cubicBezTo>{}{}{}</a:cubicBezTo>", pt(x1, y1), pt(x2, y2), pt(x3, y3));
+                    }
+                    PathCmd::Close => path.push_str("<a:close/>"),
+                }
+            }
+            let fill = match shape.fill {
+                Some(c) => format!(r#"<a:solidFill><a:srgbClr val="{}"/></a:solidFill>"#, c.hex()),
+                None => "<a:noFill/>".into(),
+            };
+            let line = match shape.stroke {
+                Some((c, wd)) => format!(r#"<a:ln w="{}"><a:solidFill><a:srgbClr val="{}"/></a:solidFill></a:ln>"#, emu(wd * sx.min(sy)), c.hex()),
+                None => "<a:ln><a:noFill/></a:ln>".into(),
+            };
+            let path_fill = if shape.fill.is_none() { r#" fill="none""# } else { "" };
+            let _ = write!(
+                s,
+                r#"<wps:wsp><wps:cNvPr id="{id}" name="Shape {id}"/><wps:cNvSpPr/><wps:spPr><a:xfrm><a:off x="{}" y="{}"/><a:ext cx="{ew}" cy="{eh}"/></a:xfrm><a:custGeom><a:avLst/><a:gdLst/><a:ahLst/><a:cxnLst/><a:rect l="0" t="0" r="r" b="b"/><a:pathLst><a:path w="{ew}" h="{eh}"{path_fill}>{path}</a:path></a:pathLst></a:custGeom>{fill}{line}</wps:spPr><wps:bodyPr/></wps:wsp>"#,
+                emu(b.x0 * sx),
+                emu(b.y0 * sy)
+            );
+        }
+        let normal = self.styles.get("Normal").cloned();
+        let saved = std::mem::replace(&mut self.base, normal);
+        for l in &v.labels {
+            let id = self.next_drawing;
+            self.next_drawing += 1;
+            let size = l.style.size.max(1.0);
+            let (x0, y0) = (l.bbox.x0 * sx, (l.bbox.y0 - 0.15 * size) * sy);
+            let (lw, lh) = (l.bbox.width() * sx + 0.4 * size, (l.bbox.height().max(1.25 * size)) * sy);
+            let mut run = String::new();
+            self.text_run(&mut run, &l.text, &l.style);
+            let _ = write!(
+                s,
+                r#"<wps:wsp><wps:cNvPr id="{id}" name="Label {id}"/><wps:cNvSpPr txBox="1"/><wps:spPr><a:xfrm><a:off x="{}" y="{}"/><a:ext cx="{}" cy="{}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/><a:ln><a:noFill/></a:ln></wps:spPr><wps:txbx><w:txbxContent><w:p><w:pPr><w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/></w:pPr>{run}</w:p></w:txbxContent></wps:txbx><wps:bodyPr rot="0" vert="horz" wrap="none" lIns="0" tIns="0" rIns="0" bIns="0" anchor="t" anchorCtr="0"><a:noAutofit/></wps:bodyPr></wps:wsp>"#,
+                emu(x0.max(0.0)),
+                emu(y0.max(0.0)),
+                emu(lw),
+                emu(lh)
+            );
+        }
+        self.base = saved;
+        s.push_str("</wpg:wgp></a:graphicData></a:graphic>");
+        s
+    }
+
+    /// Wraps a picture drawing: editable shapes first, the picture as fallback.
+    fn with_vector(&mut self, pic: &Picture, drawing: String, frame: impl Fn(&str, usize) -> String) -> String {
+        match &pic.vector {
+            Some(v) => {
+                let id = self.next_drawing;
+                self.next_drawing += 1;
+                let g = self.group_graphic(v, pic.width.max(1.0), pic.height.max(1.0));
+                format!(r#"<w:r><mc:AlternateContent><mc:Choice Requires="wpg">{}</mc:Choice><mc:Fallback>{drawing}</mc:Fallback></mc:AlternateContent></w:r>"#, frame(&g, id))
+            }
+            None => format!("<w:r>{drawing}</w:r>"),
+        }
+    }
+
     fn inline_picture_run(&mut self, pic: &Picture) -> String {
         let id = self.next_drawing;
         self.next_drawing += 1;
         let (cx, cy) = (emu(pic.width.max(1.0)), emu(pic.height.max(1.0)));
         let g = self.graphic_xml(pic, id);
-        format!(
-            r#"<w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="{cx}" cy="{cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/><wp:docPr id="{id}" name="Picture {id}"/><wp:cNvGraphicFramePr><a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/></wp:cNvGraphicFramePr>{g}</wp:inline></w:drawing></w:r>"#
-        )
+        let frame = move |g: &str, id: usize| {
+            format!(
+                r#"<w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="{cx}" cy="{cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/><wp:docPr id="{id}" name="Picture {id}"/><wp:cNvGraphicFramePr><a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/></wp:cNvGraphicFramePr>{g}</wp:inline></w:drawing>"#
+            )
+        };
+        let drawing = frame(&g, id);
+        self.with_vector(pic, drawing, frame)
     }
 
     fn anchored_picture_run(&mut self, pic: &Picture, behind: bool) -> String {
@@ -565,15 +775,21 @@ impl Writer {
         self.next_drawing += 1;
         let (cx, cy) = (emu(pic.width.max(1.0)), emu(pic.height.max(1.0)));
         let g = self.graphic_xml(pic, id);
-        let wrap = if behind { "<wp:wrapNone/>".to_string() } else { r#"<wp:wrapSquare wrapText="bothSides"/>"#.to_string() };
-        format!(
-            r#"<w:r><w:drawing><wp:anchor distT="0" distB="0" distL="57150" distR="57150" simplePos="0" relativeHeight="{rh}" behindDoc="{bd}" locked="0" layoutInCell="1" allowOverlap="1"><wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="page"><wp:posOffset>{x}</wp:posOffset></wp:positionH><wp:positionV relativeFrom="{vrel}"><wp:posOffset>{y}</wp:posOffset></wp:positionV><wp:extent cx="{cx}" cy="{cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/>{wrap}<wp:docPr id="{id}" name="Picture {id}"/><wp:cNvGraphicFramePr><a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/></wp:cNvGraphicFramePr>{g}</wp:anchor></w:drawing></w:r>"#,
-            rh = 251658240 + id,
-            bd = if behind { 1 } else { 0 },
-            x = emu(pic.bbox.x0),
-            y = emu(dy.unwrap_or(pic.bbox.y0)),
-            vrel = if dy.is_some() { "paragraph" } else { "page" },
-        )
+        let wrap = if behind || pic.overlay { "<wp:wrapNone/>".to_string() } else { r#"<wp:wrapSquare wrapText="bothSides"/>"#.to_string() };
+        // Overlays (graphic annotations) stack above everything else.
+        let rh_base = if pic.overlay { 251700000 } else { 251658240 };
+        let bd = if behind { 1 } else { 0 };
+        let x = emu(pic.bbox.x0);
+        let y = emu(dy.unwrap_or(pic.bbox.y0));
+        let vrel = if dy.is_some() { "paragraph" } else { "page" };
+        let frame = move |g: &str, id: usize| {
+            format!(
+                r#"<w:drawing><wp:anchor distT="0" distB="0" distL="57150" distR="57150" simplePos="0" relativeHeight="{rh}" behindDoc="{bd}" locked="0" layoutInCell="1" allowOverlap="1"><wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="page"><wp:posOffset>{x}</wp:posOffset></wp:positionH><wp:positionV relativeFrom="{vrel}"><wp:posOffset>{y}</wp:posOffset></wp:positionV><wp:extent cx="{cx}" cy="{cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/>{wrap}<wp:docPr id="{id}" name="Picture {id}"/><wp:cNvGraphicFramePr><a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/></wp:cNvGraphicFramePr>{g}</wp:anchor></w:drawing>"#,
+                rh = rh_base + id,
+            )
+        };
+        let drawing = frame(&g, id);
+        self.with_vector(pic, drawing, frame)
     }
 
     /// A text box anchored at its page position (rotated or vertical text).
@@ -754,7 +970,7 @@ impl Writer {
                 q.tabs = p
                     .tabs
                     .iter()
-                    .map(|t| TabStop { pos: t.pos + container_x0 - p.bbox.x0, kind: t.kind })
+                    .map(|t| TabStop { pos: t.pos + container_x0 - p.bbox.x0, kind: t.kind, leader: false })
                     .filter(|t| t.pos > 0.0)
                     .collect();
                 // Anchor the (slightly wider) frame on the side the text is aligned to.
@@ -806,6 +1022,8 @@ impl Writer {
             margins: [page.margin_top, page.margin_right, page.margin_bottom, page.margin_left],
             columns: &[],
             continuous: false,
+            free_bottom: (page.content_bottom > 0.0).then_some(page.height - page.content_bottom),
+            page: Some(page.index),
         };
         self.sect_pr_geom(&geom)
     }
@@ -819,8 +1037,36 @@ impl Writer {
             // Only the first section has a distinct first page.
             refs = refs.split("/>").filter(|r| !r.is_empty() && !r.contains(r#"w:type="first""#)).map(|r| format!("{r}/>")).collect();
         }
+        // A page without header/footer in the PDF gets blank ones.
+        let no_header = g.page.is_some_and(|p| self.no_header.contains(&p)) && !(first && self.title_page);
+        let no_footer = g.page.is_some_and(|p| self.no_footer.contains(&p)) && !(first && self.title_page);
+        if no_header || no_footer {
+            let blank: Vec<&str> = self.blank_refs.split("/>").filter(|r| !r.is_empty()).collect();
+            let mut out = String::new();
+            for r in refs.split("/>").filter(|r| !r.is_empty()) {
+                let header = r.starts_with("<w:headerReference");
+                let kind = if header { "header" } else { "footer" };
+                if (header && no_header) || (!header && no_footer) {
+                    let ty = r.split("w:type=\"").nth(1).and_then(|t| t.split('"').next()).unwrap_or("default");
+                    if let Some(b) = blank.iter().find(|b| b.starts_with(&format!("<w:{kind}Reference"))) {
+                        out.push_str(&b.replace("w:type=\"default\"", &format!("w:type=\"{ty}\"")));
+                        out.push_str("/>");
+                        continue;
+                    }
+                }
+                out.push_str(r);
+                out.push_str("/>");
+            }
+            refs = out;
+        }
         let kind = if g.continuous && !first { r#"<w:type w:val="continuous"/>"# } else { "" };
-        let num = if first && self.first_page_number != 1 { format!(r#"<w:pgNumType w:start="{}"/>"#, self.first_page_number) } else { String::new() };
+        // Each page keeps its printed number (front matter in roman numerals,
+        // numbering restarted at a chapter, pages that overflowed).
+        let num = match g.page.and_then(|p| self.page_numbers.get(&p)) {
+            Some(&(v, roman)) if v >= 0 => format!(r#"<w:pgNumType{} w:start="{v}"/>"#, if roman { r#" w:fmt="lowerRoman""# } else { "" }),
+            _ if first && self.first_page_number != 1 => format!(r#"<w:pgNumType w:start="{}"/>"#, self.first_page_number),
+            _ => String::new(),
+        };
         let title = if first && self.title_page { "<w:titlePg/>" } else { "" };
         let cols = if g.columns.len() > 1 {
             let mut c = format!(r#"<w:cols w:num="{}" w:space="0" w:equalWidth="0">"#, g.columns.len());
@@ -835,11 +1081,27 @@ impl Writer {
         let [mut mt, mr, mut mb, ml] = g.margins;
         // The margins must hold the header/footer (as Word would grow them):
         // a footer taller than its margin sends LibreOffice into a layout loop.
-        if !(first && self.blank_first.0) {
-            mt = mt.max(self.header_room);
+        // Where that would take room the body needs, the header/footer moves
+        // towards the page edge instead.
+        let (mut hd, mut fd) = (self.header_distance, self.footer_distance);
+        if !(first && self.blank_first.0) && !no_header && self.header_room > 0.0 {
+            let height = self.header_room - self.header_distance;
+            if self.header_room > mt {
+                hd = (mt - height).max(0.0).min(hd);
+            }
+            mt = mt.max(hd + height);
         }
-        if !(first && self.blank_first.1) {
-            mb = mb.max(self.footer_room);
+        if !(first && self.blank_first.1) && !no_footer && self.footer_room > 0.0 {
+            let height = self.footer_room - self.footer_distance;
+            if let Some(free) = g.free_bottom {
+                // Keep most of the slack the body had (font substitution, rounding):
+                // the footer moves towards the page edge instead.
+                let room = (free - 14.0).min(0.4 * free).max(height + 2.0);
+                if self.footer_room > room {
+                    fd = (room - height).max(0.0).min(fd);
+                }
+            }
+            mb = mb.max(fd + height);
         }
         format!(
             r#"<w:sectPr>{refs}{kind}<w:pgSz w:w="{}" w:h="{}"{orient}/><w:pgMar w:top="{}" w:right="{}" w:bottom="{}" w:left="{}" w:header="{}" w:footer="{}" w:gutter="0"/>{num}{cols}{title}</w:sectPr>"#,
@@ -851,8 +1113,8 @@ impl Writer {
             tw(mb),
             tw(ml),
             // A header/footer may not start inside the body area: LibreOffice loops on that.
-            tw(self.header_distance.min(mt)),
-            tw(self.footer_distance.min(mb)),
+            tw(hd.min(mt)),
+            tw(fd.min(mb)),
         )
     }
 
@@ -870,6 +1132,8 @@ impl Writer {
             margins: [s.margin_top, s.margin_right, s.margin_bottom, s.margin_left],
             columns: &s.columns,
             continuous: !s.new_page,
+            free_bottom: None,
+            page: None,
         };
         let sect = self.sect_pr_geom(&geom);
         if last {
@@ -938,6 +1202,11 @@ impl Writer {
             }
         }
         if last {
+            // Frames must not be the document's last paragraphs (LibreOffice then
+            // lays them out side by side).
+            if self.mode == LayoutMode::Exact {
+                self.spacer(&mut out, 1.0, None);
+            }
             out.push_str(&sect.replace("<w:sectPr>", "<w:sectPr_BODY>"));
         } else {
             self.spacer(&mut out, 1.0, Some(&sect));
@@ -983,7 +1252,7 @@ fn styles_xml(st: &DocStructure, default_font: &str, default_size: f32) -> Strin
         None => s.push_str(r#"<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:qFormat/></w:style>"#),
     }
     s.push_str(r#"<w:style w:type="character" w:default="1" w:styleId="DefaultParagraphFont"><w:name w:val="Default Paragraph Font"/><w:uiPriority w:val="1"/><w:semiHidden/></w:style><w:style w:type="table" w:default="1" w:styleId="TableNormal"><w:name w:val="Normal Table"/><w:semiHidden/><w:tblPr><w:tblInd w:w="0" w:type="dxa"/><w:tblCellMar><w:top w:w="0" w:type="dxa"/><w:left w:w="0" w:type="dxa"/><w:bottom w:w="0" w:type="dxa"/><w:right w:w="0" w:type="dxa"/></w:tblCellMar></w:tblPr></w:style><w:style w:type="numbering" w:default="1" w:styleId="NoList"><w:name w:val="No List"/><w:uiPriority w:val="99"/><w:semiHidden/></w:style><w:style w:type="character" w:styleId="Hyperlink"><w:name w:val="Hyperlink"/><w:basedOn w:val="DefaultParagraphFont"/><w:uiPriority w:val="99"/></w:style>"#);
-    for lvl in 1..=3u8 {
+    for lvl in 1..=6u8 {
         let id = format!("Heading{lvl}");
         let rpr = st.styles.iter().find(|d| d.id == id).map(|d| style_rpr(d, normal)).unwrap_or_default();
         let _ = write!(
@@ -1010,6 +1279,9 @@ fn styles_xml(st: &DocStructure, default_font: &str, default_size: f32) -> Strin
             let _ = write!(s, r#"<w:style w:type="paragraph" w:styleId="FootnoteText"><w:name w:val="footnote text"/><w:basedOn w:val="Normal"/><w:uiPriority w:val="99"/><w:rPr><w:sz w:val="{hp}"/><w:szCs w:val="{hp}"/></w:rPr></w:style>"#);
         }
         s.push_str(r#"<w:style w:type="character" w:styleId="FootnoteReference"><w:name w:val="footnote reference"/><w:basedOn w:val="DefaultParagraphFont"/><w:uiPriority w:val="99"/><w:rPr><w:vertAlign w:val="superscript"/></w:rPr></w:style>"#);
+    }
+    if !st.comments.is_empty() {
+        s.push_str(r#"<w:style w:type="character" w:styleId="CommentReference"><w:name w:val="annotation reference"/><w:basedOn w:val="DefaultParagraphFont"/><w:uiPriority w:val="99"/><w:semiHidden/><w:rPr><w:sz w:val="16"/><w:szCs w:val="16"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="CommentText"><w:name w:val="annotation text"/><w:basedOn w:val="Normal"/><w:uiPriority w:val="99"/><w:rPr><w:sz w:val="20"/><w:szCs w:val="20"/></w:rPr></w:style>"#);
     }
     if st.header.is_some() || st.footer.is_some() {
         s.push_str(r#"<w:style w:type="paragraph" w:styleId="Header"><w:name w:val="header"/><w:basedOn w:val="Normal"/><w:uiPriority w:val="99"/></w:style><w:style w:type="paragraph" w:styleId="Footer"><w:name w:val="footer"/><w:basedOn w:val="Normal"/><w:uiPriority w:val="99"/></w:style>"#);
@@ -1111,10 +1383,11 @@ fn rels_xml(rels: &[Rel], fixed: &str) -> String {
 const REL_HEADER: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/header";
 const REL_FOOTER: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer";
 const REL_FOOTNOTES: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes";
+const REL_COMMENTS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments";
 const REL_NUMBERING: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering";
 
 const SETTINGS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:zoom w:percent="100"/>EMBED<w:defaultTabStop w:val="720"/><w:characterSpacingControl w:val="doNotCompress"/>FOOTNOTEPR<w:compat><w:compatSetting w:name="compatibilityMode" w:uri="http://schemas.microsoft.com/office/word" w:val="15"/><w:compatSetting w:name="overrideTableStyleFontSizeAndJustification" w:uri="http://schemas.microsoft.com/office/word" w:val="1"/><w:compatSetting w:name="enableOpenTypeFeatures" w:uri="http://schemas.microsoft.com/office/word" w:val="1"/><w:compatSetting w:name="doNotFlipMirrorIndents" w:uri="http://schemas.microsoft.com/office/word" w:val="1"/></w:compat></w:settings>"#;
+<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:zoom w:percent="100"/>EMBED<w:defaultTabStop w:val="720"/>EVENODD<w:characterSpacingControl w:val="doNotCompress"/>FOOTNOTEPR<w:compat><w:compatSetting w:name="compatibilityMode" w:uri="http://schemas.microsoft.com/office/word" w:val="15"/><w:compatSetting w:name="overrideTableStyleFontSizeAndJustification" w:uri="http://schemas.microsoft.com/office/word" w:val="1"/><w:compatSetting w:name="enableOpenTypeFeatures" w:uri="http://schemas.microsoft.com/office/word" w:val="1"/><w:compatSetting w:name="doNotFlipMirrorIndents" w:uri="http://schemas.microsoft.com/office/word" w:val="1"/></w:compat></w:settings>"#;
 
 fn content_types(has: &[&str], overrides: &[(String, &str)]) -> String {
     let mut s = String::from(
@@ -1165,27 +1438,33 @@ pub fn write_docx<W: Write + Seek>(out: W, pages: &[PageLayout], meta: &DocMeta,
     }
     w.first_page_number = meta.first_page_number.max(1);
     w.title_page = st.blank_first_header || st.blank_first_footer;
+    if mode != LayoutMode::Continuous {
+        w.page_numbers = st.page_numbers.clone();
+    }
     w.blank_first = (st.blank_first_header, st.blank_first_footer);
 
     // Headers and footers: separate parts referenced from every section.
     let mut parts: Vec<(String, String, Vec<Rel>)> = Vec::new(); // (name, xml, rels)
     let mut overrides: Vec<(String, &str)> = Vec::new();
-    for (kind, hf) in [("header", &st.header), ("footer", &st.footer)] {
+    for (kind, hf, even) in [("header", &st.header, &st.header_even), ("footer", &st.footer, &st.footer_even)] {
         let Some(hf) = hf else { continue };
-        let (body, rels) = w.part(|w, out| {
-            for b in &hf.blocks {
-                w.flow_block(out, b);
-            }
-            if !matches!(hf.blocks.last(), Some(Block::Paragraph(_) | Block::Picture(_) | Block::Rule(_))) {
-                // Must end with a paragraph: keep it from adding a line.
-                w.spacer(out, 1.0, None);
-            }
-        });
         let (tag, rel) = if kind == "header" { ("hdr", REL_HEADER) } else { ("ftr", REL_FOOTER) };
+        let write_part = |w: &mut Writer, hf: &HeaderFooter| -> (String, Vec<Rel>) {
+            let (body, rels) = w.part(|w, out| {
+                for b in &hf.blocks {
+                    w.flow_block(out, b);
+                }
+                if !matches!(hf.blocks.last(), Some(Block::Paragraph(_) | Block::Picture(_) | Block::Rule(_))) {
+                    // Must end with a paragraph: keep it from adding a line.
+                    w.spacer(out, 1.0, None);
+                }
+            });
+            (format!("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<w:{tag} {NS}>{body}</w:{tag}>"), rels)
+        };
+        let (xml, rels) = write_part(&mut w, hf);
         let name = format!("{kind}1.xml");
         let id = w.add_rel(rel, name.clone(), false);
         let _ = write!(w.sect_refs, r#"<w:{kind}Reference w:type="default" r:id="{id}"/>"#);
-        let xml = format!("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<w:{tag} {NS}>{body}</w:{tag}>");
         parts.push((name.clone(), xml.clone(), rels.clone()));
         overrides.push((format!("/word/{name}"), kind));
         if w.title_page {
@@ -1201,12 +1480,34 @@ pub fn write_docx<W: Write + Seek>(out: W, pages: &[PageLayout], meta: &DocMeta,
             }
             overrides.push((format!("/word/{name}"), kind));
         }
+        let without = if kind == "header" { &st.pages_without_header } else { &st.pages_without_footer };
+        if !without.is_empty() && mode != LayoutMode::Continuous {
+            let name = format!("{kind}0.xml");
+            let id = w.add_rel(rel, name.clone(), false);
+            let _ = write!(w.blank_refs, r#"<w:{kind}Reference w:type="default" r:id="{id}"/>"#);
+            parts.push((name.clone(), format!("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<w:{tag} {NS}><w:p/></w:{tag}>"), Vec::new()));
+            overrides.push((format!("/word/{name}"), kind));
+            let set = if kind == "header" { &mut w.no_header } else { &mut w.no_footer };
+            set.extend(without.iter().copied());
+        }
+        let mut distance = hf.distance;
+        let mut room = hf.distance + hf.height + 2.0;
+        if let Some(e) = even {
+            let (xml, rels) = write_part(&mut w, e);
+            let name = format!("{kind}3.xml");
+            let id = w.add_rel(rel, name.clone(), false);
+            let _ = write!(w.sect_refs, r#"<w:{kind}Reference w:type="even" r:id="{id}"/>"#);
+            parts.push((name.clone(), xml, rels));
+            overrides.push((format!("/word/{name}"), kind));
+            distance = distance.min(e.distance);
+            room = room.max(e.distance + e.height + 2.0);
+        }
         if kind == "header" {
-            w.header_distance = hf.distance;
-            w.header_room = hf.distance + hf.height + 2.0;
+            w.header_distance = distance;
+            w.header_room = room;
         } else {
-            w.footer_distance = hf.distance;
-            w.footer_room = hf.distance + hf.height + 2.0;
+            w.footer_distance = distance;
+            w.footer_room = room;
         }
     }
     // Header references must precede footer references.
@@ -1235,6 +1536,27 @@ pub fn write_docx<W: Write + Seek>(out: W, pages: &[PageLayout], meta: &DocMeta,
         w.add_rel(REL_FOOTNOTES, "footnotes.xml".into(), false);
         parts.push(("footnotes.xml".into(), format!("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<w:footnotes {NS}>{body}</w:footnotes>"), rels));
         overrides.push(("/word/footnotes.xml".into(), "footnotes"));
+    }
+    if !st.comments.is_empty() {
+        w.add_rel(REL_COMMENTS, "comments.xml".into(), false);
+        let mut xml = format!("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<w:comments {NS}>");
+        for (i, c) in st.comments.iter().enumerate() {
+            let author = if c.author.is_empty() { "PDF" } else { c.author.as_str() };
+            let initials: String = author.split_whitespace().filter_map(|w| w.chars().next()).take(3).collect();
+            let date = c.date.as_ref().map(|d| format!(r#" w:date="{}""#, esc(d))).unwrap_or_default();
+            let _ = write!(xml, r#"<w:comment w:id="{i}" w:author="{}"{date} w:initials="{}">"#, esc(author), esc(&initials));
+            for (k, line) in c.text.split('\n').enumerate() {
+                xml.push_str(r#"<w:p><w:pPr><w:pStyle w:val="CommentText"/></w:pPr>"#);
+                if k == 0 {
+                    xml.push_str(r#"<w:r><w:rPr><w:rStyle w:val="CommentReference"/></w:rPr><w:annotationRef/></w:r>"#);
+                }
+                let _ = write!(xml, r#"<w:r><w:t xml:space="preserve">{}</w:t></w:r></w:p>"#, esc(line));
+            }
+            xml.push_str("</w:comment>");
+        }
+        xml.push_str("</w:comments>");
+        parts.push(("comments.xml".into(), xml, Vec::new()));
+        overrides.push(("/word/comments.xml".into(), "comments"));
     }
     if !st.lists.is_empty() {
         w.add_rel(REL_NUMBERING, "numbering.xml".into(), false);
@@ -1343,6 +1665,7 @@ pub fn write_docx<W: Write + Seek>(out: W, pages: &[PageLayout], meta: &DocMeta,
     }
     let settings = SETTINGS
         .replace("EMBED", if font_parts.is_empty() { "" } else { "<w:embedTrueTypeFonts/><w:saveSubsetFonts/>" })
+        .replace("EVENODD", if st.header_even.is_some() || st.footer_even.is_some() { "<w:evenAndOddHeaders/>" } else { "" })
         .replace(
             "FOOTNOTEPR",
             if st.footnotes.is_empty() { "" } else { r#"<w:footnotePr><w:footnote w:id="-1"/><w:footnote w:id="0"/></w:footnotePr>"# },

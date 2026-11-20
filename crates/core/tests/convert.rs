@@ -440,3 +440,36 @@ fn continuous_mode_joins_pages_and_columns() {
         assert!(p.trim_end().ends_with("separate lines."), "{start} was not joined: {p}");
     }
 }
+
+#[test]
+fn outline_links_toc_comments_forms_and_shapes() {
+    if !pdfium_available() {
+        return;
+    }
+    let d = run("annotated.pdf", LayoutMode::Flow);
+    let doc = &d.document;
+    // Outline entries are headings with bookmarks; "2.1" is one level down.
+    assert!(doc.contains(r#"<w:pStyle w:val="Heading2"/>"#));
+    assert_eq!(doc.matches(r#"<w:bookmarkStart w:id="#).count(), 4);
+    // The table of contents: TOC field, dot leaders, entries linked to the headings.
+    assert!(doc.contains(r#"<w:instrText xml:space="preserve"> TOC \o &quot;1-3&quot; \h \z \u </w:instrText>"#));
+    assert_eq!(doc.matches(r#"w:leader="dot""#).count(), 4);
+    assert_eq!(doc.matches(r#"<w:hyperlink w:anchor="_Toc"#).count(), 4);
+    assert!(doc.contains(r#"<w:pStyle w:val="TOC2"/>"#));
+    // Review: comments with authors, the highlight as shading.
+    let comments = d.part("word/comments.xml");
+    assert!(comments.contains(r#"w:author="Reviewer""#) && comments.contains("Is this supported by the data?"));
+    assert!(comments.contains("Please add the instrument model.") && comments.contains("Check the week 3 value."));
+    assert_eq!(doc.matches("<w:commentReference").count(), 3);
+    assert!(doc.contains(r#"w:fill="FFFF00""#));
+    // Form fields are content controls with their values.
+    assert!(doc.contains(r#"<w:alias w:val="name"/>"#) && text(doc).contains("Ada Lovelace"));
+    assert!(doc.contains(r#"<w14:checked w14:val="1"/>"#));
+    assert!(doc.contains(r#"<w:listItem w:displayText="Sweden" w:value="Sweden"/>"#));
+    // The bar chart is a group of editable shapes (with the picture as fallback);
+    // the reviewer's rectangle is a picture over the page.
+    assert!(doc.contains("<wpg:wgp>") && doc.contains("<mc:Fallback>"));
+    assert!(doc.matches("<a:custGeom>").count() >= 6);
+    assert!(doc.contains("Week 3"));
+    assert!(doc.contains(r#"relativeHeight="2517"#));
+}

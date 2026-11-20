@@ -19,6 +19,7 @@ from reportlab.lib.pagesizes import A4, letter
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
+from pypdf.generic import ArrayObject, FloatObject, NameObject, TextStringObject
 from reportlab.platypus import (BaseDocTemplate, Frame, Image, ListFlowable, ListItem, PageTemplate,
                                 Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle)
 
@@ -488,6 +489,109 @@ def tables(path):
     doc.build(story)
 
 
+def annotated(path, workdir):
+    """Outline, a table of contents with dot leaders and internal links,
+    review annotations (note, highlight, rectangle), form fields and a simple
+    vector bar chart."""
+    w, h = letter
+    tmp = os.path.join(workdir, "annotated-base.pdf")
+    c = canvas.Canvas(tmp, pagesize=letter)
+    sections = [("1 Introduction", 0, 2), ("2 Methods", 0, 2), ("2.1 Data collection", 1, 3), ("3 Results", 0, 3)]
+    # Page 1: table of contents.
+    c.setFont("Helvetica-Bold", 20)
+    c.drawString(72, h - 90, "Contents")
+    y = h - 130
+    for i, (title, level, page) in enumerate(sections):
+        x = 72 + 18 * level
+        c.setFont("Times-Roman", 12)
+        c.drawString(x, y, title)
+        tw = c.stringWidth(title, "Times-Roman", 12)
+        c.drawRightString(w - 72, y, str(page))
+        dots_x0, dots_x1 = x + tw + 6, w - 72 - c.stringWidth(str(page), "Times-Roman", 12) - 6
+        dot = c.stringWidth(". ", "Times-Roman", 12)
+        c.drawString(dots_x0, y, ". " * int((dots_x1 - dots_x0) / dot))
+        c.linkRect("", f"sec{i}", (x, y - 3, w - 72, y + 12), relative=0)
+        y -= 22
+    c.setFont("Times-Roman", 11)
+    c.drawString(72, y - 20, "This report shows how review features of a PDF are carried into Word.")
+    c.showPage()
+
+    def heading(i, y):
+        title, level, _ = sections[i]
+        c.bookmarkHorizontal(f"sec{i}", 0, y + 20)
+        c.addOutlineEntry(title, f"sec{i}", level=level)
+        c.setFont("Helvetica-Bold", 16 if level == 0 else 13)
+        c.drawString(72, y, title)
+
+    def para(lines, y, size=11):
+        c.setFont("Times-Roman", size)
+        for line in lines:
+            c.drawString(72, y, line)
+            y -= size * 1.3
+        return y
+
+    # Page 2: two sections, a highlighted phrase and a sticky note.
+    heading(0, h - 90)
+    lines = ["The introduction explains the purpose of the study and the questions it answers.",
+             "An important finding is highlighted by the reviewer in this sentence of the text.",
+             "The remaining lines give context for the methods that follow in the next section."]
+    para(lines, h - 120)
+    phrase = "important finding"
+    x0 = 72 + c.stringWidth("An ", "Times-Roman", 11)
+    x1 = x0 + c.stringWidth(phrase, "Times-Roman", 11)
+    yb = h - 120 - 11 * 1.3
+    c.highlightAnnotation("Is this supported by the data?", (x0, yb - 3, x1, yb + 10),
+                          QuadPoints=[x0, yb + 10, x1, yb + 10, x0, yb - 3, x1, yb - 3], Color=[1, 1, 0], T="(Reviewer)")
+    heading(1, h - 220)
+    para(["Measurements were taken every hour over a period of four weeks in three locations.",
+          "Each location used the same instruments, calibrated before the start of the study."], h - 250)
+    c.textAnnotation("Please add the instrument model.", Rect=(w - 100, h - 262, w - 80, h - 242), relative=0, T="(Editor)")
+    c.showPage()
+
+    # Page 3: data section with a bar chart, results and a form.
+    heading(2, h - 90)
+    para(["The chart summarises the number of samples collected in each week of the study."], h - 120)
+    ox, oy = 110, h - 330
+    c.setStrokeColorRGB(0, 0, 0)
+    c.setLineWidth(1)
+    c.line(ox, oy, ox + 300, oy)
+    c.line(ox, oy, ox, oy + 170)
+    for k, (val, col) in enumerate([(120, (0.27, 0.45, 0.77)), (150, (0.93, 0.49, 0.19)), (90, (0.44, 0.68, 0.28)), (160, (0.6, 0.6, 0.6))]):
+        c.setFillColorRGB(*col)
+        c.rect(ox + 20 + k * 70, oy, 45, val, stroke=0, fill=1)
+        c.setFillColorRGB(0, 0, 0)
+        c.setFont("Helvetica", 9)
+        c.drawCentredString(ox + 42 + k * 70, oy - 12, f"Week {k + 1}")
+    c.setFont("Helvetica", 9)
+    for v in (0, 50, 100, 150):
+        c.drawRightString(ox - 4, oy + v - 3, str(v))
+    heading(3, h - 400)
+    para(["Please fill in the form below to receive the full data set."], h - 430)
+    c.setFont("Times-Roman", 11)
+    c.drawString(72, h - 470, "Name:")
+    c.acroForm.textfield(name="name", value="Ada Lovelace", x=130, y=h - 476, width=200, height=18, borderWidth=0.5, fontSize=10)
+    c.drawString(72, h - 500, "Subscribe:")
+    c.acroForm.checkbox(name="subscribe", checked=True, x=130, y=h - 504, size=12)
+    c.drawString(72, h - 530, "Country:")
+    c.acroForm.choice(name="country", value="Norway", options=["Denmark", "Norway", "Sweden"], x=130, y=h - 536, width=120, height=18, fontSize=10)
+    c.showPage()
+    c.save()
+
+    # A rectangle drawn by the reviewer (graphic annotation) on page 3.
+    from pypdf import PdfReader, PdfWriter
+    from pypdf.annotations import Rectangle
+    reader = PdfReader(tmp)
+    writer = PdfWriter(clone_from=reader)
+    rect = Rectangle(rect=(100, h - 345, 430, h - 140))
+    rect[NameObject("/C")] = ArrayObject([FloatObject(1), FloatObject(0), FloatObject(0)])
+    rect[NameObject("/Contents")] = TextStringObject("Check the week 3 value.")
+    rect[NameObject("/T")] = TextStringObject("Reviewer")
+    writer.add_annotation(page_number=2, annotation=rect)
+    with open(path, "wb") as f:
+        writer.write(f)
+    os.remove(tmp)
+
+
 def scanned(src_pdf, path, workdir):
     if not shutil.which("pdftoppm"):
         print("pdftoppm not found; skipping scanned.pdf")
@@ -518,6 +622,7 @@ def main():
     rotated(os.path.join(out, "rotated.pdf"))
     structure(os.path.join(out, "structure.pdf"))
     tables(os.path.join(out, "tables.pdf"))
+    annotated(os.path.join(out, "annotated.pdf"), out)
     rtl_office(os.path.join(out, "rtl-office.pdf"), out)
     scanned(os.path.join(out, "typography.pdf"), os.path.join(out, "typography-scan.pdf"), out)
     print("written to", out)

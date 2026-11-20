@@ -1104,7 +1104,7 @@ impl Emitter<'_> {
                 let is_marker_gap = si == 1 && line.marker_text_x.is_some_and(|x| (x - seg.bbox.x0).abs() < 1.0);
                 if (allow_tabs && gap > SPLIT_GAP * line_size) || is_marker_gap {
                     out.push(Atom::Tab);
-                    tabs.push(TabStop { pos: seg.bbox.x0 - frame.x0, kind: TabKind::Left });
+                    tabs.push(TabStop { pos: seg.bbox.x0 - frame.x0, kind: TabKind::Left, leader: false });
                 } else {
                     out.push(Atom::Space);
                 }
@@ -1119,7 +1119,7 @@ impl Emitter<'_> {
                     let marker_gap = line.marker_text_x.is_some_and(|x| si == 0 && (x - g.bbox.x0).abs() < 0.5);
                     if marker_gap {
                         out.push(Atom::Tab);
-                        tabs.push(TabStop { pos: g.bbox.x0 - frame.x0, kind: TabKind::Left });
+                        tabs.push(TabStop { pos: g.bbox.x0 - frame.x0, kind: TabKind::Left, leader: false });
                     } else if (g.space_before && gap > 0.06 * size) || gap > 0.22 * size.min(line_size) {
                         out.push(Atom::Space);
                     }
@@ -1362,6 +1362,7 @@ impl Emitter<'_> {
             rtl,
             style: None,
             list: None,
+            ..Default::default()
         }
     }
 
@@ -1475,12 +1476,12 @@ impl Emitter<'_> {
             .collect();
         let text_bbox = Rect::union_all(seg_ids.iter().map(|&s| &self.ctx.segs[s].bbox));
         enum Unit {
-            Para(Paragraph),
+            Para(Box<Paragraph>),
             Other(usize),
         }
         let mut units: Vec<(f32, Unit)> = Vec::new();
         for p in self.paragraphs(&seg_ids, frame) {
-            units.push((p.bbox.y0, Unit::Para(p)));
+            units.push((p.bbox.y0, Unit::Para(Box::new(p))));
         }
         for &i in items {
             if !matches!(it[i].kind, ItemKind::Seg(_)) {
@@ -1490,7 +1491,7 @@ impl Emitter<'_> {
         units.sort_by(|a, b| a.0.total_cmp(&b.0));
         for (_, u) in units {
             match u {
-                Unit::Para(p) => self.place_paragraph(p, cursor, out),
+                Unit::Para(p) => self.place_paragraph(*p, cursor, out),
                 Unit::Other(i) => {
                     let item = it[i];
                     match item.kind {
@@ -1578,6 +1579,8 @@ impl Emitter<'_> {
             space_before: (b.y0 - cursor.y).max(0.0),
             align,
             behind_text: img.behind_text,
+            overlay: false,
+            vector: img.vector.clone(),
         }
     }
 
@@ -2409,7 +2412,20 @@ pub fn analyse_page(raw_in: &RawPage, opts: &LayoutOptions) -> PageLayout {
     let mut image_items: Vec<usize> = Vec::new();
     for (i, img) in raw.images.iter().enumerate() {
         let text_inside = raw.glyphs.iter().filter(|g| img.bbox.contains_point(g.bbox.cx(), g.bbox.cy())).count();
-        if img.behind_text || (img.bbox.area() > 0.15 * page_area && text_inside > 20) {
+        if img.overlay {
+            floating.push(Picture {
+                data: img.data.clone(),
+                width: img.bbox.width(),
+                height: img.bbox.height(),
+                bbox: img.bbox,
+                indent: 0.0,
+                space_before: 0.0,
+                align: Align::Left,
+                behind_text: false,
+                overlay: true,
+                vector: None,
+            });
+        } else if img.behind_text || (img.bbox.area() > 0.15 * page_area && text_inside > 20) {
             floating.push(Picture {
                 data: img.data.clone(),
                 width: img.bbox.width(),
@@ -2419,6 +2435,8 @@ pub fn analyse_page(raw_in: &RawPage, opts: &LayoutOptions) -> PageLayout {
                 space_before: 0.0,
                 align: Align::Left,
                 behind_text: true,
+                overlay: false,
+                vector: None,
             });
         } else {
             image_items.push(i);
@@ -2438,6 +2456,8 @@ pub fn analyse_page(raw_in: &RawPage, opts: &LayoutOptions) -> PageLayout {
                     space_before: 0.0,
                     align: Align::Left,
                     behind_text: true,
+                    overlay: false,
+                    vector: None,
                 },
             );
         }
@@ -2513,6 +2533,7 @@ pub fn analyse_page(raw_in: &RawPage, opts: &LayoutOptions) -> PageLayout {
     };
     layout.margin_top = top.min(raw.height / 2.0);
     layout.margin_bottom = (raw.height - content.y1 - 4.0).clamp(0.0, 24.0).min(raw.height / 4.0);
+    layout.content_bottom = content.y1;
     layout.margin_left = margin_left;
     layout.margin_right = margin_right;
     layout.blocks = blocks;

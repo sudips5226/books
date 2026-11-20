@@ -96,8 +96,14 @@ impl PageTransform {
         self.rot as f32 * 90.0
     }
 
-    /// Renders the page in this transform's orientation at `scale` pixels per point.
+    /// Renders the page content (without annotations and form fields, which are
+    /// converted separately) in this transform's orientation at `scale` pixels per point.
     pub fn render(&self, page: &PdfPage, scale: f32) -> anyhow::Result<DynamicImage> {
+        self.render_with(page, scale, false)
+    }
+
+    /// Like [`PageTransform::render`], optionally with annotations and form fields.
+    pub fn render_with(&self, page: &PdfPage, scale: f32, annotations: bool) -> anyhow::Result<DynamicImage> {
         // PDFium always applies /Rotate: render as displayed, then turn the
         // bitmap back by the part of the rotation this transform ignores.
         let display_w = if self.page_rot % 2 == 1 { self.h0 } else { self.w0 };
@@ -105,7 +111,8 @@ impl PageTransform {
             &PdfRenderConfig::new()
                 .set_target_width((display_w * scale).round() as i32)
                 .set_maximum_height(20000)
-                .render_form_data(true)
+                .render_form_data(annotations)
+                .render_annotations(annotations)
                 .set_clear_color(PdfColor::WHITE),
         )?;
         let img = bitmap.as_image()?;
@@ -145,6 +152,8 @@ pub struct ExtractOptions {
     pub graphics_dpi: f32,
     /// Maximum pixel size of the longest edge of an embedded image.
     pub max_image_px: u32,
+    /// Rebuild simple vector figures as editable shapes (the rendering stays as fallback).
+    pub vector_shapes: bool,
 }
 
 impl Default for ExtractOptions {
@@ -154,6 +163,7 @@ impl Default for ExtractOptions {
             rasterize_vector_graphics: true,
             graphics_dpi: 150.0,
             max_image_px: 2400,
+            vector_shapes: true,
         }
     }
 }
@@ -186,6 +196,39 @@ struct PathInfo {
     stroke_width: f32,
     segments: usize,
     has_curves: bool,
+    /// Geometry in page coordinates (simple paths only).
+    cmds: Option<Vec<PathCmd>>,
+    /// Not a path: a shading or other content shapes cannot express.
+    opaque: bool,
+}
+
+/// Path segments in page coordinates; Béziers come as three consecutive points.
+fn path_cmds(segs: &PdfPagePathObjectSegments, tf: &PageTransform) -> Option<Vec<PathCmd>> {
+    let mut out = Vec::new();
+    let mut bez: Vec<(f32, f32)> = Vec::new();
+    for s in segs.iter() {
+        let (x, y) = s.point();
+        let p = tf.point(x.value, y.value);
+        if !(p.0.is_finite() && p.1.is_finite()) {
+            return None;
+        }
+        match s.segment_type() {
+            PdfPathSegmentType::MoveTo => out.push(PathCmd::MoveTo(p.0, p.1)),
+            PdfPathSegmentType::LineTo => out.push(PathCmd::LineTo(p.0, p.1)),
+            PdfPathSegmentType::BezierTo => {
+                bez.push(p);
+                if bez.len() == 3 {
+                    out.push(PathCmd::CurveTo(bez[0].0, bez[0].1, bez[1].0, bez[1].1, bez[2].0, bez[2].1));
+                    bez.clear();
+                }
+            }
+            _ => return None,
+        }
+        if s.is_close() {
+            out.push(PathCmd::Close);
+        }
+    }
+    (!out.is_empty() && bez.is_empty()).then_some(out)
 }
 
 fn pdf_color(c: Result<PdfColor, PdfiumError>) -> Option<(Rgb, u8)> {
@@ -217,13 +260,23 @@ pub fn extract_page(
     let mut link_rects: Vec<(Rect, usize)> = Vec::new();
     for link in page.links().iter() {
         let Ok(r) = link.rect() else { continue };
-        let Some(action) = link.action() else { continue };
-        let Some(uri) = action.as_uri_action().and_then(|u| u.uri().ok()) else { continue };
-        let uri = uri.trim_end_matches('\0').trim().to_string();
-        if uri.is_empty() {
+        let action = link.action();
+        let uri = action.as_ref().and_then(|a| a.as_uri_action().and_then(|u| u.uri().ok()));
+        let target = match uri {
+            Some(uri) => uri.trim_end_matches('\0').trim().to_string(),
+            // Jumps inside the document are resolved to bookmarks after layout.
+            None => {
+                let dest = match link.destination() {
+                    Some(d) => crate::annots::dest_target(document, &d),
+                    None => action.as_ref().and_then(|a| a.as_local_destination_action()).and_then(|l| l.destination().ok()).and_then(|d| crate::annots::dest_target(document, &d)),
+                };
+                dest.map(|(p, x, y)| crate::annots::dest_link(p, x, y)).unwrap_or_default()
+            }
+        };
+        if target.is_empty() {
             continue;
         }
-        raw.links.push(uri);
+        raw.links.push(target);
         link_rects.push((tf.rect(&r), raw.links.len() - 1));
     }
 
@@ -392,6 +445,9 @@ pub fn extract_page(
     }
     dedupe_fake_bold(&mut raw);
 
+    // ---------------------------------------------------------------- annotations
+    let annotations = crate::annots::extract_annotations(page, &tf, &mut raw);
+
     // ---------------------------------------------------------------- objects
     let mut paths: Vec<PathInfo> = Vec::new();
     let mut image_area = 0.0f32;
@@ -439,8 +495,13 @@ pub fn extract_page(
         regions.extend(complex_math.into_iter().map(|r| (r, 0.0)));
     }
     if !regions.is_empty() {
-        if let Err(e) = rasterize_regions(page, &tf, &mut raw, &regions, opts) {
+        if let Err(e) = rasterize_regions(page, &tf, &mut raw, &regions, &paths, opts) {
             log::warn!("page {}: could not rasterise vector graphics: {e}", index + 1);
+        }
+    }
+    if opts.extract_images && !annotations.overlays.is_empty() {
+        if let Err(e) = render_overlays(page, &tf, &mut raw, &annotations.overlays, opts) {
+            log::warn!("page {}: could not render annotations: {e}", index + 1);
         }
     }
 
@@ -482,7 +543,7 @@ fn collect_object(
             match decoded {
                 Ok(di) => {
                     if let Some(data) = encode_image(&di, opts.max_image_px) {
-                        raw.images.push(RawImage { bbox, data, behind_text: false });
+                        raw.images.push(RawImage { bbox, data, behind_text: false, overlay: false, vector: None });
                     }
                 }
                 Err(e) => log::debug!("skipping undecodable image: {e}"),
@@ -507,15 +568,24 @@ fn collect_object(
             } else {
                 has_curves = true;
             }
+            // Geometry for editable shapes: the path's matrix (inside forms, combined with theirs).
+            let matrix = path.matrix().ok().map(|own| match form_matrix {
+                Some(parent) => own.multiply(parent),
+                None => own,
+            });
+            let scale = matrix.map(|m| (m.a() * m.d() - m.b() * m.c()).abs().sqrt()).filter(|s| s.is_finite() && *s > 0.0).unwrap_or(1.0);
+            let cmds = if opts.vector_shapes && n <= 400 { matrix.and_then(|m| path_cmds(&segs.transform(m), tf)) } else { None };
             paths.push(PathInfo {
                 bbox,
                 stroked,
                 filled,
                 fill: fill.map(|f| f.0).unwrap_or(Rgb::BLACK),
                 stroke: stroke.map(|s| s.0).unwrap_or(Rgb::BLACK),
-                stroke_width: object.stroke_width().map(|w| w.value).unwrap_or(1.0),
+                stroke_width: object.stroke_width().map(|w| w.value).unwrap_or(1.0) * scale,
                 segments: n,
                 has_curves,
+                cmds,
+                opaque: false,
             });
         }
         PdfPageObject::XObjectForm(form) => {
@@ -533,6 +603,7 @@ fn collect_object(
             }
         }
         PdfPageObject::Shading(_) => {
+            paths.push(PathInfo { bbox, stroked: false, filled: false, fill: Rgb::WHITE, stroke: Rgb::WHITE, stroke_width: 0.0, segments: 0, has_curves: false, cmds: None, opaque: true });
             raw.boxes.push(FilledBox { bbox, color: Rgb(230, 230, 230) });
         }
         _ => {}
@@ -625,7 +696,7 @@ fn dedupe_fake_bold(raw: &mut RawPage) {
 
 /// Turns path objects into rules, filled boxes or graphic hints.
 fn classify_paths(raw: &mut RawPage, paths: &[PathInfo], hints: &mut Vec<Rect>, page: &Rect) {
-    for p in paths {
+    for p in paths.iter().filter(|p| !p.opaque) {
         let b = p.bbox;
         if b.width() <= 0.0 && b.height() <= 0.0 {
             continue;
@@ -819,7 +890,74 @@ fn text_runs(raw: &RawPage) -> Vec<(Rect, usize)> {
 }
 
 /// Renders figure regions to images, removing the glyphs/images/rules they cover.
-fn rasterize_regions(page: &PdfPage, tf: &PageTransform, raw: &mut RawPage, regions: &[(Rect, f32)], opts: &ExtractOptions) -> anyhow::Result<()> {
+/// Rebuilds a figure region from its paths and labels, if it is simple enough.
+fn vector_drawing(raw: &RawPage, paths: &[PathInfo], r: &Rect) -> Option<VectorDrawing> {
+    let inside = |b: &Rect| b.intersects(r) && (b.fraction_inside(&r.expand(1.0)) > 0.95 || b.area() == 0.0 && r.expand(1.0).contains_point(b.cx(), b.cy()));
+    // Pictures, shadings and rotated text cannot be expressed as shapes.
+    if raw.images.iter().any(|im| im.bbox.intersects(r))
+        || paths.iter().any(|p| p.opaque && p.bbox.intersects(r))
+        || raw.rotated.iter().any(|(g, _)| r.contains_point(g.bbox.cx(), g.bbox.cy()))
+    {
+        return None;
+    }
+    let mut shapes = Vec::new();
+    let mut total = 0;
+    for p in paths.iter().filter(|p| !p.opaque && p.bbox.intersects(r)) {
+        if !inside(&p.bbox) {
+            return None; // cut off by the region (or clipped): keep the picture
+        }
+        if !p.filled && !p.stroked {
+            continue;
+        }
+        let cmds = p.cmds.as_ref()?;
+        total += cmds.len();
+        let rel: Vec<PathCmd> = cmds
+            .iter()
+            .map(|c| match *c {
+                PathCmd::MoveTo(x, y) => PathCmd::MoveTo(x - r.x0, y - r.y0),
+                PathCmd::LineTo(x, y) => PathCmd::LineTo(x - r.x0, y - r.y0),
+                PathCmd::CurveTo(a, b, c2, d, e, f) => PathCmd::CurveTo(a - r.x0, b - r.y0, c2 - r.x0, d - r.y0, e - r.x0, f - r.y0),
+                PathCmd::Close => PathCmd::Close,
+            })
+            .collect();
+        let bbox = Rect::new(p.bbox.x0 - r.x0, p.bbox.y0 - r.y0, p.bbox.x1 - r.x0, p.bbox.y1 - r.y0);
+        shapes.push(VectorShape {
+            bbox,
+            cmds: rel,
+            fill: p.filled.then_some(p.fill),
+            stroke: p.stroked.then_some((p.stroke, p.stroke_width.clamp(0.25, 20.0))),
+        });
+    }
+    if shapes.is_empty() || shapes.len() > 300 || total > 6000 {
+        return None;
+    }
+    // Labels: horizontal runs of glyphs inside the region.
+    let mut labels: Vec<VectorLabel> = Vec::new();
+    let mut glyphs: Vec<&Glyph> = raw.glyphs.iter().filter(|g| r.contains_point(g.bbox.cx(), g.bbox.cy())).collect();
+    glyphs.sort_by_key(|g| (g.baseline.round() as i64, g.bbox.x0 as i64));
+    let mut last: Option<&Glyph> = None;
+    for g in glyphs {
+        let st = &raw.styles[g.style];
+        let joins = last.is_some_and(|l| (l.baseline - g.baseline).abs() < 0.3 * st.size && g.bbox.x0 - l.bbox.x1 < 0.8 * st.size && l.style == g.style);
+        if joins {
+            let lab = labels.last_mut().unwrap();
+            if g.space_before || g.bbox.x0 - last.unwrap().bbox.x1 > 0.2 * st.size {
+                lab.text.push(' ');
+            }
+            lab.text.push(g.ch);
+            lab.bbox = lab.bbox.union(&Rect::new(g.bbox.x0 - r.x0, g.bbox.y0 - r.y0, g.bbox.x1 - r.x0, g.bbox.y1 - r.y0));
+        } else {
+            labels.push(VectorLabel { bbox: Rect::new(g.bbox.x0 - r.x0, g.bbox.y0 - r.y0, g.bbox.x1 - r.x0, g.bbox.y1 - r.y0), text: g.ch.to_string(), style: st.clone() });
+        }
+        last = Some(g);
+    }
+    if labels.len() > 80 {
+        return None;
+    }
+    Some(VectorDrawing { width: r.width(), height: r.height(), shapes, labels })
+}
+
+fn rasterize_regions(page: &PdfPage, tf: &PageTransform, raw: &mut RawPage, regions: &[(Rect, f32)], paths: &[PathInfo], opts: &ExtractOptions) -> anyhow::Result<()> {
     let full = tf.render(page, opts.graphics_dpi / 72.0)?;
     let (pw, ph) = full.dimensions();
     let sx = pw as f32 / raw.width;
@@ -835,12 +973,67 @@ fn rasterize_regions(page: &PdfPage, tf: &PageTransform, raw: &mut RawPage, regi
         }
         let crop = full.crop_imm(x, y, w, h);
         let Some(data) = encode_image(&crop, opts.max_image_px) else { continue };
+        let vector = if opts.vector_shapes && *pad > 0.0 { vector_drawing(raw, paths, &r).map(Box::new) } else { None };
         raw.glyphs.retain(|g| !r.contains_point(g.bbox.cx(), g.bbox.cy()));
         raw.rotated.retain(|(g, _)| !r.contains_point(g.bbox.cx(), g.bbox.cy()));
         raw.images.retain(|im| im.bbox.fraction_inside(&r) < 0.9);
         raw.rules.retain(|ru| ru.bbox.fraction_inside(&r.expand(1.0)) < 0.9);
         raw.boxes.retain(|b| b.bbox.fraction_inside(&r.expand(1.0)) < 0.9);
-        raw.images.push(RawImage { bbox: r, data, behind_text: false });
+        raw.images.push(RawImage { bbox: r, data, behind_text: false, overlay: false, vector });
+    }
+    Ok(())
+}
+
+/// Graphic annotations as transparent pictures: the pixels that differ between
+/// the page rendered with and without its annotations.
+fn render_overlays(page: &PdfPage, tf: &PageTransform, raw: &mut RawPage, rects: &[Rect], opts: &ExtractOptions) -> anyhow::Result<()> {
+    let scale = opts.graphics_dpi / 72.0;
+    let with = tf.render_with(page, scale, true)?.to_rgba8();
+    let without = tf.render_with(page, scale, false)?.to_rgba8();
+    let (pw, ph) = with.dimensions();
+    let (sx, sy) = (pw as f32 / raw.width, ph as f32 / raw.height);
+    for r in rects {
+        let r = r.expand(2.0).intersection(&Rect::new(0.0, 0.0, raw.width, raw.height));
+        let x = (r.x0 * sx).floor().max(0.0) as u32;
+        let y = (r.y0 * sy).floor().max(0.0) as u32;
+        let w = ((r.width() * sx).ceil() as u32).min(pw.saturating_sub(x));
+        let h = ((r.height() * sy).ceil() as u32).min(ph.saturating_sub(y));
+        if w < 2 || h < 2 {
+            continue;
+        }
+        let mut img = image::RgbaImage::new(w, h);
+        let mut any = false;
+        for j in 0..h {
+            for i in 0..w {
+                let (px, py) = (x + i, y + j);
+                let a = with.get_pixel(px, py);
+                // Only pixels unlike every neighbour of the plain rendering: the two
+                // renderings place text a fraction of a pixel apart.
+                let mut d = i32::MAX;
+                for ny in py.saturating_sub(1)..=(py + 1).min(ph - 1) {
+                    for nx in px.saturating_sub(1)..=(px + 1).min(pw - 1) {
+                        let b = without.get_pixel(nx, ny);
+                        d = d.min((0..3).map(|k| (a[k] as i32 - b[k] as i32).abs()).max().unwrap_or(0));
+                    }
+                }
+                if d > 24 {
+                    img.put_pixel(i, j, image::Rgba([a[0], a[1], a[2], 255]));
+                    any = true;
+                }
+            }
+        }
+        if !any {
+            continue;
+        }
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(img).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)?;
+        raw.images.push(RawImage {
+            bbox: Rect::new(x as f32 / sx, y as f32 / sy, (x + w) as f32 / sx, (y + h) as f32 / sy),
+            data: ImageData { bytes: png, ext: "png", px_width: w, px_height: h },
+            behind_text: false,
+            overlay: true,
+            vector: None,
+        });
     }
     Ok(())
 }

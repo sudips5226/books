@@ -75,17 +75,25 @@ pub struct ExtractedHeaderFooter {
     /// Header material and the (0-based) PDF page index it was taken from.
     pub header: Option<(RawPage, usize)>,
     pub footer: Option<(RawPage, usize)>,
+    /// Different material on even pages (two-sided layouts): `header`/`footer` are then the odd pages'.
+    pub header_even: Option<(RawPage, usize)>,
+    pub footer_even: Option<(RawPage, usize)>,
     pub blank_first_header: bool,
     pub blank_first_footer: bool,
+    /// PDF page indices of pages without the header / footer (chapter openings …).
+    pub pages_without_header: Vec<usize>,
+    pub pages_without_footer: Vec<usize>,
     /// Printed page number minus physical page number (front matter, chapters).
     pub number_offset: i64,
+    /// Printed page number (value, roman numerals) by PDF page index, where found.
+    pub page_numbers: HashMap<usize, (i64, bool)>,
 }
 
 /// Finds text, rules and images repeated at the top or bottom of most pages,
 /// removes them from the pages and returns them as separate raw pages
 /// (taken from a representative page, whose index is returned).
 pub fn extract_headers_footers(raws: &mut [RawPage]) -> ExtractedHeaderFooter {
-    let none = ExtractedHeaderFooter { header: None, footer: None, blank_first_header: false, blank_first_footer: false, number_offset: 0 };
+    let none = ExtractedHeaderFooter { header: None, footer: None, header_even: None, footer_even: None, blank_first_header: false, blank_first_footer: false, pages_without_header: Vec::new(), pages_without_footer: Vec::new(), number_offset: 0, page_numbers: HashMap::new() };
     let n = raws.len();
     if n < 2 {
         return none;
@@ -114,10 +122,21 @@ pub fn extract_headers_footers(raws: &mut [RawPage]) -> ExtractedHeaderFooter {
         let mut items = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut pn_seen = std::collections::HashSet::new();
-        for part in line_parts(raw) {
+        let parts: Vec<LinePart> = line_parts(raw).into_iter().filter(|p| band_of(&p.bbox, raw.height).is_some()).collect();
+        // Only the page-number-like text closest to the page edge is the page number
+        // (other lone digits near the top are superscripts, labels …).
+        let edge_pn = |band: Band| -> Option<usize> {
+            let cands = parts.iter().enumerate().filter(|(_, p)| band_of(&p.bbox, raw.height) == Some(band) && is_page_number(&normalise(&p.text)));
+            match band {
+                Band::Top => cands.min_by(|a, b| a.1.bbox.y0.total_cmp(&b.1.bbox.y0)).map(|c| c.0),
+                Band::Bottom => cands.max_by(|a, b| a.1.bbox.y1.total_cmp(&b.1.bbox.y1)).map(|c| c.0),
+            }
+        };
+        let pn_parts = [edge_pn(Band::Top), edge_pn(Band::Bottom)];
+        for (pi, part) in parts.into_iter().enumerate() {
             let Some(band) = band_of(&part.bbox, raw.height) else { continue };
             let norm = normalise(&part.text);
-            let pn = is_page_number(&norm);
+            let pn = pn_parts.contains(&Some(pi));
             // Distance from the page edge the band belongs to.
             let edge = match band {
                 Band::Top => part.bbox.y0,
@@ -161,19 +180,39 @@ pub fn extract_headers_footers(raws: &mut [RawPage]) -> ExtractedHeaderFooter {
     }
 
     let mut has_band: HashMap<Band, Vec<bool>> = HashMap::new();
-    let mut sources: HashMap<Band, (usize, usize)> = HashMap::new(); // page -> number of items
+    let mut scores: Vec<(Band, usize, usize)> = Vec::new(); // (band, page, items)
     let mut extracted: HashMap<(Band, usize), RawPage> = HashMap::new();
     let mut offsets: HashMap<i64, usize> = HashMap::new();
+    // Printed page number of each page (value, roman), by PDF page index.
+    let mut page_numbers: HashMap<usize, (i64, bool)> = HashMap::new();
+    // Horizontal position (left/centre/right third) of each page's page number, per band.
+    let mut pn_pos: HashMap<Band, Vec<(usize, u8)>> = HashMap::new();
     for (pi, items) in per_page.into_iter().enumerate() {
         let raw = &mut raws[pi];
         let mut remove = vec![false; raw.glyphs.len()];
         let mut found: HashMap<Band, usize> = HashMap::new();
+        // A line mixing repeated material with text that varies (a running title)
+        // stays in the body as a whole: a static header could not reproduce it.
+        let same_line = |a: &Rect, b: &Rect| a.y0.max(b.y0) < a.y1.min(b.y1) - 0.3 * a.height().min(b.height());
+        let mixed: Vec<Band> = [Band::Top, Band::Bottom]
+            .into_iter()
+            .filter(|&band| {
+                items.iter().any(|(k, part, pn)| {
+                    k.0 == band && !repeated(k, *pn) && items.iter().any(|(k2, p2, pn2)| k2.0 == band && repeated(k2, *pn2) && same_line(&part.bbox, &p2.bbox))
+                })
+            })
+            .collect();
         for (key, part, pn) in &items {
-            if repeated(key, *pn) {
+            if repeated(key, *pn) && !mixed.contains(&key.0) {
                 if *pn {
+                    let third = ((part.bbox.cx() / raw.width.max(1.0)) * 3.0).clamp(0.0, 2.0) as u8;
+                    pn_pos.entry(key.0).or_default().push((pi, third));
                     let digits: String = part.text.chars().skip_while(|c| !c.is_ascii_digit()).take_while(|c| c.is_ascii_digit()).collect();
                     if let Ok(v) = digits.parse::<i64>() {
                         *offsets.entry(v - raw.index as i64 - 1).or_default() += 1;
+                        page_numbers.entry(raw.index).or_insert((v, false));
+                    } else if let Some(v) = part.text.split_whitespace().rev().find_map(roman_value) {
+                        page_numbers.entry(raw.index).or_insert((v as i64, true));
                     }
                 }
                 for &g in &part.glyphs {
@@ -207,10 +246,10 @@ pub fn extract_headers_footers(raws: &mut [RawPage]) -> ExtractedHeaderFooter {
                     hf.images.push(im.clone());
                 }
             }
-            let score = cnt + hf.rules.len() + hf.images.len();
-            if sources.get(&band).is_none_or(|(_, best)| score > *best) {
-                sources.insert(band, (pi, score));
-            }
+            // Pages with an arabic page number make the best template (it becomes a PAGE field).
+            let arabic = items.iter().any(|(k, part, pn)| *pn && k.0 == band && part.text.chars().any(|c| c.is_ascii_digit()));
+            let score = 2 * (cnt + hf.rules.len() + hf.images.len()) + arabic as usize;
+            scores.push((band, pi, score));
             extracted.insert((band, pi), hf);
         }
         let mut k = 0;
@@ -220,23 +259,45 @@ pub fn extract_headers_footers(raws: &mut [RawPage]) -> ExtractedHeaderFooter {
             keep
         });
         let h = raw.height;
-        raw.rules.retain(|r| !rule_key(r, h).is_some_and(|k| rule_counts[&k] >= need));
-        raw.images.retain(|im| !img_key(im, h).is_some_and(|k| img_counts[&k] >= need));
+        raw.rules.retain(|r| !rule_key(r, h).is_some_and(|k| rule_counts[&k] >= need && found.contains_key(&k.0)));
+        raw.images.retain(|im| !img_key(im, h).is_some_and(|k| img_counts[&k] >= need && found.contains_key(&k.0)));
     }
-    let take = |band: Band, extracted: &mut HashMap<(Band, usize), RawPage>| {
-        sources.get(&band).and_then(|(pi, _)| extracted.remove(&(band, *pi))).map(|r| {
-            let index = r.index;
-            (r, index)
-        })
+    let number_offset = offsets.into_iter().max_by_key(|(o, n)| (*n, -o.abs())).map(|(o, _)| o).unwrap_or(0);
+    let parity = |pi: usize| (raws[pi].index as i64 + 1 + number_offset).rem_euclid(2) as usize; // 1 = odd
+    // Two-sided layout: page numbers on one side for odd pages, another for even ones.
+    let alternates = |band: Band| -> bool {
+        let Some(v) = pn_pos.get(&band) else { return false };
+        let side = |p: usize| -> Option<u8> {
+            let s: Vec<u8> = v.iter().filter(|(pi, _)| parity(*pi) == p).map(|x| x.1).collect();
+            (s.len() >= 2 && s.iter().filter(|&&t| t == s[0]).count() * 5 >= s.len() * 4).then(|| s[0])
+        };
+        matches!((side(0), side(1)), (Some(a), Some(b)) if a != b)
     };
-    let header = take(Band::Top, &mut extracted);
-    let footer = take(Band::Bottom, &mut extracted);
+    let best = |band: Band, want: Option<usize>| -> Option<usize> {
+        scores.iter().filter(|(b, pi, _)| *b == band && want.is_none_or(|w| parity(*pi) == w)).max_by_key(|(_, pi, s)| (*s, std::cmp::Reverse(*pi))).map(|x| x.1)
+    };
+    let mut take = |band: Band, pi: Option<usize>| pi.and_then(|pi| extracted.remove(&(band, pi))).map(|r| {
+        let index = r.index;
+        (r, index)
+    });
+    let (mut header, mut footer, mut header_even, mut footer_even) = (None, None, None, None);
+    for band in [Band::Top, Band::Bottom] {
+        let (main, even) = if alternates(band) { (take(band, best(band, Some(1))), take(band, best(band, Some(0)))) } else { (take(band, best(band, None)), None) };
+        match band {
+            Band::Top => (header, header_even) = (main, even),
+            Band::Bottom => (footer, footer_even) = (main, even),
+        }
+    }
     // A title page without header/footer while the others have them.
     let lacks_first = |band: Band| has_band.get(&band).is_some_and(|v| !v[0] && v[1..].iter().filter(|b| **b).count() >= need.min(v.len() - 1));
     let blank_first_header = header.is_some() && lacks_first(Band::Top);
     let blank_first_footer = footer.is_some() && lacks_first(Band::Bottom);
-    let number_offset = offsets.into_iter().max_by_key(|(o, n)| (*n, -o.abs())).map(|(o, _)| o).unwrap_or(0);
-    ExtractedHeaderFooter { header, footer, blank_first_header, blank_first_footer, number_offset }
+    let without = |band: Band| -> Vec<usize> {
+        has_band.get(&band).map(|v| v.iter().enumerate().filter(|(_, b)| !**b).map(|(pi, _)| raws[pi].index).collect()).unwrap_or_default()
+    };
+    let pages_without_header = if header.is_some() { without(Band::Top) } else { Vec::new() };
+    let pages_without_footer = if footer.is_some() { without(Band::Bottom) } else { Vec::new() };
+    ExtractedHeaderFooter { header, footer, header_even, footer_even, pages_without_header, pages_without_footer, blank_first_header, blank_first_footer, number_offset, page_numbers }
 }
 
 /// Height the blocks take when written (paragraph lines, rows, pictures).
