@@ -176,6 +176,78 @@ def invoice(path):
     c.save()
 
 
+def font_widths(path):
+    """Text whose widths differ from Word's fonts (condensed, letter-spaced)."""
+    c = canvas.Canvas(path, pagesize=letter)
+    w, h = letter
+    text = (LOREM + " ") * 2
+    y = h - 72
+
+    def para(font, size, leading, scale=100, charspace=0.0, width=w - 144):
+        nonlocal y
+        words = text.split()
+        line = []
+        for word in words + [None]:
+            cand = " ".join(line + ([word] if word else []))
+            tw = c.stringWidth(cand, font, size) * scale / 100 + charspace * len(cand)
+            if word is None or (tw > width and line):
+                t = c.beginText(72, y)
+                t.setFont(font, size)
+                t.setHorizScale(scale)
+                t.setCharSpace(charspace)
+                t.textOut(" ".join(line))
+                c.drawText(t)
+                y -= leading
+                line = [word] if word else []
+            else:
+                line.append(word)
+        y -= leading
+
+    c.setFont("Helvetica-Bold", 13)
+    c.drawString(72, y, "Condensed Helvetica (82% width)")
+    y -= 20
+    para("Helvetica", 10, 13, scale=82)
+    c.setFont("Helvetica-Bold", 13)
+    c.drawString(72, y, "Letter-spaced Times (+0.6 pt)")
+    y -= 20
+    para("Times-Roman", 10.5, 13.5, charspace=0.6)
+    c.setFont("Helvetica-Bold", 13)
+    c.drawString(72, y, "Regular Courier (control)")
+    y -= 20
+    para("Courier", 9, 12)
+    c.showPage()
+    c.save()
+
+
+def embedded_font(path, workdir):
+    """Text in a TrueType font that no system has ("Fixture Sans", a renamed Carlito)."""
+    try:
+        from fontTools.ttLib import TTFont as FTFont
+    except ImportError:
+        print("fontTools not installed; skipping embedded.pdf")
+        return
+    src = "/usr/share/fonts/truetype/crosextra/Carlito-Regular.ttf"
+    if not os.path.exists(src):
+        print("Carlito not installed; skipping embedded.pdf")
+        return
+    f = FTFont(src)
+    for rec in f["name"].names:
+        if rec.nameID in (1, 3, 4, 16):
+            rec.string = "Fixture Sans"
+        elif rec.nameID == 6:
+            rec.string = "FixtureSans"
+    ttf = os.path.join(workdir, "FixtureSans.ttf")
+    f.save(ttf)
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont as RLTTFont
+    pdfmetrics.registerFont(RLTTFont("FixtureSans", ttf))
+    ss = getSampleStyleSheet()
+    body = ParagraphStyle("fx", parent=ss["BodyText"], fontName="FixtureSans", fontSize=12, leading=15, alignment=TA_JUSTIFY)
+    head = ParagraphStyle("fxh", parent=body, fontSize=20, leading=24, alignment=TA_CENTER)
+    doc = SimpleDocTemplate(path, pagesize=letter)
+    doc.build([Paragraph("Embedded Fixture Sans", head), Spacer(1, 12)] + [Paragraph(LOREM, body) for _ in range(3)])
+
+
 def scanned(src_pdf, path, workdir):
     if not shutil.which("pdftoppm"):
         print("pdftoppm not found; skipping scanned.pdf")
@@ -197,6 +269,8 @@ def main():
     report(os.path.join(out, "report.pdf"), logo)
     two_columns(os.path.join(out, "twocol.pdf"))
     invoice(os.path.join(out, "invoice.pdf"))
+    font_widths(os.path.join(out, "fonts.pdf"))
+    embedded_font(os.path.join(out, "embedded.pdf"), out)
     scanned(os.path.join(out, "report.pdf"), os.path.join(out, "scanned.pdf"), out)
     print("written to", out)
 

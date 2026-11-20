@@ -184,6 +184,32 @@ fn split_camel(s: &str) -> Vec<String> {
     out
 }
 
+/// Generic class of a family name, when it can be told from the name.
+pub fn generic_of(family: &str) -> crate::model::Generic {
+    use crate::model::Generic;
+    let f = family.to_ascii_lowercase();
+    const MONO: &[&str] = &["courier", "consolas", "mono", "menlo", "monaco", "lucida console", "code", "typewriter", "cmtt"];
+    const SANS: &[&str] = &[
+        "arial", "helvetica", "calibri", "verdana", "tahoma", "segoe", "trebuchet", "sans", "gothic", "corbel", "candara",
+        "myriad", "frutiger", "futura", "gill", "lato", "roboto", "open sans", "source sans", "noto sans", "ubuntu", "inter",
+        "franklin", "univers", "avenir", "carlito", "arimo",
+    ];
+    const SERIF: &[&str] = &[
+        "times", "roman", "georgia", "cambria", "garamond", "palatino", "book antiqua", "serif", "minion", "baskerville",
+        "caslon", "bodoni", "century", "constantia", "caladea", "tinos", "charter", "cmr", "computer modern", "latin modern",
+        "lmroman", "utopia", "bookman",
+    ];
+    if MONO.iter().any(|k| f.contains(k)) {
+        Generic::Mono
+    } else if SANS.iter().any(|k| f.contains(k)) {
+        Generic::Sans
+    } else if SERIF.iter().any(|k| f.contains(k)) {
+        Generic::Serif
+    } else {
+        Generic::Unknown
+    }
+}
+
 /// Returns a generic fallback for unknown families based on PDF font flags.
 pub fn generic_family(serif: bool, monospace: bool) -> &'static str {
     if monospace {

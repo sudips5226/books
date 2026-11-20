@@ -263,7 +263,14 @@ pub fn extract_page(
                     } else {
                         info.family
                     };
+                    let generic = match crate::fonts::generic_of(&family) {
+                        Generic::Unknown if flags & 4 != 0 => Generic::Mono,
+                        Generic::Unknown if flags & 8 != 0 => Generic::Serif,
+                        Generic::Unknown => Generic::Sans,
+                        g => g,
+                    };
                     let st = TextStyle {
+                        generic,
                         font: family,
                         size: (size * 2.0).round() / 2.0,
                         bold: info.bold || flags & 1 != 0 || flags & 32 != 0,

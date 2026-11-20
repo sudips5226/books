@@ -33,6 +33,8 @@ pub struct DocMeta {
     pub author: Option<String>,
     pub subject: Option<String>,
     pub keywords: Option<String>,
+    /// Fonts to embed into the package.
+    pub fonts: Vec<crate::embed::EmbeddedFont>,
 }
 
 fn tw(pt: f32) -> i64 {
@@ -74,7 +76,7 @@ struct Writer {
     rels: Vec<(String, &'static str, String, bool)>,
     next_rel: usize,
     next_drawing: usize,
-    fonts: std::collections::BTreeSet<String>,
+    fonts: std::collections::BTreeMap<String, Generic>,
 }
 
 const REL_IMAGE: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image";
@@ -114,7 +116,7 @@ impl Writer {
     // ------------------------------------------------------------------ runs
 
     fn run_props(&mut self, st: &TextStyle) -> String {
-        self.fonts.insert(st.font.clone());
+        self.fonts.entry(st.font.clone()).or_insert(st.generic);
         let mut r = String::from("<w:rPr>");
         let f = esc(&st.font);
         let _ = write!(r, r#"<w:rFonts w:ascii="{f}" w:hAnsi="{f}" w:cs="{f}" w:eastAsia="{f}"/>"#);
@@ -132,6 +134,12 @@ impl Writer {
         }
         if st.color != Rgb::BLACK {
             let _ = write!(r, r#"<w:color w:val="{}"/>"#, st.color.hex());
+        }
+        if st.char_spacing.abs() >= 0.05 {
+            let _ = write!(r, r#"<w:spacing w:val="{}"/>"#, (st.char_spacing * 20.0).round() as i64);
+        }
+        if st.char_scale != 100 {
+            let _ = write!(r, r#"<w:w w:val="{}"/>"#, st.char_scale.clamp(1, 600));
         }
         if st.vert != VertAlign::Baseline && st.baseline_shift.abs() >= 0.5 {
             let _ = write!(r, r#"<w:position w:val="{}"/>"#, (st.baseline_shift * 2.0).round() as i64);
@@ -156,6 +164,106 @@ impl Writer {
         r
     }
 
+    /// Serialises an equation as Office Math (OMML).
+    fn omml(&mut self, nodes: &[MathNode], _inline: bool) -> String {
+        self.fonts.entry("Cambria Math".into()).or_insert(Generic::Serif);
+        let mut s = String::from("<m:oMath>");
+        Self::math_nodes(&mut s, nodes);
+        s.push_str("</m:oMath>");
+        s
+    }
+
+    fn math_nodes(s: &mut String, nodes: &[MathNode]) {
+        for n in nodes {
+            match n {
+                MathNode::Run { text, upright, bold, size } => {
+                    s.push_str("<m:r>");
+                    let sty = match (*upright, *bold) {
+                        (true, false) => Some("p"),
+                        (true, true) => Some("b"),
+                        (false, true) => Some("bi"),
+                        (false, false) => None,
+                    };
+                    if let Some(sty) = sty {
+                        let _ = write!(s, r#"<m:rPr><m:sty m:val="{sty}"/></m:rPr>"#);
+                    }
+                    let hp = (size * 2.0).round().max(2.0) as i64;
+                    let _ = write!(
+                        s,
+                        r#"<w:rPr><w:rFonts w:ascii="Cambria Math" w:hAnsi="Cambria Math"/><w:sz w:val="{hp}"/><w:szCs w:val="{hp}"/></w:rPr><m:t xml:space="preserve">{}</m:t></m:r>"#,
+                        esc(text)
+                    );
+                }
+                MathNode::Frac { num, den } => {
+                    s.push_str("<m:f><m:num>");
+                    Self::math_nodes(s, num);
+                    s.push_str("</m:num><m:den>");
+                    Self::math_nodes(s, den);
+                    s.push_str("</m:den></m:f>");
+                }
+                MathNode::Script { base, sub, sup } => {
+                    let tag = match (sub.is_some(), sup.is_some()) {
+                        (true, true) => "sSubSup",
+                        (true, false) => "sSub",
+                        (false, true) => "sSup",
+                        (false, false) => {
+                            Self::math_nodes(s, base);
+                            continue;
+                        }
+                    };
+                    let _ = write!(s, "<m:{tag}><m:e>");
+                    Self::math_nodes(s, base);
+                    s.push_str("</m:e>");
+                    if let Some(b) = sub {
+                        s.push_str("<m:sub>");
+                        Self::math_nodes(s, b);
+                        s.push_str("</m:sub>");
+                    }
+                    if let Some(p) = sup {
+                        s.push_str("<m:sup>");
+                        Self::math_nodes(s, p);
+                        s.push_str("</m:sup>");
+                    }
+                    let _ = write!(s, "</m:{tag}>");
+                }
+                MathNode::Radical { degree, body } => {
+                    s.push_str("<m:rad>");
+                    match degree {
+                        Some(d) => {
+                            s.push_str("<m:deg>");
+                            Self::math_nodes(s, d);
+                            s.push_str("</m:deg>");
+                        }
+                        None => s.push_str(r#"<m:radPr><m:degHide m:val="1"/></m:radPr><m:deg/>"#),
+                    }
+                    s.push_str("<m:e>");
+                    Self::math_nodes(s, body);
+                    s.push_str("</m:e></m:rad>");
+                }
+                MathNode::Nary { op, sub, sup, body } => {
+                    let _ = write!(s, r#"<m:nary><m:naryPr><m:chr m:val="{}"/><m:limLoc m:val="undOvr"/>"#, esc(&op.to_string()));
+                    if sub.is_none() {
+                        s.push_str(r#"<m:subHide m:val="1"/>"#);
+                    }
+                    if sup.is_none() {
+                        s.push_str(r#"<m:supHide m:val="1"/>"#);
+                    }
+                    s.push_str("</m:naryPr><m:sub>");
+                    if let Some(b) = sub {
+                        Self::math_nodes(s, b);
+                    }
+                    s.push_str("</m:sub><m:sup>");
+                    if let Some(p) = sup {
+                        Self::math_nodes(s, p);
+                    }
+                    s.push_str("</m:sup><m:e>");
+                    Self::math_nodes(s, body);
+                    s.push_str("</m:e></m:nary>");
+                }
+            }
+        }
+    }
+
     fn text_run(&mut self, out: &mut String, text: &str, st: &TextStyle) {
         let rpr = self.run_props(st);
         let _ = write!(out, r#"<w:r>{rpr}<w:t xml:space="preserve">{}</w:t></w:r>"#, esc(text));
@@ -167,7 +275,11 @@ impl Writer {
         let mut i = 0;
         while i < inlines.len() {
             match &inlines[i] {
-                Inline::Text { text, style, link } => {
+                Inline::Math(m) => {
+                    let x = self.omml(m, true);
+                    out.push_str(&x);
+                }
+                Inline::Text { text, style, link, .. } => {
                     if let Some(url) = link {
                         let id = self.add_rel(REL_LINK, url.clone(), true);
                         let _ = write!(out, r#"<w:hyperlink r:id="{id}" w:history="1">"#);
@@ -175,7 +287,7 @@ impl Writer {
                         let mut j = i;
                         while j < inlines.len() {
                             match &inlines[j] {
-                                Inline::Text { text, style, link: Some(l) } if l == url => {
+                                Inline::Text { text, style, link: Some(l), .. } if l == url => {
                                     self.text_run(out, text, style);
                                     last_style = Some(style.clone());
                                     j += 1;
@@ -591,7 +703,7 @@ fn styles_xml(default_font: &str, default_size: f32) -> String {
 }
 
 const SETTINGS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:zoom w:percent="100"/><w:defaultTabStop w:val="720"/><w:characterSpacingControl w:val="doNotCompress"/><w:compat><w:compatSetting w:name="compatibilityMode" w:uri="http://schemas.microsoft.com/office/word" w:val="15"/><w:compatSetting w:name="overrideTableStyleFontSizeAndJustification" w:uri="http://schemas.microsoft.com/office/word" w:val="1"/><w:compatSetting w:name="enableOpenTypeFeatures" w:uri="http://schemas.microsoft.com/office/word" w:val="1"/><w:compatSetting w:name="doNotFlipMirrorIndents" w:uri="http://schemas.microsoft.com/office/word" w:val="1"/></w:compat></w:settings>"#;
+<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:zoom w:percent="100"/>EMBED<w:defaultTabStop w:val="720"/><w:characterSpacingControl w:val="doNotCompress"/><w:compat><w:compatSetting w:name="compatibilityMode" w:uri="http://schemas.microsoft.com/office/word" w:val="15"/><w:compatSetting w:name="overrideTableStyleFontSizeAndJustification" w:uri="http://schemas.microsoft.com/office/word" w:val="1"/><w:compatSetting w:name="enableOpenTypeFeatures" w:uri="http://schemas.microsoft.com/office/word" w:val="1"/><w:compatSetting w:name="doNotFlipMirrorIndents" w:uri="http://schemas.microsoft.com/office/word" w:val="1"/></w:compat></w:settings>"#;
 
 fn content_types(has: &[&str]) -> String {
     let mut s = String::from(
@@ -603,6 +715,9 @@ fn content_types(has: &[&str]) -> String {
     }
     if has.contains(&"jpeg") {
         s.push_str(r#"<Default Extension="jpeg" ContentType="image/jpeg"/>"#);
+    }
+    if has.contains(&"odttf") {
+        s.push_str(r#"<Default Extension="odttf" ContentType="application/vnd.openxmlformats-officedocument.obfuscatedFont"/>"#);
     }
     s.push_str(r#"<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/><Override PartName="/word/settings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/><Override PartName="/word/fontTable.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.fontTable+xml"/><Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/><Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/></Types>"#);
     s
@@ -646,7 +761,7 @@ pub fn write_docx<W: Write + Seek>(out: W, pages: &[PageLayout], meta: &DocMeta,
     }
 
     // Default font: most used family.
-    let default_font = w.fonts.iter().next().cloned().unwrap_or_else(|| "Times New Roman".into());
+    let default_font = w.fonts.keys().next().cloned().unwrap_or_else(|| "Times New Roman".into());
     let body = std::mem::take(&mut w.body).replace("<w:sectPr_BODY>", "<w:sectPr>");
     let document = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -665,14 +780,71 @@ pub fn write_docx<W: Write + Seek>(out: W, pages: &[PageLayout], meta: &DocMeta,
 
     let mut font_table = String::from(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:fonts xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">"#,
+<w:fonts xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">"#,
     );
-    for f in &w.fonts {
-        let _ = write!(font_table, r#"<w:font w:name="{}"/>"#, esc(f));
+    // Embedded fonts: obfuscated .odttf parts referenced from the font table.
+    let mut font_rels = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+    );
+    let mut font_parts: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut embeds: std::collections::BTreeMap<String, String> = Default::default();
+    for (i, f) in meta.fonts.iter().enumerate() {
+        if !w.fonts.contains_key(&f.family) {
+            continue;
+        }
+        let key = crate::embed::font_key(&f.data, i);
+        let name = format!("font{}.odttf", i + 1);
+        let rid = format!("rId{}", i + 1);
+        let _ = write!(
+            font_rels,
+            r#"<Relationship Id="{rid}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/font" Target="fonts/{name}"/>"#
+        );
+        let tag = match (f.bold, f.italic) {
+            (false, false) => "embedRegular",
+            (true, false) => "embedBold",
+            (false, true) => "embedItalic",
+            (true, true) => "embedBoldItalic",
+        };
+        let order = match tag {
+            "embedRegular" => 0,
+            "embedBold" => 1,
+            "embedItalic" => 2,
+            _ => 3,
+        };
+        let entry = embeds.entry(f.family.clone()).or_default();
+        entry.push_str(&format!("{order}<w:{tag} r:id=\"{rid}\" w:fontKey=\"{key}\"/>\n"));
+        font_parts.push((name, crate::embed::obfuscate(&f.data, &key)));
+    }
+    font_rels.push_str("</Relationships>");
+    for (f, generic) in &w.fonts {
+        // Family class and pitch steer Word's substitution when the font is missing.
+        let (family, pitch) = match generic {
+            Generic::Serif => ("roman", "variable"),
+            Generic::Sans => ("swiss", "variable"),
+            Generic::Mono => ("modern", "fixed"),
+            Generic::Unknown => ("auto", "variable"),
+        };
+        let mut embed_xml = String::new();
+        if let Some(list) = embeds.get(f) {
+            let mut items: Vec<&str> = list.lines().collect();
+            items.sort();
+            for it in items {
+                embed_xml.push_str(&it[1..]);
+            }
+        }
+        let _ = write!(font_table, r#"<w:font w:name="{}"><w:family w:val="{family}"/><w:pitch w:val="{pitch}"/>{embed_xml}</w:font>"#, esc(f));
     }
     font_table.push_str("</w:fonts>");
 
-    let exts: Vec<&str> = w.media.iter().map(|m| if m.name.ends_with(".png") { "png" } else { "jpeg" }).collect();
+    let mut exts: Vec<&str> = w.media.iter().map(|m| if m.name.ends_with(".png") { "png" } else { "jpeg" }).collect();
+    if !font_parts.is_empty() {
+        exts.push("odttf");
+    }
+    let settings = SETTINGS.replace(
+        "EMBED",
+        if font_parts.is_empty() { "" } else { "<w:embedTrueTypeFonts/><w:saveSubsetFonts/>" },
+    );
 
     let mut zip = ZipWriter::new(out);
     let deflate = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
@@ -690,9 +862,17 @@ pub fn write_docx<W: Write + Seek>(out: W, pages: &[PageLayout], meta: &DocMeta,
     zip.start_file("word/styles.xml", deflate)?;
     zip.write_all(styles_xml(&default_font, 11.0).as_bytes())?;
     zip.start_file("word/settings.xml", deflate)?;
-    zip.write_all(SETTINGS.as_bytes())?;
+    zip.write_all(settings.as_bytes())?;
     zip.start_file("word/fontTable.xml", deflate)?;
     zip.write_all(font_table.as_bytes())?;
+    if !font_parts.is_empty() {
+        zip.start_file("word/_rels/fontTable.xml.rels", deflate)?;
+        zip.write_all(font_rels.as_bytes())?;
+        for (name, data) in &font_parts {
+            zip.start_file(format!("word/fonts/{name}"), deflate)?;
+            zip.write_all(data)?;
+        }
+    }
     zip.start_file("word/_rels/document.xml.rels", deflate)?;
     zip.write_all(doc_rels.as_bytes())?;
     for m in &w.media {
@@ -715,7 +895,7 @@ mod tests {
     #[test]
     fn writes_valid_zip() {
         let p = Paragraph {
-            inlines: vec![Inline::Text { text: "Hello & world".into(), style: TextStyle::default(), link: Some("https://example.com".into()) }],
+            inlines: vec![Inline::Text { text: "Hello & world".into(), style: TextStyle::default(), link: Some("https://example.com".into()), pdf_width: 0.0 }],
             line_pitch: Some(13.2),
             n_lines: 1,
             font_size: 11.0,

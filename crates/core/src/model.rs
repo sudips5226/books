@@ -146,6 +146,16 @@ impl fmt::Display for Rgb {
     }
 }
 
+/// Generic font class, used for substitution when a font is not installed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Generic {
+    #[default]
+    Unknown,
+    Serif,
+    Sans,
+    Mono,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum VertAlign {
     #[default]
@@ -172,6 +182,14 @@ pub struct TextStyle {
     pub vert: VertAlign,
     /// Baseline shift in points (positive = raised) for super/subscripts.
     pub baseline_shift: f32,
+    /// Generic class of the font (serif / sans / monospace).
+    pub generic: Generic,
+    /// The glyph comes from a mathematical font (CMMI, Cambria Math, ...).
+    pub math: bool,
+    /// Extra spacing after each character in points (width compensation).
+    pub char_spacing: f32,
+    /// Horizontal character scale in percent (width compensation).
+    pub char_scale: u16,
 }
 
 impl Default for TextStyle {
@@ -188,6 +206,10 @@ impl Default for TextStyle {
             highlight: None,
             vert: VertAlign::Baseline,
             baseline_shift: 0.0,
+            generic: Generic::Unknown,
+            math: false,
+            char_spacing: 0.0,
+            char_scale: 100,
         }
     }
 }
@@ -206,6 +228,9 @@ impl TextStyle {
             && self.highlight == o.highlight
             && self.vert == o.vert
             && (self.baseline_shift - o.baseline_shift).abs() < 0.3
+            && self.math == o.math
+            && (self.char_spacing - o.char_spacing).abs() < 0.02
+            && self.char_scale == o.char_scale
     }
 }
 
@@ -305,12 +330,81 @@ pub enum Inline {
         text: String,
         style: TextStyle,
         link: Option<String>,
+        /// Width of the run's non-space glyphs in the PDF (points), 0 = unknown.
+        pdf_width: f32,
     },
+    /// An equation (Office Math).
+    Math(Vec<MathNode>),
     Tab,
     LineBreak,
     /// End of a line in the source PDF. Flow layout joins the lines,
     /// exact layout keeps the break.
     SoftBreak(Joiner),
+}
+
+/// A node of an equation tree (serialised as OMML).
+#[derive(Clone, Debug, PartialEq)]
+pub enum MathNode {
+    /// Plain characters; letters render italic unless `upright`.
+    Run { text: String, upright: bool, bold: bool, size: f32 },
+    Frac { num: Vec<MathNode>, den: Vec<MathNode> },
+    /// Base with optional sub- and superscript.
+    Script { base: Vec<MathNode>, sub: Option<Vec<MathNode>>, sup: Option<Vec<MathNode>> },
+    Radical { degree: Option<Vec<MathNode>>, body: Vec<MathNode> },
+    /// Big operator (∑, ∫, ∏ …) with limits above/below.
+    Nary { op: char, sub: Option<Vec<MathNode>>, sup: Option<Vec<MathNode>>, body: Vec<MathNode> },
+}
+
+impl MathNode {
+    /// Linear text of the equation (for search, tests and fallbacks).
+    pub fn plain(nodes: &[MathNode]) -> String {
+        let mut s = String::new();
+        for n in nodes {
+            match n {
+                MathNode::Run { text, .. } => s.push_str(text),
+                MathNode::Frac { num, den } => {
+                    s.push('(');
+                    s.push_str(&Self::plain(num));
+                    s.push_str(")/(");
+                    s.push_str(&Self::plain(den));
+                    s.push(')');
+                }
+                MathNode::Script { base, sub, sup } => {
+                    s.push_str(&Self::plain(base));
+                    if let Some(b) = sub {
+                        s.push('_');
+                        s.push_str(&Self::plain(b));
+                    }
+                    if let Some(p) = sup {
+                        s.push('^');
+                        s.push_str(&Self::plain(p));
+                    }
+                }
+                MathNode::Radical { degree, body } => {
+                    s.push('√');
+                    if let Some(d) = degree {
+                        s.push_str(&Self::plain(d));
+                    }
+                    s.push('(');
+                    s.push_str(&Self::plain(body));
+                    s.push(')');
+                }
+                MathNode::Nary { op, sub, sup, body } => {
+                    s.push(*op);
+                    if let Some(b) = sub {
+                        s.push('_');
+                        s.push_str(&Self::plain(b));
+                    }
+                    if let Some(p) = sup {
+                        s.push('^');
+                        s.push_str(&Self::plain(p));
+                    }
+                    s.push_str(&Self::plain(body));
+                }
+            }
+        }
+        s
+    }
 }
 
 /// How two source lines are joined in flow layout.
@@ -373,6 +467,9 @@ pub struct Paragraph {
     pub bbox: Rect,
     /// Background shading.
     pub shading: Option<Rgb>,
+    /// Right-to-left paragraph (Arabic, Hebrew …). Indents and alignment are
+    /// then expressed relative to the reading direction (left = start).
+    pub rtl: bool,
 }
 
 impl Paragraph {
@@ -381,6 +478,7 @@ impl Paragraph {
         for i in &self.inlines {
             match i {
                 Inline::Text { text, .. } => s.push_str(text),
+                Inline::Math(m) => s.push_str(&MathNode::plain(m)),
                 Inline::Tab => s.push('\t'),
                 Inline::LineBreak => s.push('\n'),
                 Inline::SoftBreak(Joiner::Space) => s.push(' '),
@@ -489,6 +587,23 @@ impl Block {
     }
 }
 
+/// Text that is not horizontal: rotated lines and vertical (East Asian) columns,
+/// written as a positioned text box.
+#[derive(Clone, Debug)]
+pub struct TextBox {
+    pub inlines: Vec<Inline>,
+    /// Centre of the text on the page.
+    pub cx: f32,
+    pub cy: f32,
+    /// Size of the unrotated box (along the text × across it).
+    pub width: f32,
+    pub height: f32,
+    /// Clockwise rotation in degrees.
+    pub rotation: f32,
+    /// Vertical East Asian layout (characters upright, top to bottom).
+    pub vertical: bool,
+}
+
 /// A fully analysed page ready for serialisation.
 #[derive(Clone, Debug, Default)]
 pub struct PageLayout {
@@ -503,6 +618,8 @@ pub struct PageLayout {
     /// Pictures anchored at absolute positions (backgrounds, watermarks,
     /// figures with text flowing beside them).
     pub floating: Vec<Picture>,
+    /// Rotated or vertical text placed in text boxes.
+    pub text_boxes: Vec<TextBox>,
     pub ocr: bool,
 }
 

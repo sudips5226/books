@@ -66,6 +66,10 @@ struct Args {
     #[arg(long)]
     no_headings: bool,
 
+    /// Do not adjust character spacing to keep the PDF's text widths.
+    #[arg(long)]
+    no_width_compensation: bool,
+
     /// Path to the PDFium shared library (file or directory).
     #[arg(long)]
     pdfium: Option<PathBuf>,
@@ -95,6 +99,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         pages: args.pages.clone(),
         password: args.password.clone(),
         detect_headings: !args.no_headings,
+        compensate_widths: !args.no_width_compensation,
         pdfium_path: args.pdfium.clone(),
         ..Default::default()
     };

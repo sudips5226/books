@@ -19,9 +19,11 @@
 #![allow(clippy::needless_range_loop)]
 
 pub mod docx;
+pub mod embed;
 pub mod extract;
 pub mod fonts;
 pub mod layout;
+pub mod metrics;
 pub mod model;
 pub mod ocr;
 
@@ -86,6 +88,10 @@ pub struct ConvertOptions {
     pub extract: ExtractOptions,
     pub layout: LayoutOptions,
     pub detect_headings: bool,
+    /// Adjust character spacing so text keeps its PDF width with Word's fonts.
+    pub compensate_widths: bool,
+    /// Embed the PDF's TrueType fonts into the DOCX when their licence allows it.
+    pub embed_fonts: bool,
     /// Explicit path to the PDFium library (file or directory).
     pub pdfium_path: Option<PathBuf>,
 }
@@ -102,6 +108,8 @@ impl Default for ConvertOptions {
             extract: ExtractOptions::default(),
             layout: LayoutOptions::default(),
             detect_headings: true,
+            compensate_widths: true,
+            embed_fonts: true,
             pdfium_path: None,
         }
     }
@@ -128,6 +136,8 @@ pub struct ConvertReport {
     pub tables: usize,
     pub paragraphs: usize,
     pub warnings: Vec<String>,
+    /// Font families embedded into the DOCX.
+    pub embedded_fonts: Vec<String>,
 }
 
 /// Cooperative cancellation flag.
@@ -368,9 +378,28 @@ pub fn convert(
     if opts.detect_headings {
         layout::detect_headings(&mut layouts);
     }
+    let mut embedded = Vec::new();
+    if opts.embed_fonts {
+        match embed::read_pdf_fonts(input, opts.password.as_deref()) {
+            Ok(programs) => embedded = embed::select(&layouts, &programs),
+            Err(e) => log::debug!("font embedding skipped: {e}"),
+        }
+    }
+    if opts.compensate_widths {
+        let mut library = metrics::FontLibrary::default();
+        for f in &embedded {
+            if let Some(data) = metrics::FontData::new(f.data.clone(), 0) {
+                library.register(&f.family, f.bold, f.italic, std::sync::Arc::new(data));
+            }
+        }
+        metrics::compensate(&mut layouts, &library);
+    }
+    report.embedded_fonts = embedded.iter().map(|f| f.family.clone()).collect();
+    report.embedded_fonts.dedup();
 
     progress(Progress::Writing);
-    let meta = document_meta(&document, input);
+    let mut meta = document_meta(&document, input);
+    meta.fonts = embedded;
     let tmp = output.with_extension("docx.part");
     {
         let file = std::fs::File::create(&tmp).with_context(|| format!("cannot create {}", tmp.display()))?;
@@ -396,6 +425,7 @@ fn document_meta(document: &PdfDocument, input: &Path) -> DocMeta {
         author: get(PdfDocumentMetadataTagType::Author),
         subject: get(PdfDocumentMetadataTagType::Subject),
         keywords: get(PdfDocumentMetadataTagType::Keywords),
+        fonts: Vec::new(),
     }
 }
 

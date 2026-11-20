@@ -874,33 +874,28 @@ impl Emitter<'_> {
 
     /// Builds the inline content of one line.
     fn line_inlines(&self, line: &Line, frame: Frame, allow_tabs: bool, tabs: &mut Vec<TabStop>) -> Vec<Inline> {
+        let atoms = self.line_atoms(line, frame, allow_tabs, tabs);
+        atoms_to_inlines(atoms)
+    }
+
+    /// The characters, spaces and tabs of a line in visual (left-to-right) order.
+    fn line_atoms(&self, line: &Line, frame: Frame, allow_tabs: bool, tabs: &mut Vec<TabStop>) -> Vec<Atom> {
         let raw = self.raw();
         let segs = self.ctx.segs;
-        let mut out: Vec<Inline> = Vec::new();
+        let mut out: Vec<Atom> = Vec::new();
         let line_size = line.size;
         let mut prev_x1: Option<f32> = None;
 
-        let push_text = |out: &mut Vec<Inline>, text: &str, style: &TextStyle, link: Option<&String>| {
-            if let Some(Inline::Text { text: t, style: s, link: l }) = out.last_mut() {
-                if s.same_run_format(style) && l.as_ref() == link {
-                    t.push_str(text);
-                    return;
-                }
-            }
-            out.push(Inline::Text { text: text.to_string(), style: style.clone(), link: link.cloned() });
-        };
-
-        let mut prev_style: Option<TextStyle> = None;
         for (si, &s) in line.segs.iter().enumerate() {
             let seg = &segs[s];
             if si > 0 {
                 let gap = seg.bbox.x0 - prev_x1.unwrap_or(seg.bbox.x0);
                 let is_marker_gap = si == 1 && line.marker_text_x.is_some_and(|x| (x - seg.bbox.x0).abs() < 1.0);
                 if (allow_tabs && gap > SPLIT_GAP * line_size) || is_marker_gap {
-                    out.push(Inline::Tab);
+                    out.push(Atom::Tab);
                     tabs.push(TabStop { pos: seg.bbox.x0 - frame.x0, kind: TabKind::Left });
-                } else if let Some(st) = &prev_style {
-                    push_text(&mut out, " ", st, None);
+                } else {
+                    out.push(Atom::Space);
                 }
             }
             let mut last_x1: Option<f32> = None;
@@ -912,12 +907,10 @@ impl Emitter<'_> {
                     let gap = g.bbox.x0 - lx;
                     let marker_gap = line.marker_text_x.is_some_and(|x| si == 0 && (x - g.bbox.x0).abs() < 0.5);
                     if marker_gap {
-                        out.push(Inline::Tab);
+                        out.push(Atom::Tab);
                         tabs.push(TabStop { pos: g.bbox.x0 - frame.x0, kind: TabKind::Left });
                     } else if (g.space_before && gap > 0.06 * size) || gap > 0.22 * size.min(line_size) {
-                        if let Some(st) = &prev_style {
-                            push_text(&mut out, " ", st, None);
-                        }
+                        out.push(Atom::Space);
                     }
                 }
                 last_x1 = Some(g.bbox.x1);
@@ -935,21 +928,17 @@ impl Emitter<'_> {
                         style.baseline_shift = (off * 2.0).round() / 2.0;
                     }
                 }
-                let link = g.link.and_then(|l| raw.links.get(l));
-                let text = expand_ligature(g.ch);
-                push_text(&mut out, &text, &style, link);
-                prev_style = Some(style);
+                out.push(Atom::Char {
+                    text: expand_ligature(g.ch),
+                    style,
+                    link: g.link.and_then(|l| raw.links.get(l)).cloned(),
+                    width: g.bbox.width(),
+                    glyph: gi,
+                });
             }
             prev_x1 = Some(seg.bbox.x1);
         }
-        // Collapse double spaces.
-        for i in &mut out {
-            if let Inline::Text { text, .. } = i {
-                while text.contains("  ") {
-                    *text = text.replace("  ", " ");
-                }
-            }
-        }
+        apply_letter_spacing(&mut out, raw);
         out
     }
 
@@ -1093,6 +1082,7 @@ impl Emitter<'_> {
             heading: None,
             bbox,
             shading: None,
+            rtl: false,
         }
     }
 
@@ -1586,6 +1576,96 @@ fn right_guess(lines: &[Line]) -> f32 {
     v.get(1).or(v.first()).copied().unwrap_or(0.0)
 }
 
+/// One element of a line before it is merged into runs.
+#[derive(Clone, Debug)]
+enum Atom {
+    Char {
+        text: String,
+        style: TextStyle,
+        link: Option<String>,
+        /// Advance width of the glyph in the PDF.
+        width: f32,
+        #[allow(dead_code)]
+        glyph: usize,
+    },
+    Space,
+    Tab,
+    Math(Vec<MathNode>),
+}
+
+/// Letter spacing (PDF `Tc`) is not part of a glyph's box: widen each glyph to
+/// its pitch so runs are measured with their real, tracked width.
+fn apply_letter_spacing(atoms: &mut [Atom], raw: &RawPage) {
+    let x0 = |a: &Atom| match a {
+        Atom::Char { glyph, .. } => Some(raw.glyphs[*glyph].bbox.x0),
+        _ => None,
+    };
+    let mut extras = Vec::new();
+    let mut per_atom = vec![None; atoms.len()];
+    for i in 0..atoms.len().saturating_sub(1) {
+        if let (Some(a), Some(b), Atom::Char { width, style, .. }) = (x0(&atoms[i]), x0(&atoms[i + 1]), &atoms[i]) {
+            let extra = (b - a) - width;
+            if extra.abs() < 0.6 * style.size {
+                extras.push(extra);
+                per_atom[i] = Some(extra);
+            }
+        }
+    }
+    let Some(typical) = median(&mut extras) else { return };
+    for (i, a) in atoms.iter_mut().enumerate() {
+        if let Atom::Char { width, style, .. } = a {
+            let extra = per_atom[i].unwrap_or(typical).clamp(-0.15 * style.size, 0.6 * style.size);
+            *width += extra;
+        }
+    }
+}
+
+/// Merges atoms into text runs (spaces take the style of the preceding character).
+fn atoms_to_inlines(atoms: Vec<Atom>) -> Vec<Inline> {
+    let mut out: Vec<Inline> = Vec::new();
+    let mut prev_style: Option<TextStyle> = None;
+    let mut pending_space = false;
+    let push = |out: &mut Vec<Inline>, text: &str, style: &TextStyle, link: Option<&String>, width: f32| {
+        if let Some(Inline::Text { text: t, style: s, link: l, pdf_width }) = out.last_mut() {
+            if s.same_run_format(style) && l.as_ref() == link {
+                t.push_str(text);
+                *pdf_width += width;
+                return;
+            }
+        }
+        out.push(Inline::Text { text: text.to_string(), style: style.clone(), link: link.cloned(), pdf_width: width });
+    };
+    for a in atoms {
+        match a {
+            Atom::Space => pending_space = !out.is_empty(),
+            Atom::Tab => {
+                pending_space = false;
+                out.push(Inline::Tab);
+            }
+            Atom::Math(m) => {
+                if pending_space {
+                    if let Some(st) = &prev_style {
+                        push(&mut out, " ", st, None, 0.0);
+                    }
+                    pending_space = false;
+                }
+                out.push(Inline::Math(m));
+            }
+            Atom::Char { text, style, link, width, .. } => {
+                if pending_space {
+                    let st = prev_style.clone().unwrap_or_else(|| style.clone());
+                    push(&mut out, " ", &st, None, 0.0);
+                    pending_space = false;
+                }
+                let w = if text.trim().is_empty() { 0.0 } else { width };
+                push(&mut out, &text, &style, link.as_ref(), w);
+                prev_style = Some(style);
+            }
+        }
+    }
+    out
+}
+
 fn expand_ligature(c: char) -> String {
     match c {
         '\u{FB00}' => "ff".into(),
@@ -1947,12 +2027,12 @@ mod tests {
     #[test]
     fn hyphen_join() {
         let st = TextStyle::default();
-        let mut prev = vec![Inline::Text { text: "conver-".into(), style: st.clone(), link: None }];
-        let next = vec![Inline::Text { text: "sion".into(), style: st.clone(), link: None }];
+        let mut prev = vec![Inline::Text { text: "conver-".into(), style: st.clone(), link: None, pdf_width: 0.0 }];
+        let next = vec![Inline::Text { text: "sion".into(), style: st.clone(), link: None, pdf_width: 0.0 }];
         assert_eq!(line_joiner(&mut prev, &next), Joiner::Hyphen);
         let Inline::Text { text, .. } = &prev[0] else { panic!() };
         assert_eq!(text, "conver");
-        let mut prev = vec![Inline::Text { text: "end.".into(), style: st.clone(), link: None }];
+        let mut prev = vec![Inline::Text { text: "end.".into(), style: st.clone(), link: None, pdf_width: 0.0 }];
         assert_eq!(line_joiner(&mut prev, &next), Joiner::Space);
     }
 }
