@@ -69,9 +69,14 @@ pub mod qobject {
         #[qproperty(QString, screenshot_path, cxx_name = "screenshotPath")]
         #[qproperty(bool, auto_convert, cxx_name = "autoConvert")]
         #[qproperty(bool, edit_mode, cxx_name = "editMode")]
-        #[qproperty(QString, text_items_json, cxx_name = "textItemsJson")]
+        #[qproperty(QString, page_text_json, cxx_name = "pageTextJson")]
         #[qproperty(i32, edit_count, cxx_name = "editCount")]
+        #[qproperty(i32, redo_count, cxx_name = "redoCount")]
         #[qproperty(bool, edit_busy, cxx_name = "editBusy")]
+        #[qproperty(bool, previewing)]
+        #[qproperty(bool, ocr_busy, cxx_name = "ocrBusy")]
+        #[qproperty(QString, find_json, cxx_name = "findJson")]
+        #[qproperty(bool, find_busy, cxx_name = "findBusy")]
         #[qproperty(QString, edit_demo, cxx_name = "editDemo")]
         type Converter = super::ConverterRust;
     }
@@ -158,14 +163,40 @@ pub mod qobject {
         #[cxx_name = "enableEditing"]
         fn set_edit_mode_on(self: Pin<&mut Converter>, on: bool);
 
-        /// Replaces the text of run `index` (from `textItemsJson`).
+        /// Changes run `index` (from `pageTextJson`): its text, and its look
+        /// from `style` (JSON: bold, italic, size, color "#rrggbb").
         #[qinvokable]
-        #[cxx_name = "replaceText"]
-        fn replace_text(self: Pin<&mut Converter>, index: i32, text: &QString, fit: bool);
+        #[cxx_name = "editRun"]
+        fn edit_run(self: Pin<&mut Converter>, index: i32, text: &QString, fit: bool, style: &QString);
+
+        /// Shows what `editRun` would do, without keeping it.
+        #[qinvokable]
+        #[cxx_name = "previewRun"]
+        fn preview_run(self: Pin<&mut Converter>, index: i32, text: &QString, fit: bool, style: &QString);
+
+        /// Rewrites paragraph `index`, wrapping it over as many lines as it needs.
+        #[qinvokable]
+        #[cxx_name = "editParagraph"]
+        fn edit_paragraph(self: Pin<&mut Converter>, index: i32, text: &QString, fit: bool, push_down: bool);
 
         #[qinvokable]
-        #[cxx_name = "deleteText"]
-        fn delete_text(self: Pin<&mut Converter>, index: i32);
+        #[cxx_name = "previewParagraph"]
+        fn preview_paragraph(self: Pin<&mut Converter>, index: i32, text: &QString, fit: bool, push_down: bool);
+
+        /// Back to the page as it is.
+        #[qinvokable]
+        #[cxx_name = "cancelPreview"]
+        fn cancel_preview(self: Pin<&mut Converter>);
+
+        /// Deletes runs (JSON array of indices).
+        #[qinvokable]
+        #[cxx_name = "deleteItems"]
+        fn delete_items(self: Pin<&mut Converter>, indices: &QString);
+
+        /// Moves run `index` by (dx, dy), fractions of the page.
+        #[qinvokable]
+        #[cxx_name = "moveText"]
+        fn move_text(self: Pin<&mut Converter>, index: i32, dx: f64, dy: f64);
 
         /// Adds text at (x, y), fractions of the page. `style`: family (0 sans,
         /// 1 serif, 2 monospace) + 4 for bold + 8 for italic.
@@ -173,15 +204,29 @@ pub mod qobject {
         #[cxx_name = "insertText"]
         fn insert_text(self: Pin<&mut Converter>, x: f64, y: f64, text: &QString, size: f64, style: i32);
 
-        /// Replaces every occurrence of `find` in the whole document.
+        /// Searches the document (results in `findJson`).
         #[qinvokable]
-        #[cxx_name = "findReplace"]
-        fn find_replace(self: Pin<&mut Converter>, find: &QString, replace: &QString);
+        #[cxx_name = "findText"]
+        fn find_text(self: Pin<&mut Converter>, query: &QString, match_case: bool, whole_word: bool);
+
+        /// Replaces the found matches with these indices (JSON array).
+        #[qinvokable]
+        #[cxx_name = "replaceFound"]
+        fn replace_found(self: Pin<&mut Converter>, indices: &QString, replacement: &QString);
+
+        /// Recognises letters drawn as outlines on the page (OCR) so they can be edited.
+        #[qinvokable]
+        #[cxx_name = "recognizeOutlined"]
+        fn recognize_outlined(self: Pin<&mut Converter>);
 
         /// Takes back the last edit of the selected file.
         #[qinvokable]
         #[cxx_name = "undoEdit"]
         fn undo_edit(self: Pin<&mut Converter>);
+
+        #[qinvokable]
+        #[cxx_name = "redoEdit"]
+        fn redo_edit(self: Pin<&mut Converter>);
 
         /// Saves the selected file's edited PDF.
         #[qinvokable]
@@ -214,6 +259,8 @@ struct QueueItem {
     message: String,
     /// Edited copies of the PDF, oldest first (the last one is current).
     versions: Vec<PathBuf>,
+    /// Undone versions, most recently undone last.
+    redo: Vec<PathBuf>,
 }
 
 impl QueueItem {
@@ -223,7 +270,13 @@ impl QueueItem {
     }
 
     fn discard_versions(&mut self) {
-        for v in self.versions.drain(..) {
+        for v in self.versions.drain(..).chain(self.redo.drain(..)) {
+            let _ = std::fs::remove_file(v);
+        }
+    }
+
+    fn clear_redo(&mut self) {
+        for v in self.redo.drain(..) {
             let _ = std::fs::remove_file(v);
         }
     }
@@ -271,15 +324,30 @@ pub struct ConverterRust {
     screenshot_path: QString,
     auto_convert: bool,
     edit_mode: bool,
-    text_items_json: QString,
+    page_text_json: QString,
     edit_count: i32,
+    redo_count: i32,
     edit_busy: bool,
+    previewing: bool,
+    ocr_busy: bool,
+    find_json: QString,
+    find_busy: bool,
     edit_demo: QString,
 
     queue: Vec<QueueItem>,
     cancel: Option<CancelToken>,
-    /// Text runs of the previewed page, as listed in `text_items_json`.
-    text_items: Vec<pdf2word_core::edit::TextItem>,
+    /// Text of the previewed page (`page_text_json`): runs, then runs recognised in outlines.
+    page_text: Option<pdf2word_core::edit::PageText>,
+    outlined: Vec<pdf2word_core::edit::TextItem>,
+    /// Pages whose outlines are recognised (file, page).
+    ocr_pages: std::collections::HashSet<(PathBuf, i32)>,
+    /// Search results and the version they were found in.
+    matches: Vec<pdf2word_core::edit::Match>,
+    matches_source: PathBuf,
+    /// An edit shown as a preview: its request, result file and the version it applies to.
+    preview_edit: Option<(String, PathBuf, PathBuf)>,
+    /// A preview asked for while another edit was running.
+    queued_preview: Option<(String, String, EditJob)>,
     /// Incremented for every preview render, so that stale results are dropped.
     render_gen: u64,
 }
@@ -350,13 +418,24 @@ impl Default for ConverterRust {
             screenshot_path: QString::from(&std::env::var("PDF2WORD_SCREENSHOT").unwrap_or_default()),
             auto_convert: std::env::var_os("PDF2WORD_AUTOCONVERT").is_some(),
             edit_mode: false,
-            text_items_json: QString::from("[]"),
+            page_text_json: QString::from("{}"),
             edit_count: 0,
+            redo_count: 0,
             edit_busy: false,
+            previewing: false,
+            ocr_busy: false,
+            find_json: QString::from("[]"),
+            find_busy: false,
             edit_demo: QString::from(&std::env::var("PDF2WORD_EDIT_DEMO").unwrap_or_default()),
             queue: Vec::new(),
             cancel: None,
-            text_items: Vec::new(),
+            page_text: None,
+            outlined: Vec::new(),
+            ocr_pages: Default::default(),
+            matches: Vec::new(),
+            matches_source: PathBuf::new(),
+            preview_edit: None,
+            queued_preview: None,
             render_gen: 0,
         };
         if let Some(v) = settings_file().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|t| serde_json::from_str::<Value>(&t).ok()) {
@@ -446,6 +525,16 @@ fn qs(p: &Path) -> QString {
     QString::from(&p.to_string_lossy().into_owned())
 }
 
+/// "#rrggbb" → RGB.
+fn parse_color(s: &str) -> Option<[u8; 3]> {
+    let h = s.trim().trim_start_matches('#');
+    if h.len() != 6 {
+        return None;
+    }
+    let v = u32::from_str_radix(h, 16).ok()?;
+    Some([(v >> 16) as u8, (v >> 8) as u8, v as u8])
+}
+
 fn output_for(input: &Path, folder: Option<&Path>) -> PathBuf {
     match (folder, input.file_stem()) {
         (Some(f), Some(stem)) => f.join(stem).with_extension("docx"),
@@ -511,8 +600,10 @@ impl qobject::Converter {
             self.as_mut().set_output_path(qs(&q.output));
             self.as_mut().set_last_output(if q.status == ItemStatus::Done { qs(&q.output) } else { QString::default() });
             self.as_mut().set_edit_count(q.versions.len() as i32);
+            self.as_mut().set_redo_count(q.redo.len() as i32);
         } else {
             self.as_mut().set_edit_count(0);
+            self.as_mut().set_redo_count(0);
         }
     }
 
@@ -525,8 +616,7 @@ impl qobject::Converter {
         self.as_mut().set_page_count(0);
         self.as_mut().set_preview_source(QUrl::default());
         self.as_mut().set_structure_json(QString::from("[]"));
-        self.as_mut().set_text_items_json(QString::from("[]"));
-        self.as_mut().rust_mut().text_items.clear();
+        self.as_mut().clear_page_text();
         self.as_mut().set_document_info(QString::from(EMPTY_INFO));
         self.sync_queue();
     }
@@ -544,6 +634,7 @@ impl qobject::Converter {
             progress: 0.0,
             message: String::new(),
             versions: Vec::new(),
+            redo: Vec::new(),
         });
         self.rust().queue.len() - 1
     }
@@ -589,8 +680,7 @@ impl qobject::Converter {
         self.as_mut().set_input_path(qs(&item.input));
         self.as_mut().set_page_count(0);
         self.as_mut().set_structure_json(QString::from("[]"));
-        self.as_mut().set_text_items_json(QString::from("[]"));
-        self.as_mut().rust_mut().text_items.clear();
+        self.as_mut().clear_page_text();
         self.as_mut().set_document_info(QString::from("Reading document…"));
 
         let path = item.input.clone();
@@ -727,8 +817,7 @@ impl qobject::Converter {
         let page = page.clamp(1, count);
         self.as_mut().set_preview_page(page);
         self.as_mut().set_structure_json(QString::from("[]"));
-        self.as_mut().set_text_items_json(QString::from("[]"));
-        self.as_mut().rust_mut().text_items.clear();
+        self.as_mut().clear_page_text();
         self.as_mut().rust_mut().render_gen += 1;
         let gen = self.rust().render_gen;
         let input = PathBuf::from(self.input_path().to_string());
@@ -736,21 +825,26 @@ impl qobject::Converter {
         let password = opt_string(self.password());
         let structure = *self.show_structure();
         let editing = *self.edit_mode();
+        let ocr = self.rust().ocr_pages.contains(&(input.clone(), page));
+        let ocr_language = opt_string(self.ocr_language()).unwrap_or_else(|| "auto".into());
+        self.as_mut().drop_pending();
         let qt_thread = self.qt_thread();
         std::thread::spawn(move || {
             let n = PREVIEW_COUNTER.fetch_add(1, Ordering::SeqCst);
             let out = std::env::temp_dir().join(format!("pdf2word-preview-{}-{n}.png", std::process::id()));
             let result = pdf2word_core::render_page_png(&source, password.as_deref(), (page - 1) as usize, 1200, &out, None);
             let boxes = if structure { structure_json(&source, password.as_deref(), page) } else { None };
-            let items = if editing { pdf2word_core::edit::text_items(&source, password.as_deref(), (page - 1) as usize, None).ok() } else { None };
+            let items = if editing { pdf2word_core::edit::page_text(&source, password.as_deref(), (page - 1) as usize, None).ok() } else { None };
+            let outlined = if editing && ocr { pdf2word_core::edit::outlined_text(&source, password.as_deref(), (page - 1) as usize, &ocr_language, None).ok() } else { None };
             let _ = qt_thread.queue(move |mut obj| {
                 // Ignore stale renders.
                 if obj.rust().render_gen != gen || *obj.preview_page() != page || obj.input_path().to_string() != input.to_string_lossy() {
                     let _ = std::fs::remove_file(&out);
                     return;
                 }
-                if let Some(items) = items.filter(|_| *obj.edit_mode()) {
-                    obj.as_mut().set_items(items);
+                if let Some(pt) = items.filter(|_| *obj.edit_mode()) {
+                    obj.as_mut().rust_mut().outlined = outlined.unwrap_or_default();
+                    obj.as_mut().set_page_text_value(pt);
                 }
                 match result {
                     Ok(()) => {
@@ -987,127 +1081,343 @@ impl qobject::Converter {
         usize::try_from(*self.selected()).ok().and_then(|i| self.rust().queue.get(i)).map(QueueItem::source)
     }
 
-    fn set_items(mut self: Pin<&mut Self>, items: Vec<pdf2word_core::edit::TextItem>) {
-        let v: Vec<Value> = items
+    fn clear_page_text(mut self: Pin<&mut Self>) {
+        self.as_mut().set_page_text_json(QString::from("{}"));
+        self.as_mut().rust_mut().page_text = None;
+        self.as_mut().rust_mut().outlined.clear();
+    }
+
+    /// All runs of the page: its text, then the runs recognised in outlines.
+    fn runs(&self) -> Vec<pdf2word_core::edit::TextItem> {
+        let mut v = self.rust().page_text.as_ref().map(|p| p.items.clone()).unwrap_or_default();
+        v.extend(self.rust().outlined.iter().cloned());
+        v
+    }
+
+    fn set_page_text_value(mut self: Pin<&mut Self>, pt: pdf2word_core::edit::PageText) {
+        self.as_mut().rust_mut().page_text = Some(pt);
+        self.as_mut().publish_page_text();
+    }
+
+    fn publish_page_text(mut self: Pin<&mut Self>) {
+        let Some(pt) = self.rust().page_text.clone() else { return };
+        let hex = |c: [u8; 3]| format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]);
+        let items: Vec<Value> = self
+            .runs()
             .iter()
             .enumerate()
             .map(|(i, t)| {
                 json!({
                     "i": i, "text": t.text, "x": t.x, "y": t.y, "w": t.w, "h": t.h,
                     "font": t.font, "size": (t.size as f64 * 10.0).round() / 10.0, "bold": t.bold, "italic": t.italic,
-                    "invisible": t.invisible,
+                    "color": hex(t.color), "invisible": t.invisible, "rtl": t.rtl, "outlined": t.outlined,
+                    "paragraph": if t.outlined { -1 } else { t.paragraph as i64 },
+                    "serif": t.font.to_ascii_lowercase().contains("serif") && !t.font.to_ascii_lowercase().contains("sans")
+                        || ["times", "roman", "cmr", "georgia", "garamond", "cambria"].iter().any(|k| t.font.to_ascii_lowercase().contains(k)),
                 })
             })
             .collect();
-        self.as_mut().set_text_items_json(QString::from(&Value::Array(v).to_string()));
-        self.as_mut().rust_mut().text_items = items;
+        let paras: Vec<Value> = pt
+            .paragraphs
+            .iter()
+            .enumerate()
+            .map(|(i, p)| json!({ "i": i, "items": p.items, "text": p.text, "x": p.x, "y": p.y, "w": p.w, "h": p.h, "lines": p.lines,
+                "align": format!("{:?}", p.align).to_lowercase() }))
+            .collect();
+        let v = json!({ "w": pt.width, "h": pt.height, "outlined": pt.outlined_shapes, "recognised": !self.rust().outlined.is_empty(), "items": items, "paragraphs": paras });
+        self.as_mut().set_page_text_json(QString::from(&v.to_string()));
     }
 
     pub fn set_edit_mode_on(mut self: Pin<&mut Self>, on: bool) {
         self.as_mut().set_edit_mode(on);
+        self.as_mut().drop_pending();
         if !on {
-            self.as_mut().set_text_items_json(QString::from("[]"));
-            self.as_mut().rust_mut().text_items.clear();
+            self.clear_page_text();
             return;
         }
         let page = *self.preview_page();
-        let input = PathBuf::from(self.input_path().to_string());
-        let Some(source) = self.selected_source() else { return };
-        let password = opt_string(self.password());
-        let qt_thread = self.qt_thread();
-        std::thread::spawn(move || {
-            let items = pdf2word_core::edit::text_items(&source, password.as_deref(), (page - 1).max(0) as usize, None);
-            let _ = qt_thread.queue(move |mut obj| {
-                if *obj.preview_page() != page || !*obj.edit_mode() || obj.input_path().to_string() != input.to_string_lossy() {
-                    return;
-                }
-                match items {
-                    Ok(items) => obj.as_mut().set_items(items),
-                    Err(e) => obj.as_mut().set_status(QString::from(&format!("Cannot read the page's text: {e:#}"))),
-                }
-            });
-        });
+        self.show_page(page);
     }
 
-    /// Runs an edit of the selected file in the background and keeps the result as its new version.
-    fn run_edit(mut self: Pin<&mut Self>, what: String, job: EditJob) {
-        if *self.edit_busy() || *self.busy() {
+    /// Forgets a preview (and shows the page as it is when it was shown).
+    fn drop_pending(mut self: Pin<&mut Self>) {
+        if let Some((_, path, _)) = self.as_mut().rust_mut().preview_edit.take() {
+            let _ = std::fs::remove_file(path);
+        }
+        self.as_mut().rust_mut().queued_preview = None;
+        if *self.previewing() {
+            self.as_mut().set_previewing(false);
+        }
+    }
+
+    /// Runs an edit of the selected file in the background. With a `preview`
+    /// key the result is only shown; otherwise it becomes the file's new version.
+    fn run_edit(mut self: Pin<&mut Self>, what: String, job: EditJob, preview: Option<String>) {
+        if *self.busy() {
+            return;
+        }
+        if *self.edit_busy() {
+            if let Some(key) = preview {
+                self.as_mut().rust_mut().queued_preview = Some((key, what, job));
+            }
             return;
         }
         let Some(source) = self.selected_source() else { return };
         let input = PathBuf::from(self.input_path().to_string());
         let password = opt_string(self.password());
+        let page = *self.preview_page();
         self.as_mut().set_edit_busy(true);
-        self.as_mut().set_status(QString::from(&format!("{what}…")));
+        if preview.is_none() {
+            self.as_mut().set_status(QString::from(&format!("{what}…")));
+        }
         let qt_thread = self.qt_thread();
         std::thread::spawn(move || {
             let n = PREVIEW_COUNTER.fetch_add(1, Ordering::SeqCst);
             let out = std::env::temp_dir().join(format!("pdf2word-edit-{}-{n}.pdf", std::process::id()));
             let result = job(&source, password.as_deref(), &out);
+            let png = match (&result, &preview) {
+                (Ok(_), Some(_)) => {
+                    let png = std::env::temp_dir().join(format!("pdf2word-preview-{}-{n}.png", std::process::id()));
+                    pdf2word_core::render_page_png(&out, password.as_deref(), (page - 1).max(0) as usize, 1200, &png, None).ok().map(|_| png)
+                }
+                _ => None,
+            };
             let _ = qt_thread.queue(move |mut obj| {
                 obj.as_mut().set_edit_busy(false);
                 let index = obj.rust().queue.iter().position(|q| q.input == input);
-                match (result, index) {
-                    (Ok((changes, notes)), Some(index)) if changes > 0 => {
-                        if let Some(item) = obj.as_mut().rust_mut().queue.get_mut(index) {
-                            item.versions.push(out);
-                            if item.status == ItemStatus::Done {
-                                item.status = ItemStatus::Waiting;
-                                item.progress = 0.0;
+                let current = obj.selected_source();
+                match (result, preview) {
+                    (Ok(_), Some(key)) => {
+                        // Still the same page of the same version?
+                        if current.as_deref() == Some(source.as_path()) && *obj.preview_page() == page && *obj.edit_mode() {
+                            if let Some((_, old, _)) = obj.as_mut().rust_mut().preview_edit.replace((key, out, source)) {
+                                let _ = std::fs::remove_file(old);
                             }
-                        }
-                        for n in &notes {
-                            obj.as_mut().append_log(&format!("  ⚠ {n}"));
-                        }
-                        let msg = match notes.first() {
-                            Some(n) => format!("{what}: done — {n}"),
-                            None => format!("{what}: done"),
-                        };
-                        obj.as_mut().set_status(QString::from(&msg));
-                        obj.as_mut().sync_queue();
-                        if *obj.selected() == index as i32 {
-                            let page = *obj.preview_page();
-                            obj.as_mut().show_page(page);
+                            if let Some(png) = png {
+                                if let Some(old) = url_to_path(obj.preview_source()) {
+                                    let _ = std::fs::remove_file(old);
+                                }
+                                obj.as_mut().set_preview_source(path_to_url(&png));
+                                obj.as_mut().set_previewing(true);
+                            }
+                        } else {
+                            let _ = std::fs::remove_file(&out);
                         }
                     }
-                    (Ok(_), _) => {
+                    (Ok((changes, notes)), None) if changes > 0 && index.is_some() => {
+                        let index = index.unwrap();
+                        obj.as_mut().commit_version(index, out, &what, &notes);
+                    }
+                    (Ok(_), None) => {
                         let _ = std::fs::remove_file(&out);
                         obj.as_mut().set_status(QString::from(&format!("{what}: nothing changed")));
                     }
-                    (Err(e), _) => {
+                    (Err(e), preview) => {
                         let _ = std::fs::remove_file(&out);
                         obj.as_mut().set_status(QString::from(&format!("{what} failed: {e:#}")));
-                        obj.as_mut().append_log(&format!("✖ {what} failed: {e:#}"));
+                        if preview.is_none() {
+                            obj.as_mut().append_log(&format!("✖ {what} failed: {e:#}"));
+                        }
                     }
+                }
+                if let Some((key, what, job)) = obj.as_mut().rust_mut().queued_preview.take() {
+                    obj.as_mut().run_edit(what, job, Some(key));
                 }
             });
         });
     }
 
-    fn single_edit(self: Pin<&mut Self>, what: &str, edit: pdf2word_core::edit::TextEdit) {
+    /// Makes `out` the new version of queue item `index`.
+    fn commit_version(mut self: Pin<&mut Self>, index: usize, out: PathBuf, what: &str, notes: &[String]) {
+        if let Some(item) = self.as_mut().rust_mut().queue.get_mut(index) {
+            item.clear_redo();
+            item.versions.push(out);
+            if item.status == ItemStatus::Done {
+                item.status = ItemStatus::Waiting;
+                item.progress = 0.0;
+            }
+        }
+        for n in notes {
+            self.as_mut().append_log(&format!("  ⚠ {n}"));
+        }
+        let msg = match notes.first() {
+            Some(n) => format!("{what}: done — {n}"),
+            None => format!("{what}: done"),
+        };
+        self.as_mut().set_status(QString::from(&msg));
+        self.as_mut().set_previewing(false);
+        self.as_mut().sync_queue();
+        if *self.selected() == index as i32 {
+            let page = *self.preview_page();
+            self.show_page(page);
+        }
+    }
+
+    /// Applies `edits` (or shows them, with a preview key).
+    fn apply(mut self: Pin<&mut Self>, what: &str, edits: Vec<pdf2word_core::edit::TextEdit>, preview: bool) {
+        if edits.is_empty() {
+            if preview {
+                self.cancel_preview();
+            }
+            return;
+        }
+        let key = format!("{edits:?}");
+        let source = self.selected_source();
+        if !preview {
+            // The preview of exactly this edit is ready: keep it.
+            let ready = match (&self.rust().preview_edit, &source) {
+                (Some((k, path, base)), Some(src)) if *k == key && base == src && path.is_file() => Some(path.clone()),
+                _ => None,
+            };
+            if let Some(path) = ready {
+                self.as_mut().rust_mut().preview_edit = None;
+                let input = PathBuf::from(self.input_path().to_string());
+                if let Some(index) = self.rust().queue.iter().position(|q| q.input == input) {
+                    self.commit_version(index, path, what, &[]);
+                }
+                return;
+            }
+            self.as_mut().drop_pending();
+        }
         self.run_edit(
             what.to_string(),
             Box::new(move |src, pw, out| {
-                let r = pdf2word_core::edit::apply_edits(src, pw, &[edit], out, None)?;
+                let r = pdf2word_core::edit::apply_edits(src, pw, &edits, out, None)?;
                 Ok((1, r.notes))
             }),
+            preview.then_some(key),
         );
     }
 
-    pub fn replace_text(self: Pin<&mut Self>, index: i32, text: &QString, fit: bool) {
-        let Some(item) = usize::try_from(index).ok().and_then(|i| self.rust().text_items.get(i).cloned()) else { return };
-        let text = text.to_string();
-        if text == item.text {
-            return;
-        }
-        let page = (*self.preview_page() - 1).max(0) as usize;
-        self.single_edit("Changing text", pdf2word_core::edit::TextEdit::Replace { page, objects: item.objects, text, fit });
+    fn page_index(&self) -> usize {
+        (*self.preview_page() - 1).max(0) as usize
     }
 
-    pub fn delete_text(self: Pin<&mut Self>, index: i32) {
-        let Some(item) = usize::try_from(index).ok().and_then(|i| self.rust().text_items.get(i).cloned()) else { return };
-        let page = (*self.preview_page() - 1).max(0) as usize;
-        self.single_edit("Deleting text", pdf2word_core::edit::TextEdit::Delete { page, objects: item.objects });
+    /// The edit for run `index` with new text and style.
+    fn run_edits(&self, index: i32, text: &QString, fit: bool, style: &QString) -> Vec<pdf2word_core::edit::TextEdit> {
+        use pdf2word_core::edit::{NewTextStyle, StyleChange, TextEdit};
+        let Some(item) = usize::try_from(index).ok().and_then(|i| self.runs().get(i).cloned()) else { return Vec::new() };
+        let text = text.to_string();
+        let st: Value = serde_json::from_str(&style.to_string()).unwrap_or(Value::Null);
+        let page = self.page_index();
+        let color = st.get("color").and_then(Value::as_str).and_then(parse_color);
+        let change = StyleChange {
+            bold: st.get("bold").and_then(Value::as_bool).filter(|b| *b != item.bold),
+            italic: st.get("italic").and_then(Value::as_bool).filter(|b| *b != item.italic),
+            size: st.get("size").and_then(Value::as_f64).map(|v| v as f32).filter(|v| (*v - item.size).abs() > 0.05),
+            color: color.filter(|c| *c != item.color),
+        };
+        if item.outlined {
+            let family = if item.font.contains("(serif)") {
+                "serif"
+            } else if item.font.contains("monospace") {
+                "mono"
+            } else {
+                ""
+            };
+            return vec![TextEdit::Outlined {
+                page,
+                x: item.x,
+                y: item.y,
+                w: item.w,
+                h: item.h,
+                baseline: item.baseline,
+                text,
+                size: change.size.unwrap_or(item.size),
+                color: change.color.unwrap_or(item.color),
+                style: NewTextStyle { family: family.into(), bold: change.bold.unwrap_or(item.bold), italic: change.italic.unwrap_or(item.italic) },
+                fit,
+            }];
+        }
+        if change != StyleChange::default() {
+            let text = (text != item.text).then_some(text);
+            return vec![TextEdit::Restyle { page, objects: item.objects, text, change, fit }];
+        }
+        if text == item.text {
+            return Vec::new();
+        }
+        vec![TextEdit::Replace { page, objects: item.objects, text, fit }]
+    }
+
+    pub fn edit_run(self: Pin<&mut Self>, index: i32, text: &QString, fit: bool, style: &QString) {
+        let edits = self.run_edits(index, text, fit, style);
+        self.apply("Changing text", edits, false);
+    }
+
+    pub fn preview_run(self: Pin<&mut Self>, index: i32, text: &QString, fit: bool, style: &QString) {
+        let edits = self.run_edits(index, text, fit, style);
+        self.apply("Preview", edits, true);
+    }
+
+    fn paragraph_edits(&self, index: i32, text: &QString, fit: bool, push_down: bool) -> Vec<pdf2word_core::edit::TextEdit> {
+        let Some(pt) = self.rust().page_text.as_ref() else { return Vec::new() };
+        let Some(p) = usize::try_from(index).ok().and_then(|i| pt.paragraphs.get(i)) else { return Vec::new() };
+        let text = text.to_string();
+        if text == p.text {
+            return Vec::new();
+        }
+        let objects = p.items.iter().filter_map(|i| pt.items.get(*i)).flat_map(|i| i.objects.clone()).collect();
+        vec![pdf2word_core::edit::TextEdit::Paragraph { page: self.page_index(), objects, text, fit, push_down }]
+    }
+
+    pub fn edit_paragraph(self: Pin<&mut Self>, index: i32, text: &QString, fit: bool, push_down: bool) {
+        let edits = self.paragraph_edits(index, text, fit, push_down);
+        self.apply("Changing the paragraph", edits, false);
+    }
+
+    pub fn preview_paragraph(self: Pin<&mut Self>, index: i32, text: &QString, fit: bool, push_down: bool) {
+        let edits = self.paragraph_edits(index, text, fit, push_down);
+        self.apply("Preview", edits, true);
+    }
+
+    pub fn cancel_preview(mut self: Pin<&mut Self>) {
+        let was = *self.previewing() || self.rust().preview_edit.is_some();
+        self.as_mut().drop_pending();
+        if was {
+            let page = *self.preview_page();
+            self.show_page(page);
+        }
+    }
+
+    pub fn delete_items(self: Pin<&mut Self>, indices: &QString) {
+        use pdf2word_core::edit::{NewTextStyle, TextEdit};
+        let idx: Vec<usize> = serde_json::from_str(&indices.to_string()).unwrap_or_default();
+        let runs = self.runs();
+        let page = self.page_index();
+        let edits: Vec<TextEdit> = idx
+            .iter()
+            .filter_map(|i| runs.get(*i))
+            .map(|it| {
+                if it.outlined {
+                    TextEdit::Outlined {
+                        page,
+                        x: it.x,
+                        y: it.y,
+                        w: it.w,
+                        h: it.h,
+                        baseline: it.baseline,
+                        text: String::new(),
+                        size: it.size,
+                        color: it.color,
+                        style: NewTextStyle::default(),
+                        fit: false,
+                    }
+                } else {
+                    TextEdit::Delete { page, objects: it.objects.clone() }
+                }
+            })
+            .collect();
+        let what = if edits.len() == 1 { "Deleting text".to_string() } else { format!("Deleting {} lines", edits.len()) };
+        self.apply(&what, edits, false);
+    }
+
+    pub fn move_text(self: Pin<&mut Self>, index: i32, dx: f64, dy: f64) {
+        let Some(item) = usize::try_from(index).ok().and_then(|i| self.runs().get(i).cloned()) else { return };
+        if item.outlined || (dx.abs() < 1e-4 && dy.abs() < 1e-4) {
+            return;
+        }
+        let edit = pdf2word_core::edit::TextEdit::Move { page: self.page_index(), objects: item.objects, dx: dx as f32, dy: dy as f32 };
+        self.apply("Moving text", vec![edit], false);
     }
 
     pub fn insert_text(self: Pin<&mut Self>, x: f64, y: f64, text: &QString, size: f64, style: i32) {
@@ -1116,51 +1426,124 @@ impl qobject::Converter {
         if text.trim().is_empty() {
             return;
         }
-        let page = (*self.preview_page() - 1).max(0) as usize;
         let family = match family {
             1 => "serif",
             2 => "mono",
             _ => "",
         }
         .to_string();
-        self.single_edit(
-            "Adding text",
-            pdf2word_core::edit::TextEdit::Insert {
-                page,
-                x: x as f32,
-                y: y as f32,
-                text,
-                size: size.clamp(2.0, 400.0) as f32,
-                color: [0, 0, 0],
-                style: pdf2word_core::edit::NewTextStyle { family, bold, italic },
-            },
+        let edit = pdf2word_core::edit::TextEdit::Insert {
+            page: self.page_index(),
+            x: x as f32,
+            y: y as f32,
+            text,
+            size: size.clamp(2.0, 400.0) as f32,
+            color: [0, 0, 0],
+            style: pdf2word_core::edit::NewTextStyle { family, bold, italic },
+        };
+        self.apply("Adding text", vec![edit], false);
+    }
+
+    pub fn find_text(mut self: Pin<&mut Self>, query: &QString, match_case: bool, whole_word: bool) {
+        let query = query.to_string();
+        let Some(source) = self.selected_source() else { return };
+        if query.is_empty() || *self.find_busy() {
+            return;
+        }
+        let password = opt_string(self.password());
+        self.as_mut().set_find_busy(true);
+        let qt_thread = self.qt_thread();
+        std::thread::spawn(move || {
+            let opts = pdf2word_core::edit::FindOptions { match_case, whole_word };
+            let result = pdf2word_core::edit::find_text(&source, password.as_deref(), &query, opts, None);
+            let _ = qt_thread.queue(move |mut obj| {
+                obj.as_mut().set_find_busy(false);
+                match result {
+                    Ok(matches) => {
+                        let v: Vec<Value> = matches
+                            .iter()
+                            .enumerate()
+                            .map(|(i, m)| json!({ "i": i, "page": m.page + 1, "before": m.before, "found": m.found, "after": m.after }))
+                            .collect();
+                        obj.as_mut().set_status(QString::from(&format!("{} match{} found", matches.len(), if matches.len() == 1 { "" } else { "es" })));
+                        obj.as_mut().rust_mut().matches = matches;
+                        obj.as_mut().rust_mut().matches_source = source;
+                        obj.as_mut().set_find_json(QString::from(&Value::Array(v).to_string()));
+                    }
+                    Err(e) => obj.as_mut().set_status(QString::from(&format!("Search failed: {e:#}"))),
+                }
+            });
+        });
+    }
+
+    pub fn replace_found(mut self: Pin<&mut Self>, indices: &QString, replacement: &QString) {
+        let idx: Vec<usize> = serde_json::from_str(&indices.to_string()).unwrap_or_default();
+        let replacement = replacement.to_string();
+        if self.selected_source().as_ref() != Some(&self.rust().matches_source) {
+            self.as_mut().set_status(QString::from("The document changed: search again"));
+            return;
+        }
+        let chosen: Vec<pdf2word_core::edit::Match> = idx.iter().filter_map(|i| self.rust().matches.get(*i).cloned()).collect();
+        if chosen.is_empty() {
+            return;
+        }
+        let n = chosen.len();
+        self.as_mut().set_find_json(QString::from("[]"));
+        self.as_mut().rust_mut().matches.clear();
+        self.as_mut().drop_pending();
+        self.run_edit(
+            format!("Replacing {n} match{}", if n == 1 { "" } else { "es" }),
+            Box::new(move |src, pw, out| {
+                let r = pdf2word_core::edit::replace_matches(src, pw, &chosen, &replacement, out, None)?;
+                Ok((n, r.notes))
+            }),
+            None,
         );
     }
 
-    pub fn find_replace(self: Pin<&mut Self>, find: &QString, replace: &QString) {
-        let (find, replace) = (find.to_string(), replace.to_string());
-        if find.is_empty() {
+    pub fn recognize_outlined(mut self: Pin<&mut Self>) {
+        let Some(source) = self.selected_source() else { return };
+        if *self.ocr_busy() {
             return;
         }
-        let what = format!("Replacing “{find}”");
-        self.run_edit(
-            what,
-            Box::new(move |src, pw, out| {
-                let (n, r) = pdf2word_core::edit::find_replace(src, pw, &find, &replace, out, None)?;
-                Ok((n, r.notes))
-            }),
-        );
+        let input = PathBuf::from(self.input_path().to_string());
+        let page = *self.preview_page();
+        let password = opt_string(self.password());
+        let language = opt_string(self.ocr_language()).unwrap_or_else(|| "auto".into());
+        self.as_mut().rust_mut().ocr_pages.insert((input.clone(), page));
+        self.as_mut().set_ocr_busy(true);
+        self.as_mut().set_status(QString::from("Recognising outlined text…"));
+        let qt_thread = self.qt_thread();
+        std::thread::spawn(move || {
+            let result = pdf2word_core::edit::outlined_text(&source, password.as_deref(), (page - 1).max(0) as usize, &language, None);
+            let _ = qt_thread.queue(move |mut obj| {
+                obj.as_mut().set_ocr_busy(false);
+                if *obj.preview_page() != page || obj.input_path().to_string() != input.to_string_lossy() {
+                    return;
+                }
+                match result {
+                    Ok(items) => {
+                        let n = items.len();
+                        obj.as_mut().rust_mut().outlined = items;
+                        obj.as_mut().publish_page_text();
+                        obj.as_mut().set_status(QString::from(&format!("{n} line{} of outlined text recognised", if n == 1 { "" } else { "s" })));
+                    }
+                    Err(e) => obj.as_mut().set_status(QString::from(&format!("Could not recognise the outlined text: {e:#}"))),
+                }
+            });
+        });
     }
 
     pub fn undo_edit(mut self: Pin<&mut Self>) {
         if *self.edit_busy() || *self.busy() {
             return;
         }
+        self.as_mut().drop_pending();
         let Ok(i) = usize::try_from(*self.selected()) else { return };
         let undone = match self.as_mut().rust_mut().queue.get_mut(i) {
             Some(item) => match item.versions.pop() {
                 Some(v) => {
-                    let _ = std::fs::remove_file(v);
+                    item.redo.push(v);
                     if item.status == ItemStatus::Done {
                         item.status = ItemStatus::Waiting;
                         item.progress = 0.0;
@@ -1179,22 +1562,55 @@ impl qobject::Converter {
         }
     }
 
+    pub fn redo_edit(mut self: Pin<&mut Self>) {
+        if *self.edit_busy() || *self.busy() {
+            return;
+        }
+        self.as_mut().drop_pending();
+        let Ok(i) = usize::try_from(*self.selected()) else { return };
+        let redone = match self.as_mut().rust_mut().queue.get_mut(i) {
+            Some(item) => match item.redo.pop() {
+                Some(v) => {
+                    item.versions.push(v);
+                    true
+                }
+                None => false,
+            },
+            None => false,
+        };
+        if redone {
+            self.as_mut().set_status(QString::from("Edit redone"));
+            self.as_mut().sync_queue();
+            let page = *self.preview_page();
+            self.show_page(page);
+        }
+    }
+
     pub fn save_edited_pdf(mut self: Pin<&mut Self>, url: &QUrl) {
         let Some(mut path) = url_to_path(url) else { return };
         if path.extension().is_none_or(|e| !e.eq_ignore_ascii_case("pdf")) {
             path.set_extension("pdf");
         }
         let Some(source) = self.selected_source() else { return };
-        let msg = if path == source {
-            "Choose another file name".to_string()
-        } else {
-            match std::fs::copy(&source, &path) {
-                Ok(_) => format!("Saved {}", path.display()),
-                Err(e) => format!("Could not save {}: {e}", path.display()),
-            }
-        };
-        self.as_mut().append_log(&msg);
-        self.as_mut().set_status(QString::from(&msg));
+        if path == source {
+            self.as_mut().set_status(QString::from("Choose another file name"));
+            return;
+        }
+        let password = opt_string(self.password());
+        self.as_mut().set_status(QString::from("Saving the PDF…"));
+        let qt_thread = self.qt_thread();
+        std::thread::spawn(move || {
+            // Without the earlier revisions: removed text is really gone.
+            let result = pdf2word_core::edit::compact(&source, password.as_deref(), &path, None).or_else(|_| std::fs::copy(&source, &path).map(|_| ()).map_err(anyhow::Error::from));
+            let _ = qt_thread.queue(move |mut obj| {
+                let msg = match result {
+                    Ok(()) => format!("Saved {}", path.display()),
+                    Err(e) => format!("Could not save {}: {e:#}", path.display()),
+                };
+                obj.as_mut().append_log(&msg);
+                obj.as_mut().set_status(QString::from(&msg));
+            });
+        });
     }
 
     pub fn save_settings(&self) {

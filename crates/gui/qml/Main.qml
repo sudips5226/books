@@ -19,7 +19,53 @@ ApplicationWindow {
     readonly property color subtle: dark ? "#9aa4b2" : "#5f6b7a"
     readonly property var queue: JSON.parse(conv.queueJson)
     readonly property var structure: JSON.parse(conv.structureJson)
-    readonly property var textItems: JSON.parse(conv.textItemsJson)
+    readonly property var pageText: JSON.parse(conv.pageTextJson)
+    readonly property var textItems: pageText.items || []
+    readonly property var paragraphs: pageText.paragraphs || []
+    // Edit whole paragraphs instead of single lines.
+    property bool paragraphMode: false
+    // Runs selected with Ctrl/Shift-click.
+    property var selection: []
+    // The run (or paragraph) in the on-page editor, -1 for none.
+    property int editIndex: -1
+    // Open the editor on this run once the page has been read again (Tab).
+    property int nextAfterEdit: -1
+    readonly property var editTarget: editIndex < 0 ? null : (paragraphMode ? paragraphs[editIndex] : textItems[editIndex])
+
+    function openEditor(i) {
+        var t = paragraphMode ? paragraphs[i] : textItems[i]
+        if (!t)
+            return
+        editIndex = i
+        editor.load(t)
+    }
+    function closeEditor(cancelPreview) {
+        editIndex = -1
+        if (cancelPreview)
+            conv.cancelPreview()
+    }
+    function toggleSelected(i) {
+        var s = selection.slice()
+        var k = s.indexOf(i)
+        if (k >= 0) s.splice(k, 1); else s.push(i)
+        selection = s
+    }
+    function esc(t) {
+        return String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    }
+    onPageTextChanged: {
+        selection = []
+        if (nextAfterEdit >= 0) {
+            var n = nextAfterEdit
+            nextAfterEdit = -1
+            if (n < (paragraphMode ? paragraphs.length : textItems.length))
+                openEditor(n)
+            else
+                editIndex = -1
+        } else if (editIndex >= 0 && !conv.previewing) {
+            editIndex = -1
+        }
+    }
 
     // Colours of the structure overlay.
     readonly property var kindColors: ({
@@ -78,52 +124,6 @@ ApplicationWindow {
         onAccepted: conv.saveEditedPdf(selectedFile)
     }
 
-    // Change or delete a run of text.
-    Dialog {
-        id: editDialog
-        property int itemIndex: -1
-        property var item: ({})
-        title: "Edit text"
-        modal: true
-        anchors.centerIn: parent
-        width: Math.min(window.width - 80, 640)
-        standardButtons: Dialog.Ok | Dialog.Cancel
-        onOpened: { editField.forceActiveFocus(); editField.selectAll() }
-        onAccepted: conv.replaceText(itemIndex, editField.text, fitBox.checked)
-
-        ColumnLayout {
-            anchors.fill: parent
-            spacing: 8
-            Label {
-                text: (editDialog.item.font || "") + " · " + (editDialog.item.size || 0) + " pt"
-                      + (editDialog.item.bold ? " · bold" : "") + (editDialog.item.italic ? " · italic" : "")
-                      + (editDialog.item.invisible ? " · invisible (OCR text layer)" : "")
-                color: window.subtle
-            }
-            TextField {
-                id: editField
-                Layout.fillWidth: true
-                onAccepted: editDialog.accept()
-            }
-            CheckBox {
-                id: fitBox
-                text: "Keep within the original width (condense longer text)"
-                checked: true
-            }
-            Label {
-                Layout.fillWidth: true
-                wrapMode: Text.WordWrap
-                font.pointSize: 9
-                color: window.subtle
-                text: "The text keeps its font when the PDF contains the needed letters; otherwise the changed letters use a similar installed font."
-            }
-            Button {
-                text: "Delete this text"
-                onClicked: { conv.deleteText(editDialog.itemIndex); editDialog.close() }
-            }
-        }
-    }
-
     // Add new text where the page was clicked.
     Dialog {
         id: insertDialog
@@ -167,26 +167,79 @@ ApplicationWindow {
         }
     }
 
-    // Replace text throughout the document.
+    // Find, tick the matches to change, replace.
     Dialog {
         id: findDialog
         title: "Find and replace in the PDF"
-        modal: true
+        modal: false
         anchors.centerIn: parent
-        width: Math.min(window.width - 80, 560)
-        standardButtons: Dialog.Ok | Dialog.Cancel
+        width: Math.min(window.width - 80, 680)
+        height: Math.min(window.height - 80, 540)
+        standardButtons: Dialog.Close
+        readonly property var results: JSON.parse(conv.findJson)
+        property var unticked: ({})
         onOpened: findField.forceActiveFocus()
-        onAccepted: conv.findReplace(findField.text, replaceField.text)
+        onResultsChanged: unticked = ({})
+        function search() {
+            if (findField.text.length > 0)
+                conv.findText(findField.text, matchCase.checked, wholeWord.checked)
+        }
+        function ticked() {
+            var v = []
+            for (var k = 0; k < results.length; k++)
+                if (!unticked[results[k].i]) v.push(results[k].i)
+            return v
+        }
 
-        GridLayout {
+        ColumnLayout {
             anchors.fill: parent
-            columns: 2
-            columnSpacing: 8
-            rowSpacing: 8
-            Label { text: "Find" }
-            TextField { id: findField; Layout.fillWidth: true }
-            Label { text: "Replace with" }
-            TextField { id: replaceField; Layout.fillWidth: true; onAccepted: findDialog.accept() }
+            spacing: 8
+            RowLayout {
+                TextField { id: findField; Layout.fillWidth: true; placeholderText: "Find"; onAccepted: findDialog.search() }
+                Button { text: "Find"; enabled: !conv.findBusy && findField.text.length > 0; onClicked: findDialog.search() }
+            }
+            RowLayout {
+                CheckBox { id: matchCase; text: "Match case" }
+                CheckBox { id: wholeWord; text: "Whole words" }
+                Item { Layout.fillWidth: true }
+                BusyIndicator { running: conv.findBusy; visible: running; implicitHeight: 24; implicitWidth: 24 }
+                Label {
+                    color: window.subtle
+                    text: findDialog.results.length === 0 ? "" : findDialog.results.length + (findDialog.results.length === 1 ? " match" : " matches")
+                }
+            }
+            ListView {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                model: findDialog.results
+                ScrollBar.vertical: ScrollBar {}
+                delegate: CheckDelegate {
+                    required property var modelData
+                    width: ListView.view.width
+                    checked: !findDialog.unticked[modelData.i]
+                    onToggled: {
+                        var u = Object.assign({}, findDialog.unticked)
+                        u[modelData.i] = !checked
+                        findDialog.unticked = u
+                    }
+                    contentItem: Label {
+                        rightPadding: 28
+                        textFormat: Text.StyledText
+                        elide: Text.ElideRight
+                        text: "<font color='" + window.subtle + "'>p. " + modelData.page + "</font>  …" + window.esc(modelData.before)
+                              + "<b>" + window.esc(modelData.found) + "</b>" + window.esc(modelData.after) + "…"
+                    }
+                }
+            }
+            RowLayout {
+                TextField { id: replaceField; Layout.fillWidth: true; placeholderText: "Replace with" }
+                Button {
+                    text: "Replace ticked"
+                    enabled: findDialog.results.length > 0 && !conv.editBusy && !conv.busy
+                    onClicked: conv.replaceFound(JSON.stringify(findDialog.ticked()), replaceField.text)
+                }
+            }
         }
     }
 
@@ -294,7 +347,7 @@ ApplicationWindow {
                         }
                     }
 
-                    // Text runs that can be edited.
+                    // Text runs (or paragraphs) that can be edited.
                     Item {
                         id: editOverlay
                         visible: conv.editMode && preview.status === Image.Ready
@@ -302,13 +355,18 @@ ApplicationWindow {
                         y: preview.y + (preview.height - preview.paintedHeight) / 2
                         width: preview.paintedWidth
                         height: preview.paintedHeight
-                        enabled: !conv.editBusy && !conv.busy
+                        enabled: !conv.busy
 
                         // A click on empty space adds text there.
                         MouseArea {
                             anchors.fill: parent
                             cursorShape: Qt.IBeamCursor
                             onClicked: (mouse) => {
+                                if (window.editIndex >= 0) {
+                                    window.closeEditor(true)
+                                    return
+                                }
+                                window.selection = []
                                 insertDialog.px = mouse.x / width
                                 insertDialog.py = mouse.y / height
                                 insertDialog.open()
@@ -316,33 +374,257 @@ ApplicationWindow {
                         }
 
                         Repeater {
-                            model: window.textItems
+                            model: window.paragraphMode ? window.paragraphs : window.textItems
                             delegate: Rectangle {
+                                id: box
                                 required property var modelData
-                                x: modelData.x * editOverlay.width - 2
-                                y: modelData.y * editOverlay.height - 2
+                                required property int index
+                                readonly property bool outlined: !window.paragraphMode && modelData.outlined === true
+                                readonly property bool selected: !window.paragraphMode && window.selection.indexOf(index) >= 0
+                                readonly property bool current: window.editIndex === index
+                                property real dragX: 0
+                                property real dragY: 0
+                                x: modelData.x * editOverlay.width - 2 + dragX
+                                y: modelData.y * editOverlay.height - 2 + dragY
                                 width: Math.max(4, modelData.w * editOverlay.width + 4)
                                 height: Math.max(4, modelData.h * editOverlay.height + 4)
                                 radius: 2
-                                color: textHover.containsMouse ? Qt.rgba(0.17, 0.34, 0.6, 0.18) : Qt.rgba(0.17, 0.34, 0.6, 0.05)
-                                border.color: textHover.containsMouse ? window.accent : Qt.rgba(0.17, 0.34, 0.6, 0.35)
-                                border.width: textHover.containsMouse ? 2 : 1
+                                readonly property color tint: outlined ? "#e67e22" : window.accent
+                                color: Qt.rgba(tint.r, tint.g, tint.b, selected || current ? 0.22 : (textHover.containsMouse ? 0.16 : 0.05))
+                                border.color: selected || current || textHover.containsMouse ? tint : Qt.rgba(tint.r, tint.g, tint.b, 0.4)
+                                border.width: selected || current ? 2 : 1
 
                                 MouseArea {
                                     id: textHover
                                     anchors.fill: parent
                                     hoverEnabled: true
-                                    cursorShape: Qt.PointingHandCursor
-                                    onClicked: {
-                                        editDialog.itemIndex = modelData.i
-                                        editDialog.item = modelData
-                                        editField.text = modelData.text
-                                        editDialog.open()
+                                    cursorShape: dragging ? Qt.ClosedHandCursor : Qt.PointingHandCursor
+                                    property point start
+                                    property bool dragging: false
+                                    onPressed: (mouse) => { start = Qt.point(mouse.x, mouse.y); dragging = false }
+                                    onPositionChanged: (mouse) => {
+                                        if (!pressed || window.paragraphMode || box.outlined || conv.editBusy)
+                                            return
+                                        var dx = mouse.x - start.x, dy = mouse.y - start.y
+                                        if (!dragging && Math.abs(dx) + Math.abs(dy) > 5)
+                                            dragging = true
+                                        if (dragging) { box.dragX = dx; box.dragY = dy }
+                                    }
+                                    onReleased: (mouse) => {
+                                        if (dragging) {
+                                            conv.moveText(box.index, box.dragX / editOverlay.width, box.dragY / editOverlay.height)
+                                            dragging = false
+                                            return
+                                        }
+                                    }
+                                    onClicked: (mouse) => {
+                                        if (box.dragX !== 0 || box.dragY !== 0)
+                                            return
+                                        if (!window.paragraphMode && (mouse.modifiers & (Qt.ControlModifier | Qt.ShiftModifier | Qt.MetaModifier))) {
+                                            window.toggleSelected(box.index)
+                                            return
+                                        }
+                                        window.selection = []
+                                        window.openEditor(box.index)
                                     }
                                 }
-                                ToolTip.visible: textHover.containsMouse
-                                ToolTip.text: modelData.font + " · " + modelData.size + " pt — click to edit"
-                                ToolTip.delay: 400
+                                ToolTip.visible: textHover.containsMouse && window.editIndex < 0
+                                ToolTip.text: window.paragraphMode
+                                              ? "Paragraph, " + modelData.lines + (modelData.lines === 1 ? " line" : " lines") + " — click to edit"
+                                              : modelData.font + " · " + modelData.size + " pt — click to edit, drag to move, Ctrl-click to select"
+                                ToolTip.delay: 500
+                            }
+                        }
+                    }
+
+                    // The on-page editor, next to the text being changed.
+                    Pane {
+                        id: editor
+                        visible: conv.editMode && window.editTarget !== null && window.editTarget !== undefined
+                        z: 20
+                        padding: 10
+                        property var item: ({})
+                        property bool sizeTouched: false
+                        property string pickedColor: ""
+                        readonly property bool para: window.paragraphMode
+                        readonly property real tx: editOverlay.x + (window.editTarget ? window.editTarget.x * editOverlay.width : 0)
+                        readonly property real ty: editOverlay.y + (window.editTarget ? window.editTarget.y * editOverlay.height : 0)
+                        readonly property real th: window.editTarget ? window.editTarget.h * editOverlay.height : 0
+                        width: Math.min(stage.width - 8, Math.max(editorColumn.implicitWidth + 2 * padding, para ? 480 : 420, (window.editTarget ? window.editTarget.w * editOverlay.width : 0) + 40))
+                        x: Math.max(4, Math.min(tx - 10, stage.width - width - 4))
+                        // Above the text when there is room, else below it.
+                        y: ty - height - 8 >= 0 ? ty - height - 8 : Math.max(4, Math.min(stage.height - height - 4, ty + th + 8))
+                        background: Rectangle { color: window.palette.window; border.color: window.accent; border.width: 1.5; radius: 6 }
+
+                        function load(t) {
+                            item = t
+                            sizeTouched = false
+                            pickedColor = ""
+                            lineField.text = t.text
+                            paraField.text = t.text
+                            boldBtn.checked = t.bold === true
+                            italicBtn.checked = t.italic === true
+                            sizeBox.value = Math.round(t.size || 11)
+                            if (para) paraField.forceActiveFocus(); else { lineField.forceActiveFocus(); lineField.selectAll() }
+                        }
+                        function text() { return para ? paraField.text : lineField.text }
+                        function styleJson() {
+                            var st = {}
+                            if (boldBtn.checked !== (item.bold === true)) st.bold = boldBtn.checked
+                            if (italicBtn.checked !== (item.italic === true)) st.italic = italicBtn.checked
+                            if (sizeTouched) st.size = sizeBox.value
+                            if (pickedColor.length > 0) st.color = pickedColor
+                            return JSON.stringify(st)
+                        }
+                        function changed() {
+                            return text() !== item.text || styleJson() !== "{}"
+                        }
+                        function schedulePreview() {
+                            if (visible && changed()) previewTimer.restart()
+                        }
+                        function apply(next) {
+                            previewTimer.stop()
+                            if (!changed()) {
+                                if (next >= 0) window.openEditor(next); else window.closeEditor(true)
+                                return
+                            }
+                            window.nextAfterEdit = next
+                            if (para)
+                                conv.editParagraph(window.editIndex, paraField.text, fitBox.checked, pushBox.checked)
+                            else
+                                conv.editRun(window.editIndex, lineField.text, fitBox.checked, styleJson())
+                            if (next < 0) window.editIndex = -1
+                        }
+                        Timer {
+                            id: previewTimer
+                            interval: 700
+                            onTriggered: {
+                                if (!editor.visible) return
+                                if (editor.para)
+                                    conv.previewParagraph(window.editIndex, paraField.text, fitBox.checked, pushBox.checked)
+                                else
+                                    conv.previewRun(window.editIndex, lineField.text, fitBox.checked, editor.styleJson())
+                            }
+                        }
+
+                        ColumnLayout {
+                            id: editorColumn
+                            anchors.fill: parent
+                            spacing: 6
+                            RowLayout {
+                                Label {
+                                    Layout.fillWidth: true
+                                    elide: Text.ElideRight
+                                    color: window.subtle
+                                    font.pointSize: 9
+                                    text: editor.para
+                                          ? "Paragraph · " + (editor.item.lines || 1) + " lines · " + (editor.item.align || "")
+                                          : (editor.item.font || "") + " · " + (editor.item.size || 0) + " pt" + (editor.item.outlined ? " · recognised from outlines" : "")
+                                }
+                                Label {
+                                    visible: conv.previewing
+                                    text: "Preview"
+                                    color: "white"
+                                    font.pointSize: 8
+                                    padding: 2
+                                    leftPadding: 6
+                                    rightPadding: 6
+                                    background: Rectangle { color: window.accent; radius: 3 }
+                                }
+                            }
+                            TextField {
+                                id: lineField
+                                visible: !editor.para
+                                Layout.fillWidth: true
+                                Layout.preferredWidth: 380
+                                font.bold: boldBtn.checked
+                                font.italic: italicBtn.checked
+                                horizontalAlignment: editor.item.rtl ? Text.AlignRight : Text.AlignLeft
+                                onTextEdited: editor.schedulePreview()
+                                onAccepted: editor.apply(-1)
+                                Keys.onEscapePressed: window.closeEditor(true)
+                                Keys.onTabPressed: editor.apply(window.editIndex + 1 < window.textItems.length ? window.editIndex + 1 : -1)
+                                Keys.onBacktabPressed: editor.apply(window.editIndex > 0 ? window.editIndex - 1 : -1)
+                            }
+                            ScrollView {
+                                id: paraScroll
+                                visible: editor.para
+                                Layout.fillWidth: true
+                                Layout.preferredWidth: 440
+                                Layout.preferredHeight: 130
+                                contentWidth: availableWidth
+                                TextArea {
+                                    id: paraField
+                                    wrapMode: TextEdit.Wrap
+                                    horizontalAlignment: editor.item.align === "right" ? Text.AlignRight : Text.AlignLeft
+                                    onTextChanged: editor.schedulePreview()
+                                    Keys.onEscapePressed: window.closeEditor(true)
+                                    Keys.onReturnPressed: (event) => {
+                                        if (event.modifiers & Qt.ControlModifier) editor.apply(-1); else event.accepted = false
+                                    }
+                                }
+                            }
+                            RowLayout {
+                                spacing: 4
+                                visible: !editor.para
+                                ToolButton { id: boldBtn; text: "B"; font.bold: true; checkable: true; onToggled: editor.schedulePreview(); ToolTip.text: "Bold"; ToolTip.visible: hovered }
+                                ToolButton { id: italicBtn; text: "I"; font.italic: true; checkable: true; onToggled: editor.schedulePreview(); ToolTip.text: "Italic"; ToolTip.visible: hovered }
+                                SpinBox {
+                                    id: sizeBox
+                                    from: 4
+                                    to: 144
+                                    editable: true
+                                    implicitWidth: 96
+                                    onValueModified: { editor.sizeTouched = true; editor.schedulePreview() }
+                                }
+                                Label { text: "pt"; color: window.subtle }
+                                Repeater {
+                                    model: ["#000000", "#1f4e79", "#c00000", "#2e7d32", "#7030a0", "#808080"]
+                                    delegate: Rectangle {
+                                        required property string modelData
+                                        width: 18
+                                        height: 18
+                                        radius: 9
+                                        color: modelData
+                                        border.width: editor.pickedColor === modelData ? 3 : 1
+                                        border.color: editor.pickedColor === modelData ? window.accent : "#999999"
+                                        MouseArea {
+                                            anchors.fill: parent
+                                            onClicked: { editor.pickedColor = editor.pickedColor === parent.modelData ? "" : parent.modelData; editor.schedulePreview() }
+                                        }
+                                    }
+                                }
+                            }
+                            RowLayout {
+                                CheckBox {
+                                    id: fitBox
+                                    text: editor.para ? "Make smaller to fit" : "Keep within the width"
+                                    checked: !editor.para
+                                    onToggled: editor.schedulePreview()
+                                }
+                                CheckBox {
+                                    id: pushBox
+                                    visible: editor.para
+                                    text: "Move the text below down"
+                                    checked: true
+                                    onToggled: editor.schedulePreview()
+                                }
+                                Item { Layout.fillWidth: true }
+                                Button {
+                                    text: "Delete"
+                                    visible: !editor.para
+                                    onClicked: { var i = window.editIndex; window.closeEditor(false); conv.deleteItems(JSON.stringify([i])) }
+                                }
+                                Button { text: "Cancel"; onClicked: window.closeEditor(true) }
+                                Button { text: "Apply"; highlighted: true; enabled: !conv.editBusy; onClicked: editor.apply(-1) }
+                            }
+                            Label {
+                                Layout.fillWidth: true
+                                wrapMode: Text.WordWrap
+                                font.pointSize: 8
+                                color: window.subtle
+                                text: editor.para ? "Ctrl+Enter applies · Esc cancels · the paragraph wraps over as many lines as it needs"
+                                                  : "Enter applies · Tab applies and edits the next line · Esc cancels"
                             }
                         }
                     }
@@ -351,7 +633,7 @@ ApplicationWindow {
                         anchors.right: parent.right
                         anchors.top: parent.top
                         anchors.margins: 8
-                        running: conv.editBusy
+                        running: conv.editBusy || conv.ocrBusy
                         visible: running
                     }
 
@@ -410,29 +692,78 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     visible: conv.editMode && conv.pageCount > 0
                     spacing: 6
+                    ButtonGroup { id: unitGroup }
+                    Button {
+                        text: "Lines"
+                        checkable: true
+                        checked: !window.paragraphMode
+                        ButtonGroup.group: unitGroup
+                        onClicked: { window.closeEditor(true); window.paragraphMode = false }
+                    }
+                    Button {
+                        text: "Paragraphs"
+                        checkable: true
+                        checked: window.paragraphMode
+                        ButtonGroup.group: unitGroup
+                        onClicked: { window.closeEditor(true); window.paragraphMode = true }
+                    }
                     Label {
                         Layout.fillWidth: true
                         elide: Text.ElideRight
                         color: window.subtle
-                        text: conv.editCount > 0
-                              ? conv.editCount + (conv.editCount === 1 ? " change" : " changes") + " — converting uses the edited PDF"
-                              : "Click a line to change it, or empty space to add text"
+                        text: window.selection.length > 0 ? window.selection.length + " selected"
+                              : conv.editCount > 0 ? conv.editCount + (conv.editCount === 1 ? " change" : " changes") + " — converting uses the edited PDF"
+                              : "Click text to change it, empty space to add text"
+                    }
+                    Button {
+                        text: conv.ocrBusy ? "Recognising…" : "Recognise outlined text"
+                        visible: (window.pageText.outlined || 0) > 0 && !window.pageText.recognised
+                        enabled: !conv.ocrBusy
+                        onClicked: conv.recognizeOutlined()
+                        ToolTip.text: "Letters on this page are drawn as shapes. Recognise them (OCR) to edit them."
+                        ToolTip.visible: hovered
+                    }
+                    Button {
+                        text: "Delete selected"
+                        visible: window.selection.length > 0
+                        enabled: !conv.editBusy
+                        onClicked: { conv.deleteItems(JSON.stringify(window.selection)); window.selection = [] }
                     }
                     Button {
                         text: "Find and replace…"
-                        enabled: !conv.editBusy && !conv.busy
+                        enabled: !conv.busy
                         onClicked: findDialog.open()
                     }
                     Button {
                         text: "Undo"
                         enabled: conv.editCount > 0 && !conv.editBusy && !conv.busy
-                        onClicked: conv.undoEdit()
+                        onClicked: { window.closeEditor(false); conv.undoEdit() }
+                    }
+                    Button {
+                        text: "Redo"
+                        enabled: conv.redoCount > 0 && !conv.editBusy && !conv.busy
+                        onClicked: { window.closeEditor(false); conv.redoEdit() }
                     }
                     Button {
                         text: "Save PDF…"
                         enabled: conv.editCount > 0 && !conv.editBusy
                         onClicked: savePdfDialog.open()
                     }
+                }
+                Shortcut {
+                    sequences: [StandardKey.Undo]
+                    enabled: conv.editMode && window.editIndex < 0 && conv.editCount > 0
+                    onActivated: conv.undoEdit()
+                }
+                Shortcut {
+                    sequences: [StandardKey.Redo]
+                    enabled: conv.editMode && window.editIndex < 0 && conv.redoCount > 0
+                    onActivated: conv.redoEdit()
+                }
+                Shortcut {
+                    sequences: [StandardKey.Delete]
+                    enabled: conv.editMode && window.editIndex < 0 && window.selection.length > 0
+                    onActivated: { conv.deleteItems(JSON.stringify(window.selection)); window.selection = [] }
                 }
 
                 // Legend of the overlay.
@@ -933,32 +1264,69 @@ ApplicationWindow {
             Qt.quit()
         })
     }
-    // PDF2WORD_EDIT_DEMO="text": turns on editing and replaces the first text run.
+    // PDF2WORD_EDIT_DEMO="text": turns on editing, replaces the first text run
+    // and opens the editor on the second.
     Timer {
         running: conv.editDemo.length > 0
         interval: 2500
         onTriggered: conv.enableEditing(true)
     }
+    readonly property bool paraDemo: conv.editDemo.startsWith("para:")
+    readonly property bool ocrDemo: conv.editDemo === "ocr"
+    readonly property bool findDemo: conv.editDemo.startsWith("find:")
     Timer {
-        running: conv.editDemo.length > 0
-        interval: 4000
-        onTriggered: conv.replaceText(0, conv.editDemo, true)
+        running: window.findDemo
+        interval: 3500
+        onTriggered: {
+            findDialog.open()
+            findField.text = conv.editDemo.substring(5)
+            findDialog.search()
+        }
     }
     Timer {
-        running: conv.editDemo.length > 0
+        running: window.ocrDemo
+        interval: 4000
+        onTriggered: conv.recognizeOutlined()
+    }
+    Timer {
+        running: window.ocrDemo
+        interval: 8000
+        onTriggered: window.openEditor(window.textItems.length - 1)
+    }
+    Timer {
+        running: conv.editDemo.length > 0 && !window.paraDemo && !window.ocrDemo && !window.findDemo
+        interval: 4000
+        onTriggered: conv.editRun(0, conv.editDemo, true, "{}")
+    }
+    Timer {
+        running: window.paraDemo
+        interval: 4000
+        onTriggered: {
+            window.paragraphMode = true
+            var k = 0
+            for (var i = 0; i < window.paragraphs.length; i++)
+                if (window.paragraphs[i].lines > window.paragraphs[k].lines) k = i
+            window.openEditor(k)
+            paraField.text = paraField.text + " " + conv.editDemo.substring(5)
+            editor.schedulePreview()
+        }
+    }
+    Timer {
+        running: conv.editDemo.length > 0 && !window.paraDemo && !window.ocrDemo && !window.findDemo
         interval: 7500
         onTriggered: {
             if (window.textItems.length > 1) {
-                editDialog.itemIndex = 1
-                editDialog.item = window.textItems[1]
-                editField.text = window.textItems[1].text
-                editDialog.open()
+                window.openEditor(1)
+                editor.sizeTouched = true
+                sizeBox.value = sizeBox.value + 4
+                boldBtn.checked = true
+                editor.schedulePreview()
             }
         }
     }
     Timer {
         running: conv.screenshotPath.length > 0
-        interval: conv.editDemo.length > 0 ? 9000 : 6000
+        interval: conv.editDemo.length > 0 ? 10500 : 6000
         onTriggered: conv.autoConvert ? conv.convert() : window.screenshot()
     }
     Connections {

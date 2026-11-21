@@ -122,10 +122,11 @@ impl FontData {
         ttf_parser::Face::parse(&self.bytes, self.index).ok()
     }
 
-    /// TrueType outlines whose licence allows embedding into a document.
+    /// TrueType or CFF outlines whose licence allows embedding into a document.
     pub fn embeddable(&self) -> bool {
         self.face().is_some_and(|f| {
-            f.tables().glyf.is_some() && !matches!(f.permissions(), Some(ttf_parser::Permissions::Restricted))
+            let t = f.tables();
+            (t.glyf.is_some() || t.cff.is_some()) && t.cff2.is_none() && !matches!(f.permissions(), Some(ttf_parser::Permissions::Restricted))
         })
     }
 

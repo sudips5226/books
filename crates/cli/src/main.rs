@@ -124,6 +124,19 @@ struct Args {
     #[arg(long = "replace", value_name = "OLD=NEW")]
     replace: Vec<String>,
 
+    /// With --replace: only occurrences with the same upper and lower case.
+    #[arg(long)]
+    match_case: bool,
+
+    /// With --replace: only whole words.
+    #[arg(long)]
+    whole_word: bool,
+
+    /// With --replace: keep the earlier revisions in the file (an incremental
+    /// update, faster for big files) instead of rewriting it without them.
+    #[arg(long)]
+    keep_history: bool,
+
     /// Path to the PDFium shared library (file or directory).
     #[arg(long)]
     pdfium: Option<PathBuf>,
@@ -150,19 +163,24 @@ fn replace_text(args: &Args) -> anyhow::Result<()> {
     for (i, pair) in args.replace.iter().enumerate() {
         let Some((old, new)) = pair.split_once('=') else { bail!("--replace expects OLD=NEW, got '{pair}'") };
         let next = tmp.join(format!("step{i}.pdf"));
-        let (n, report) = pdf2word_core::edit::find_replace(&current, args.password.as_deref(), old, new, &next, args.pdfium.as_deref())?;
+        let opts = pdf2word_core::edit::FindOptions { match_case: args.match_case, whole_word: args.whole_word };
+        let (n, report) = pdf2word_core::edit::find_replace(&current, args.password.as_deref(), old, new, opts, &next, args.pdfium.as_deref())?;
         for note in report.notes {
             log::warn!("{note}");
         }
         if !args.quiet {
-            log::info!("'{old}' → '{new}': {n} text run(s) changed");
+            log::info!("'{old}' → '{new}': {n} occurrence(s) replaced");
         }
         total += n;
         if n > 0 {
             current = next;
         }
     }
-    std::fs::copy(&current, &output).with_context(|| format!("cannot write {}", output.display()))?;
+    if args.keep_history || total == 0 {
+        std::fs::copy(&current, &output).with_context(|| format!("cannot write {}", output.display()))?;
+    } else {
+        pdf2word_core::edit::compact(&current, args.password.as_deref(), &output, args.pdfium.as_deref())?;
+    }
     let _ = std::fs::remove_dir_all(&tmp);
     if !args.quiet {
         log::info!("wrote {} ({total} change(s))", output.display());

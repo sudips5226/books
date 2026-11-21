@@ -8,9 +8,10 @@ layout and formatting of the original, including scanned pages through OCR.
 * **PDFium** (via [`pdfium-render`](https://crates.io/crates/pdfium-render)) parses and renders PDFs.
 * **Tesseract** OCR for scanned pages, linked through its stable C API.
 * A purpose-built WordprocessingML writer: no Office, LibreOffice or other runtime needed.
-* **Text editing in the PDF itself**: correct a word, delete or add text, or
-  find and replace throughout the document, then save the corrected PDF (or
-  convert it to Word).
+* **Text editing in the PDF itself**: change, restyle, move, delete or add
+  text, rewrite whole paragraphs (they re-wrap), find and replace, edit
+  Hebrew/Arabic and text drawn as vector outlines (recognised with OCR), then
+  save the corrected PDF (or convert it to Word).
 
 ## What is preserved
 
@@ -68,7 +69,8 @@ Three layout modes:
 ```
 
 * `crates/core`: the library (`convert()`, `inspect()`, `render_page_png()`, `page_structure()`, progress events, cancellation;
-  `edit::text_items()`, `edit::apply_edits()`, `edit::find_replace()` for editing PDFs).
+  `edit::page_text()`, `edit::outlined_text()`, `edit::apply_edits()`, `edit::find_text()`, `edit::replace_matches()`,
+  `edit::compact()` for editing PDFs).
   Modules: `extract` (PDFium), `annots` (outline, link targets, annotations, form fields),
   `ocr` and `scan` (Tesseract, straightening, language), `layout` (reconstruction, bidi, text boxes, tables),
   `structure` (headers/footers, lists, footnotes, styles), `navigate` (outline, links, TOC, comments, controls),
@@ -186,10 +188,18 @@ Choose the layout mode and the content, structure and OCR options; they are
 remembered for the next start. Conversions run in the background and can be
 cancelled.
 
-**Edit text** outlines the page's lines of text: click one to change or
-delete it, or click empty space to add text (font family, size, bold,
-italic). **Find and replace…** changes a word everywhere in the document,
-**Undo** takes edits back one by one and **Save PDF…** writes the corrected
+**Edit text** outlines the page's text. In **Lines** mode click a line: an
+editor opens next to it where the text, bold, italic, size and colour can be
+changed, with a live preview of the page; Enter applies, Tab applies and
+moves to the next line, Esc cancels. Drag a line to move it; Ctrl-click
+several lines and press Delete to remove them. In **Paragraphs** mode click a
+paragraph to rewrite it: it wraps over as many lines as it needs, and the
+text below moves down (or the paragraph gets smaller to fit). Click empty
+space to add text. **Recognise outlined text** appears on pages whose
+letters are drawn as shapes, and makes them editable too. **Find and
+replace…** lists every match (also across line breaks and hyphenated words,
+optionally matching case or whole words) to tick before replacing. **Undo**
+and **Redo** step through the edits, and **Save PDF…** writes the corrected
 PDF. A file with edits shows ✎ in the list, and converting it uses the
 edited version.
 
@@ -203,16 +213,36 @@ start and end of the line are kept as they were too.
 * New text keeps the **original font** when the PDF is known to contain the
   needed letters. PDFs usually embed only the letters they use, so this is
   learned from the characters the font draws anywhere in the document; fonts
-  that are not embedded can show any letter of their encoding.
+  that are not embedded can show any letter of their encoding, and fonts
+  embedded in full any letter of their program (the font's widths and text
+  mapping are extended).
 * Letters the font lacks are set in a **similar installed font** (the same
   family if installed, then a metric-compatible clone such as Liberation
   Sans for Arial, then a generic serif/sans/monospace font, then any font
-  with the letters), which is embedded into the PDF. The app says when this
-  happens.
-* **Keep within the original width** condenses longer text (down to half
-  its width) so it does not run into what follows. Otherwise text after the
-  edit on the same line moves along, as in a word processor.
+  with the letters; the app says when this happens), shaped
+  (kerning, ligatures, Arabic joining, Indic scripts) and embedded as a
+  **subset** of the glyphs used, so a correction adds kilobytes, not the whole
+  font. TrueType and CFF/OpenType fonts are used.
+* **Right-to-left text** is written in display order (Unicode bidi), keeps its
+  right edge, and mixes with left-to-right words.
+* **Restyling** uses the installed bold/italic face of the family when there
+  is one, else a synthetic bold (stroked outline) or slant. **Moving** text
+  keeps its exact glyphs and spacing.
+* **Paragraphs** are rebuilt line by line with their alignment (left, right,
+  centred, justified), first-line indent and line spacing; unchanged words
+  keep their fonts and colours, new words take the style of the word before.
+* **Keep within the width** condenses longer text (down to half its width).
+  Otherwise text after the edit on the same line moves along.
+* Text inside **form XObjects** is edited in a copy of the form used only at
+  that place, so other pages using the same form keep it.
+* **Outlined text** (letters converted to vector shapes, common in print and
+  design exports) is recognised with Tesseract; editing removes the shapes of
+  those letters and writes real text in an installed font of the recognised
+  style, size and colour.
 * Text in OCR text layers (invisible text) can be corrected the same way.
+* Edits are saved as **incremental updates** (fast, the original bytes are
+  kept); **Save PDF…** writes a compacted file without the earlier revisions,
+  so removed text is really gone.
 
 ### Command line
 
@@ -235,7 +265,9 @@ Run `pdf2word --help` for all options. Content: `--no-images`, `--no-figures`,
 document among the installed languages), `--ocr-dpi`, `--ocr-font`,
 `--tessdata`, `--no-straighten`, `--no-picture-text`, `--threads`. Also
 `--password` and `--pdfium`. With `--replace OLD=NEW` (repeatable) the PDF's
-text is corrected and a PDF is written instead (default `<input>-edited.pdf`).
+text is corrected and a PDF is written instead (default `<input>-edited.pdf`);
+`--match-case` and `--whole-word` narrow the matches, and `--keep-history`
+writes an incremental update instead of a compacted file.
 
 ### Library
 
@@ -328,10 +360,12 @@ The CI runs it on every push and reports drops against `eval/baseline.json`
   Very short words inherit bold or italic from their line. Automatic language
   detection chooses among the installed languages only.
 * **Right-to-left** lists are kept as plain text, without hanging indents.
-* **PDF text editing** works on whole lines (runs of the same font), not on
-  paragraphs: text does not re-wrap to the next line. Hebrew, Arabic and other
-  right-to-left text cannot be edited yet (it would need reordering and
-  shaping), nor text inside form XObjects (some PDFs draw whole pages that
-  way) or vertical text. Replacement letters missing from an embedded font
-  subset come from an installed font, so they can look different. Saving
-  rewrites the file, which invalidates digital signatures.
+* **PDF text editing.** Letters missing from an embedded font subset come from
+  an installed font, so they can look different (Arabic and other scripts
+  that join letters always use an installed font). Paragraph detection is
+  heuristic: lines of one paragraph that are far apart or in different sizes
+  are edited separately. Pushing text down when a paragraph grows moves only
+  the text of its column, and only when there is room above the next picture
+  or the page margin. Outlined text is recognised by OCR: the font is chosen
+  by style (serif, sans, monospace), not by name. Vertical text is not
+  edited. Editing invalidates digital signatures.

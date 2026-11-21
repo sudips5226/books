@@ -18,6 +18,8 @@ pdfium-render = { version = "0.9", default-features = false, features = ["pdfium
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 ttf-parser = "0.25"
+subsetter = "0.2.6"
+rustybuzz = "0.20.1"
 unicode-normalization = "0.1"
 unicode-bidi = "0.3"
 lopdf = { version = "0.47", default-features = false }
