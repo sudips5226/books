@@ -83,6 +83,11 @@ impl PageTransform {
         }
     }
 
+    /// An unrotated page with this crop box.
+    pub(crate) fn plain(x0: f32, y0: f32, w: f32, h: f32) -> Self {
+        Self { rot: 0, page_rot: 0, ox: x0, oy: y0, w0: w, h0: h }
+    }
+
     pub fn width(&self) -> f32 {
         if self.rot % 2 == 1 { self.h0 } else { self.w0 }
     }

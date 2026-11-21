@@ -421,8 +421,14 @@ pub(crate) struct Para {
 
 /// Joins runs into lines (same baseline, side by side).
 pub(crate) fn group_lines(texts: &[String], geoms: &[RunGeom], containers: &[Vec<usize>]) -> Vec<Line> {
+    group_lines_of(&(0..geoms.len()).collect::<Vec<_>>(), texts, geoms, containers)
+}
+
+/// Joins some of the runs (indices in content order) into lines.
+pub(crate) fn group_lines_of(runs: &[usize], texts: &[String], geoms: &[RunGeom], containers: &[Vec<usize>]) -> Vec<Line> {
     let mut lines: Vec<Line> = Vec::new();
-    for (i, g) in geoms.iter().enumerate() {
+    for &i in runs {
+        let g = &geoms[i];
         if let Some(l) = lines.last_mut() {
             let last = &geoms[*l.runs.last().unwrap()];
             let size = l.size.max(g.size).max(1.0);
@@ -506,7 +512,7 @@ pub(crate) fn group_paragraphs(lines: &[Line], geoms: &[RunGeom], containers: &[
     groups.into_iter().map(|g| make_para(lines, g, geoms, texts)).filter(|p| !p.text.trim().is_empty()).collect()
 }
 
-fn make_para(lines: &[Line], g: Vec<usize>, geoms: &[RunGeom], texts: &[String]) -> Para {
+pub(crate) fn make_para(lines: &[Line], g: Vec<usize>, geoms: &[RunGeom], texts: &[String]) -> Para {
     let left = g.iter().map(|k| lines[*k].left).fold(f64::MAX, f64::min);
     let right = g.iter().map(|k| lines[*k].right).fold(f64::MIN, f64::max);
     let top = g.iter().flat_map(|k| lines[*k].runs.iter().map(|r| geoms[*r].top)).fold(f64::MAX, f64::min);

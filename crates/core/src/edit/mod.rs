@@ -17,8 +17,10 @@
 //! rewrites a file without its earlier revisions.
 
 mod content;
+mod flow;
 mod fonts;
 mod objects;
+mod tables;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -29,9 +31,10 @@ use pdfium_render::prelude::*;
 
 use content::{apply, apply_vec, fmt, fmt_mat, invert, mul, neutralize, quote_prefix, resume, tj_ops, translate, write_name, x_scale, Mat, Scan, Show, Tok, IDENTITY};
 use fonts::{deref, encode_in_font, fallback_pieces, fallback_text, installed_variant, is_rtl, needs_shaping, pieces_advance, resource_fonts, split_codes, Ctx, FontMeta, Piece};
-use objects::{group_lines, group_paragraphs, group_runs, page_objects, run_geom, run_text, Line, PObj, PageObjects, Para, RunGeom, Src};
+use objects::{group_lines, group_lines_of, group_paragraphs, group_runs, page_objects, run_geom, run_text, Line, PObj, PageObjects, Para, RunGeom, Src};
 
 pub use objects::{Align, ObjPath};
+pub use tables::{TableCell, TableInfo};
 
 use crate::extract::PageTransform;
 
@@ -96,6 +99,8 @@ pub struct PageText {
     /// text): [`outlined_text`] can recognise them.
     pub outlined_shapes: usize,
     pub images: Vec<ImageItem>,
+    /// Data tables, with their cells ([`TextEdit::Cell`] edits a cell).
+    pub tables: Vec<TableInfo>,
 }
 
 /// A picture on a page.
@@ -167,8 +172,14 @@ pub enum TextEdit {
     /// Rewrites a paragraph (all its runs) with new text, wrapping it over as
     /// many lines as it needs. With `fit` the text is made smaller instead of
     /// taking more lines; with `push_down` the text below moves down when the
-    /// paragraph grows.
-    Paragraph { page: usize, objects: Vec<ObjPath>, text: String, fit: bool, push_down: bool },
+    /// paragraph grows; with `flow` lines that no longer fit in the column
+    /// move on to the next column and page (pages are added when needed).
+    /// A `\n` in `text` starts a new line.
+    Paragraph { page: usize, objects: Vec<ObjPath>, text: String, fit: bool, push_down: bool, flow: bool },
+    /// Rewrites the text of a table cell ([`TableCell`]), wrapping it inside
+    /// the cell's box (fractions of the displayed page). With `fit` the text
+    /// is made smaller when it would not fit the cell. A `\n` starts a new line.
+    Cell { page: usize, x: f32, y: f32, w: f32, h: f32, objects: Vec<ObjPath>, text: String, fit: bool },
 }
 
 impl TextEdit {
@@ -183,7 +194,8 @@ impl TextEdit {
             | TextEdit::Redact { page, .. }
             | TextEdit::Image { page, .. }
             | TextEdit::InsertImage { page, .. }
-            | TextEdit::Paragraph { page, .. } => *page,
+            | TextEdit::Paragraph { page, .. }
+            | TextEdit::Cell { page, .. } => *page,
         }
     }
 }
@@ -220,7 +232,10 @@ pub fn page_text(input: &Path, password: Option<&str>, page: usize, pdfium_path:
     let pdfium = crate::load_pdfium(pdfium_path)?;
     let document = pdfium.load_pdf_from_file(input, password).map_err(|e| anyhow!("could not open {}: {e}", input.display()))?;
     let p = document.pages().get(page as PdfPageIndex)?;
-    Ok(analyse(&p)?.page_text())
+    let a = analyse(&p)?;
+    let mut pt = a.page_text();
+    pt.tables = tables::find_tables(&document, &p, page, &a, &pt);
+    Ok(pt)
 }
 
 /// Letters drawn as vector outlines on a page (0-based), recognised with
@@ -334,9 +349,23 @@ pub fn apply_edits(input: &Path, password: Option<&str>, edits: &[TextEdit], out
         }
         by_page.entry(e.page()).or_default().push(e);
     }
-    for (page, list) in by_page {
-        s.edit_page(page, &list).with_context(|| format!("page {}", page + 1))?;
+    // Pages in order; text flowing on from a page is placed on the next one.
+    let mut page = by_page.keys().next().copied().unwrap_or(0);
+    while page < s.page_ids.len().min(s.pdoc.pages().len() as usize) {
+        match by_page.remove(&page) {
+            Some(list) => s.edit_page(page, &list).with_context(|| format!("page {}", page + 1))?,
+            None if s.carry.is_some() => s.edit_page(page, &[]).with_context(|| format!("page {}", page + 1))?,
+            None => match by_page.keys().next() {
+                Some(p) => {
+                    page = *p;
+                    continue;
+                }
+                None => break,
+            },
+        }
+        page += 1;
     }
+    s.flow_new_pages()?;
     let report = EditReport { notes: s.ctx.notes.clone() };
     let doc = s.finish()?;
     save_incremental(bytes, prev, doc, output)?;
@@ -702,7 +731,7 @@ impl Analysis {
                 ImageItem { path: im.path.clone(), x: (r.0 / pw) as f32, y: (r.1 / ph) as f32, w: ((r.2 - r.0) / pw) as f32, h: ((r.3 - r.1) / ph) as f32 }
             })
             .collect();
-        PageText { width: pw as f32, height: ph as f32, items, paragraphs, outlined_shapes: self.outline_shapes().len(), images }
+        PageText { width: pw as f32, height: ph as f32, items, paragraphs, outlined_shapes: self.outline_shapes().len(), images, tables: Vec::new() }
     }
 
     /// Letter-like outline shapes away from real text (display points: left, top, right, bottom).
@@ -730,6 +759,8 @@ enum RunFont {
     Res(Vec<u8>),
     /// An installed font (index into the session's fallbacks).
     Fallback(usize),
+    /// A font object (added to the resources when needed).
+    Obj(ObjectId),
 }
 
 #[derive(Clone, Debug)]
@@ -750,10 +781,46 @@ struct SegRun {
     render: Option<i32>,
     /// Horizontal scaling (fraction).
     tz: Option<f64>,
+    /// Character and word spacing.
+    tc: Option<f64>,
+    tw: Option<f64>,
     /// Text matrix for this run (else it follows the previous run).
     tm: Option<Mat>,
     items: Vec<Item>,
     base_rise: f64,
+}
+
+/// How a paragraph is laid out again.
+#[derive(Clone, Copy, Debug, Default)]
+struct Wrap {
+    /// Make the text smaller (down to 70 %, or 60 % in a frame) rather than use more lines.
+    fit: bool,
+    /// Move the text below down when the paragraph grows.
+    push_down: bool,
+    /// Move what no longer fits in the column on to the next column and page.
+    flow: bool,
+    /// A box to wrap in (display points: left, top, right, bottom), such as a table cell.
+    frame: Option<[f64; 4]>,
+}
+
+/// A paragraph laid out again.
+struct Wrapped {
+    c: usize,
+    shows: Vec<usize>,
+    anchor: Show,
+    /// The anchor's text space → container space.
+    ma: Mat,
+    /// Container space → page space.
+    to_page: Mat,
+    /// The runs of each new line (text matrices in the anchor's text space).
+    lines: Vec<Vec<SegRun>>,
+    /// Baseline step (anchor text space).
+    pitch: f64,
+    old_lines: usize,
+    /// The paragraph's runs.
+    runs: Vec<usize>,
+    /// More lines than the frame holds.
+    overfull: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -842,6 +909,8 @@ struct Session<'a, 'b> {
     plans: Vec<PagePlan>,
     /// Content streams built now are learned from.
     learning: bool,
+    /// Lines that flow on to the next page.
+    carry: Option<flow::Carry>,
 }
 
 /// The page's resource dictionary (inherited ones included).
@@ -881,7 +950,7 @@ impl<'a, 'b> Session<'a, 'b> {
         if page_ids.len() != pdoc.pages().len() as usize {
             bail!("this PDF cannot be edited (its page tree is damaged)");
         }
-        Ok(Session { pdoc, doc, page_ids, ctx: Ctx::new(), plans: Vec::new(), learning: false })
+        Ok(Session { pdoc, doc, page_ids, ctx: Ctx::new(), plans: Vec::new(), learning: false, carry: None })
     }
 
     /// Builds (or finds) the plan for content stream `path` of a page.
@@ -995,13 +1064,16 @@ impl<'a, 'b> Session<'a, 'b> {
         self.learn_page(page);
         let mut plan = PagePlan { page, page_id: self.page_ids[page], containers: Vec::new() };
         let mut touched: HashSet<ObjPath> = HashSet::new();
+        // Text flowing on from the page before (placed after this page's own edits).
+        let incoming = self.carry.take();
         for e in edits {
             let objects: &[ObjPath] = match e {
                 TextEdit::Replace { objects, .. }
                 | TextEdit::Delete { objects, .. }
                 | TextEdit::Restyle { objects, .. }
                 | TextEdit::Move { objects, .. }
-                | TextEdit::Paragraph { objects, .. } => objects,
+                | TextEdit::Paragraph { objects, .. }
+                | TextEdit::Cell { objects, .. } => objects,
                 TextEdit::Insert { .. } | TextEdit::Outlined { .. } | TextEdit::Redact { .. } | TextEdit::Image { .. } | TextEdit::InsertImage { .. } => &[],
             };
             for o in objects {
@@ -1024,7 +1096,14 @@ impl<'a, 'b> Session<'a, 'b> {
                     let v = display_to_page_vec(&a.tf, *dx as f64 * a.tf.width() as f64, *dy as f64 * a.tf.height() as f64);
                     self.move_objects(&mut plan, &a, objects, v)?
                 }
-                TextEdit::Paragraph { objects, text, fit, push_down, .. } => self.paragraph(&mut plan, &a, objects, text, *fit, *push_down, &mut touched)?,
+                TextEdit::Paragraph { objects, text, fit, push_down, flow, .. } => {
+                    self.paragraph(&mut plan, &a, objects, text, Wrap { fit: *fit, push_down: *push_down, flow: *flow, frame: None }, &mut touched)?
+                }
+                TextEdit::Cell { x, y, w, h, objects, text, fit, .. } => {
+                    let (dw, dh) = (a.tf.width() as f64, a.tf.height() as f64);
+                    let cell = [*x as f64 * dw, *y as f64 * dh, (*x + *w) as f64 * dw, (*y + *h) as f64 * dh];
+                    self.cell(&mut plan, &a, cell, objects, text, *fit, &mut touched)?
+                }
                 TextEdit::Redact { x, y, w, h, fill, .. } => {
                     let region = display_box_to_page(&a.tf, [*x, *y, *w, *h]);
                     self.redact(&mut plan, &a, region, fill.unwrap_or([0, 0, 0]))?
@@ -1035,6 +1114,9 @@ impl<'a, 'b> Session<'a, 'b> {
                     self.outlined(&mut plan, &a, [*x, *y, *w, *h], *baseline, text, *size, *color, style, *fit)?
                 }
             }
+        }
+        if let Some(carry) = incoming {
+            self.flow_in(&mut plan, &a, carry, &mut touched)?;
         }
         self.plans.push(plan);
         Ok(())
@@ -1654,6 +1736,7 @@ impl<'a, 'b> Session<'a, 'b> {
             }),
             items: pieces.into_iter().map(Item::Piece).collect(),
             base_rise: first.rise,
+            ..Default::default()
         };
         self.place_segment(plan, c, &shows, Segment { prefix: quote_prefix(&first, false), reset: false, runs: vec![run], resume: resume(&first) })
     }
@@ -1677,22 +1760,26 @@ impl<'a, 'b> Session<'a, 'b> {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn paragraph(&mut self, plan: &mut PagePlan, a: &Analysis, objects: &[ObjPath], text: &str, fit: bool, push_down: bool, touched: &mut HashSet<ObjPath>) -> anyhow::Result<()> {
-        let r0 = a.run_of(objects.first().ok_or_else(|| anyhow!("no text objects given"))?).ok_or_else(|| anyhow!("text run not found"))?;
-        let pi = a.para_of_run(r0).ok_or_else(|| anyhow!("paragraph not found"))?;
-        let para = &a.paras[pi];
-        let runs: Vec<usize> = para.lines.iter().flat_map(|l| a.lines[*l].runs.iter().copied()).collect();
+    /// Lays a paragraph out again with new text. `tab` holds the lines that
+    /// `para.lines` refers to. A `\n` in `text` starts a new line.
+    fn layout_paragraph(&mut self, plan: &mut PagePlan, a: &Analysis, tab: &[Line], para: &Para, text: &str, opt: &Wrap) -> anyhow::Result<Wrapped> {
+        let text = text.trim_matches('\n');
+        let runs: Vec<usize> = para.lines.iter().flat_map(|l| tab[*l].runs.iter().copied()).collect();
         let paths: Vec<ObjPath> = runs.iter().flat_map(|r| a.run_paths(*r)).collect();
-        for p in &paths {
-            touched.insert(p.clone());
-        }
         let (c, shows) = self.shows_of(plan, a, &paths)?;
         let page = plan.page;
         let anchor = plan.containers[c].scan.shows[shows[0]].clone();
         let ma = mul(&anchor.tm(), &anchor.ctm);
         let ia = invert(&ma).ok_or_else(|| anyhow!("degenerate text matrix"))?;
         let scale_a = x_scale(&ma).max(1e-9);
+        let to_page = a.po.container(&plan.containers[c].path).map(|i| i.to_page).unwrap_or(IDENTITY);
+        let inv_page = invert(&to_page).ok_or_else(|| anyhow!("degenerate form matrix"))?;
+        // Displayed page → the anchor's text space.
+        let to_text = |x: f64, y: f64| {
+            let p = a.tf.to_user(x as f32, y as f32);
+            let q = apply(&inv_page, p.0 as f64, p.1 as f64);
+            apply(&ia, q.0, q.1)
+        };
 
         // Geometry of the original lines in the anchor's text space.
         struct L {
@@ -1704,7 +1791,7 @@ impl<'a, 'b> Session<'a, 'b> {
         for l in &para.lines {
             let (mut left, mut right) = (f64::MAX, f64::MIN);
             let mut base = None;
-            for r in &a.lines[*l].runs {
+            for r in &tab[*l].runs {
                 for k in &a.runs[*r] {
                     let o = &a.po.objs[*k];
                     for cn in o.corners() {
@@ -1719,14 +1806,24 @@ impl<'a, 'b> Session<'a, 'b> {
             }
             lines.push(L { left, right, base: base.unwrap_or(0.0) });
         }
-        let left = lines.iter().map(|l| l.left).fold(f64::MAX, f64::min);
-        let right = lines.iter().map(|l| l.right).fold(f64::MIN, f64::max);
+        let mut left = lines.iter().map(|l| l.left).fold(f64::MAX, f64::min);
+        let mut right = lines.iter().map(|l| l.right).fold(f64::MIN, f64::max);
         let rtl_para = objects::first_strong_rtl(&para.text);
-        let indent = match (para.align, rtl_para) {
+        let mut indent = match (para.align, rtl_para) {
             (Align::Left | Align::Justify, false) => lines[0].left - left,
             (Align::Right | Align::Justify, true) => right - lines[0].right,
             _ => 0.0,
         };
+        // A frame (a table cell) sets the width and the lowest baseline.
+        let mut floor = None;
+        if let Some([fl, ft, fr, fb]) = opt.frame {
+            let y = (ft + fb) / 2.0;
+            let (p, q) = (to_text(fl, y), to_text(fr, y));
+            left = p.0.min(q.0);
+            right = p.0.max(q.0);
+            indent = 0.0;
+            floor = Some(to_text(fl, fb).1);
+        }
         let mut pitches: Vec<f64> = lines.windows(2).map(|w| w[0].base - w[1].base).filter(|d| *d > 0.0).collect();
         pitches.sort_by(|x, y| x.total_cmp(y));
 
@@ -1786,7 +1883,8 @@ impl<'a, 'b> Session<'a, 'b> {
             new_styles.push(st);
         }
 
-        // Words: pieces per style part, and the width of the space before them.
+        // Words: pieces per style part, the width of the space before them,
+        // and the line breaks before them.
         struct WPart {
             style: usize,
             text: String,
@@ -1798,12 +1896,19 @@ impl<'a, 'b> Session<'a, 'b> {
             parts: Vec<WPart>,
             width: f64,
             space: f64,
+            brk: usize,
         }
         let mut words: Vec<Word> = Vec::new();
         let mut i = 0;
         let mut space = 0.0;
+        let mut brk = 0;
         let mut space_cache: HashMap<usize, f64> = HashMap::new();
         while i < new.len() {
+            if new[i] == '\n' {
+                brk += 1;
+                i += 1;
+                continue;
+            }
             if new[i].is_whitespace() {
                 let st = new_styles[i];
                 let em = match space_cache.get(&st) {
@@ -1843,8 +1948,9 @@ impl<'a, 'b> Session<'a, 'b> {
                 s = e;
             }
             let width = parts.iter().map(|p| p.width).sum();
-            words.push(Word { parts, width, space: if words.is_empty() { 0.0 } else { space } });
+            words.push(Word { parts, width, space: if words.is_empty() { 0.0 } else { space }, brk });
             space = 0.0;
+            brk = 0;
             i = j;
         }
 
@@ -1855,6 +1961,13 @@ impl<'a, 'b> Session<'a, 'b> {
             let mut cur: Vec<usize> = Vec::new();
             let mut w = 0.0;
             for (wi, word) in words.iter().enumerate() {
+                if word.brk > 0 {
+                    out.push(std::mem::take(&mut cur));
+                    for _ in 1..word.brk {
+                        out.push(Vec::new());
+                    }
+                    w = 0.0;
+                }
                 let add = if cur.is_empty() { word.width } else { word.space + word.width };
                 if !cur.is_empty() && w + add > avail(out.len(), k) + 1e-6 {
                     out.push(std::mem::take(&mut cur));
@@ -1869,14 +1982,21 @@ impl<'a, 'b> Session<'a, 'b> {
             }
             out
         };
+        // Lines that fit: the frame's height, or as many as before.
+        let max_lines = |k: f64| match floor {
+            Some(f) => ((lines[0].base - f - 0.25 * max_size * k) / (pitch * k)).floor().max(0.0) as usize + 1,
+            None => lines.len(),
+        };
         let mut k = 1.0;
         let mut broken = break_lines(k);
-        if fit {
-            while broken.len() > lines.len() && k > 0.7 {
+        if opt.fit {
+            let min_k = if floor.is_some() { 0.6 } else { 0.7 };
+            while broken.len() > max_lines(k) && k > min_k + 1e-9 {
                 k -= 0.05;
                 broken = break_lines(k);
             }
         }
+        let overfull = floor.is_some() && broken.len() > max_lines(k);
 
         // Place the words, in display order.
         let word_dir: Vec<Option<bool>> = words
@@ -1886,11 +2006,14 @@ impl<'a, 'b> Session<'a, 'b> {
                 t.chars().find(|c| c.is_alphabetic()).map(is_rtl)
             })
             .collect();
-        let mut seg_runs = Vec::new();
+        let mut out_lines = Vec::new();
         for (li, ws) in broken.iter().enumerate() {
+            let y = lines[0].base - li as f64 * pitch * k;
+            let mut seg_runs = Vec::new();
             let natural: f64 = ws.iter().enumerate().map(|(n, w)| words[*w].width + if n > 0 { words[*w].space } else { 0.0 }).sum::<f64>() * k;
             let width = avail(li, k) * k;
-            let last = li + 1 == broken.len();
+            // The last line of the paragraph, or before a line break, is not justified.
+            let last = broken.get(li + 1).is_none_or(|n| n.first().is_none_or(|w| words[*w].brk > 0));
             let gaps = ws.len().saturating_sub(1);
             let extra = if para.align == Align::Justify && !last && gaps > 0 { ((width - natural) / gaps as f64).max(0.0) } else { 0.0 };
             let first_indent = if li == 0 { indent } else { 0.0 };
@@ -1900,7 +2023,6 @@ impl<'a, 'b> Session<'a, 'b> {
                 (_, true) => left,
                 _ => left + first_indent,
             };
-            let y = lines[0].base - li as f64 * pitch * k;
             let order = visual_order_of(&ws.iter().map(|w| word_dir[*w]).collect::<Vec<_>>(), rtl_para);
             for (n, &vi) in order.iter().enumerate() {
                 let w = ws[vi];
@@ -1927,25 +2049,49 @@ impl<'a, 'b> Session<'a, 'b> {
                         tm: Some(tm),
                         items: part.pieces.iter().cloned().map(Item::Piece).collect(),
                         base_rise: 0.0,
+                        ..Default::default()
                     });
                     x += part.width * k;
                 }
             }
+            out_lines.push(seg_runs);
         }
-        self.place_segment(plan, c, &shows, Segment { prefix: quote_prefix(&anchor, false), reset: true, runs: seg_runs, resume: resume(&anchor) })?;
+        Ok(Wrapped { c, shows, anchor, ma, to_page, lines: out_lines, pitch: pitch * k, old_lines: lines.len(), runs, overfull })
+    }
+
+    /// Writes the lines of a laid-out paragraph in place of the old ones.
+    fn place_wrapped(&mut self, plan: &mut PagePlan, w: &Wrapped) -> anyhow::Result<()> {
+        let runs: Vec<SegRun> = w.lines.iter().flatten().cloned().collect();
+        self.place_segment(plan, w.c, &w.shows, Segment { prefix: quote_prefix(&w.anchor, false), reset: true, runs, resume: resume(&w.anchor) })
+    }
+
+    /// The displayed-page vector of moving a laid-out line by `dy` (anchor text space).
+    fn wrapped_shift(a: &Analysis, w: &Wrapped, dy: f64) -> ((f64, f64), f64) {
+        let vc = apply_vec(&w.ma, 0.0, dy);
+        let vp = apply_vec(&w.to_page, vc.0, vc.1);
+        let d0 = a.tf.point(0.0, 0.0);
+        let d1 = a.tf.point(vp.0 as f32, vp.1 as f32);
+        (vp, (d1.1 - d0.1) as f64)
+    }
+
+    fn paragraph(&mut self, plan: &mut PagePlan, a: &Analysis, objects: &[ObjPath], text: &str, opt: Wrap, touched: &mut HashSet<ObjPath>) -> anyhow::Result<()> {
+        let r0 = a.run_of(objects.first().ok_or_else(|| anyhow!("no text objects given"))?).ok_or_else(|| anyhow!("text run not found"))?;
+        let pi = a.para_of_run(r0).ok_or_else(|| anyhow!("paragraph not found"))?;
+        let para = &a.paras[pi];
+        let mut w = self.layout_paragraph(plan, a, &a.lines, para, text, &opt)?;
+        for r in &w.runs {
+            for p in a.run_paths(*r) {
+                touched.insert(p);
+            }
+        }
+        let page = plan.page;
 
         // More lines than before: move the text below down, when there is room.
-        let grown = broken.len() as f64 - lines.len() as f64;
-        if grown > 0.0 && !fit {
-            let shift_t = grown * pitch * k;
-            let vc = apply_vec(&ma, 0.0, -shift_t);
-            let to_page = a.po.container(&plan.containers[c].path).map(|i| i.to_page).unwrap_or(IDENTITY);
-            let vp = apply_vec(&to_page, vc.0, vc.1);
-            let d0 = a.tf.point(0.0, 0.0);
-            let d1 = a.tf.point(vp.0 as f32, vp.1 as f32);
-            let shift_d = (d1.1 - d0.1) as f64;
+        let grown = w.lines.len() as f64 - w.old_lines as f64;
+        if grown > 0.0 && !opt.fit {
+            let (vp, shift_d) = Self::wrapped_shift(a, &w, -grown * w.pitch);
             let pitch_d = shift_d.abs() / grown.max(1.0);
-            let moved = if push_down { self.text_below(a, para, &runs, shift_d.abs(), pitch_d.max(1.0)) } else { None };
+            let moved = if opt.push_down || opt.flow { self.text_below(a, para, &w.runs, shift_d.abs(), pitch_d.max(1.0)) } else { None };
             match moved {
                 Some(below) => {
                     for r in below {
@@ -1959,10 +2105,13 @@ impl<'a, 'b> Session<'a, 'b> {
                         self.move_objects(plan, a, &paths, vp)?;
                     }
                 }
+                None if opt.flow => {
+                    self.flow(plan, a, para, &mut w, touched)?;
+                }
                 None => self.ctx.note(format!("Page {}: the paragraph is now longer and may overlap what follows it.", page + 1)),
             }
         }
-        Ok(())
+        self.place_wrapped(plan, &w)
     }
 
     /// Runs below a paragraph in its column that can move down by `shift`
@@ -2075,6 +2224,7 @@ impl<'a, 'b> Session<'a, 'b> {
                 let id = self.ctx.fallbacks[*i].id.ok_or_else(|| anyhow!("font was not embedded"))?;
                 Ok(cp.resource_name(&self.doc, b"Font", id))
             }
+            RunFont::Obj(id) => Ok(cp.resource_name(&self.doc, b"Font", *id)),
         }
     }
 
@@ -2142,6 +2292,12 @@ impl<'a, 'b> Session<'a, 'b> {
             }
             if let Some(tz) = run.tz {
                 s.push_str(&format!("{} Tz ", fmt(tz * 100.0)));
+            }
+            if let Some(tc) = run.tc {
+                s.push_str(&format!("{} Tc ", fmt(tc)));
+            }
+            if let Some(tw) = run.tw {
+                s.push_str(&format!("{} Tw ", fmt(tw)));
             }
             s.push_str(&tj_ops(&self.toks(&run.items), run.size, run.base_rise));
             s.push(' ');

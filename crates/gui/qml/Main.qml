@@ -737,7 +737,7 @@ ApplicationWindow {
                             }
                             window.nextAfterEdit = next
                             if (para)
-                                conv.editParagraph(window.editIndex, paraField.text, fitBox.checked, pushBox.checked)
+                                conv.editParagraph(window.editIndex, paraField.text, fitBox.checked, pushBox.checked, flowBox.checked)
                             else
                                 conv.editRun(window.editIndex, lineField.text, fitBox.checked, styleJson())
                             if (next < 0) window.editIndex = -1
@@ -748,7 +748,7 @@ ApplicationWindow {
                             onTriggered: {
                                 if (!editor.visible) return
                                 if (editor.para)
-                                    conv.previewParagraph(window.editIndex, paraField.text, fitBox.checked, pushBox.checked)
+                                    conv.previewParagraph(window.editIndex, paraField.text, fitBox.checked, pushBox.checked, flowBox.checked)
                                 else
                                     conv.previewRun(window.editIndex, lineField.text, fitBox.checked, editor.styleJson())
                             }
@@ -854,6 +854,13 @@ ApplicationWindow {
                                     visible: editor.para
                                     text: "Move the text below down"
                                     checked: true
+                                    onToggled: editor.schedulePreview()
+                                }
+                                CheckBox {
+                                    id: flowBox
+                                    visible: editor.para
+                                    text: "Flow on to the next column and page"
+                                    checked: false
                                     onToggled: editor.schedulePreview()
                                 }
                                 Item { Layout.fillWidth: true }

@@ -174,14 +174,24 @@ pub mod qobject {
         #[cxx_name = "previewRun"]
         fn preview_run(self: Pin<&mut Converter>, index: i32, text: &QString, fit: bool, style: &QString);
 
-        /// Rewrites paragraph `index`, wrapping it over as many lines as it needs.
+        /// Rewrites paragraph `index`, wrapping it over as many lines as it
+        /// needs; with `flow` what no longer fits moves to the next column and page.
         #[qinvokable]
         #[cxx_name = "editParagraph"]
-        fn edit_paragraph(self: Pin<&mut Converter>, index: i32, text: &QString, fit: bool, push_down: bool);
+        fn edit_paragraph(self: Pin<&mut Converter>, index: i32, text: &QString, fit: bool, push_down: bool, flow: bool);
 
         #[qinvokable]
         #[cxx_name = "previewParagraph"]
-        fn preview_paragraph(self: Pin<&mut Converter>, index: i32, text: &QString, fit: bool, push_down: bool);
+        fn preview_paragraph(self: Pin<&mut Converter>, index: i32, text: &QString, fit: bool, push_down: bool, flow: bool);
+
+        /// Rewrites table cell `index` (cells of all tables in `pageTextJson`, in order).
+        #[qinvokable]
+        #[cxx_name = "editCell"]
+        fn edit_cell(self: Pin<&mut Converter>, index: i32, text: &QString, fit: bool);
+
+        #[qinvokable]
+        #[cxx_name = "previewCell"]
+        fn preview_cell(self: Pin<&mut Converter>, index: i32, text: &QString, fit: bool);
 
         /// Back to the page as it is.
         #[qinvokable]
@@ -1264,7 +1274,17 @@ impl qobject::Converter {
                 "align": format!("{:?}", p.align).to_lowercase() }))
             .collect();
         let images: Vec<Value> = pt.images.iter().enumerate().map(|(i, im)| json!({ "i": i, "x": im.x, "y": im.y, "w": im.w, "h": im.h })).collect();
-        let v = json!({ "w": pt.width, "h": pt.height, "outlined": pt.outlined_shapes, "recognised": !self.rust().outlined.is_empty(), "items": items, "paragraphs": paras, "images": images });
+        let mut cells: Vec<Value> = Vec::new();
+        let mut tables: Vec<Value> = Vec::new();
+        for (ti, t) in pt.tables.iter().enumerate() {
+            tables.push(json!({ "x": t.x, "y": t.y, "w": t.w, "h": t.h, "rows": t.rows, "cols": t.cols }));
+            for c in &t.cells {
+                cells.push(json!({ "i": cells.len(), "table": ti, "row": c.row, "col": c.col, "x": c.x, "y": c.y, "w": c.w, "h": c.h,
+                    "text": c.text, "lines": c.text.lines().count().max(1), "align": "left" }));
+            }
+        }
+        let v = json!({ "w": pt.width, "h": pt.height, "outlined": pt.outlined_shapes, "recognised": !self.rust().outlined.is_empty(), "items": items,
+            "paragraphs": paras, "images": images, "tables": tables, "cells": cells });
         self.as_mut().set_page_text_json(QString::from(&v.to_string()));
     }
 
@@ -1522,7 +1542,7 @@ impl qobject::Converter {
         self.apply("Preview", edits, true);
     }
 
-    fn paragraph_edits(&self, index: i32, text: &QString, fit: bool, push_down: bool) -> Vec<pdf2word_core::edit::TextEdit> {
+    fn paragraph_edits(&self, index: i32, text: &QString, fit: bool, push_down: bool, flow: bool) -> Vec<pdf2word_core::edit::TextEdit> {
         let Some(pt) = self.rust().page_text.as_ref() else { return Vec::new() };
         let Some(p) = usize::try_from(index).ok().and_then(|i| pt.paragraphs.get(i)) else { return Vec::new() };
         let text = text.to_string();
@@ -1530,16 +1550,37 @@ impl qobject::Converter {
             return Vec::new();
         }
         let objects = p.items.iter().filter_map(|i| pt.items.get(*i)).flat_map(|i| i.objects.clone()).collect();
-        vec![pdf2word_core::edit::TextEdit::Paragraph { page: self.page_index(), objects, text, fit, push_down }]
+        vec![pdf2word_core::edit::TextEdit::Paragraph { page: self.page_index(), objects, text, fit, push_down, flow }]
     }
 
-    pub fn edit_paragraph(self: Pin<&mut Self>, index: i32, text: &QString, fit: bool, push_down: bool) {
-        let edits = self.paragraph_edits(index, text, fit, push_down);
+    pub fn edit_paragraph(self: Pin<&mut Self>, index: i32, text: &QString, fit: bool, push_down: bool, flow: bool) {
+        let edits = self.paragraph_edits(index, text, fit, push_down, flow);
         self.apply("Changing the paragraph", edits, false);
     }
 
-    pub fn preview_paragraph(self: Pin<&mut Self>, index: i32, text: &QString, fit: bool, push_down: bool) {
-        let edits = self.paragraph_edits(index, text, fit, push_down);
+    pub fn preview_paragraph(self: Pin<&mut Self>, index: i32, text: &QString, fit: bool, push_down: bool, flow: bool) {
+        let edits = self.paragraph_edits(index, text, fit, push_down, flow);
+        self.apply("Preview", edits, true);
+    }
+
+    fn cell_edits(&self, index: i32, text: &QString, fit: bool) -> Vec<pdf2word_core::edit::TextEdit> {
+        let Some(pt) = self.rust().page_text.as_ref() else { return Vec::new() };
+        let Some(c) = usize::try_from(index).ok().and_then(|i| pt.tables.iter().flat_map(|t| t.cells.iter()).nth(i)) else { return Vec::new() };
+        let text = text.to_string();
+        if text == c.text {
+            return Vec::new();
+        }
+        let objects = c.items.iter().filter_map(|i| pt.items.get(*i)).flat_map(|i| i.objects.clone()).collect();
+        vec![pdf2word_core::edit::TextEdit::Cell { page: self.page_index(), x: c.x, y: c.y, w: c.w, h: c.h, objects, text, fit }]
+    }
+
+    pub fn edit_cell(self: Pin<&mut Self>, index: i32, text: &QString, fit: bool) {
+        let edits = self.cell_edits(index, text, fit);
+        self.apply("Changing the cell", edits, false);
+    }
+
+    pub fn preview_cell(self: Pin<&mut Self>, index: i32, text: &QString, fit: bool) {
+        let edits = self.cell_edits(index, text, fit);
         self.apply("Preview", edits, true);
     }
 

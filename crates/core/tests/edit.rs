@@ -292,7 +292,7 @@ fn paragraphs_rewrap_and_push_text_down() {
     let objects = para.items.iter().flat_map(|i| pt.items[*i].objects.clone()).collect();
     let text = format!("{} It was a very long day for everybody involved, and the fox was tired.", para.text);
     let out = tmp("para-out.pdf");
-    apply_edits(&input, None, &[TextEdit::Paragraph { page: 0, objects, text: text.clone(), fit: false, push_down: true }], &out, None).unwrap();
+    apply_edits(&input, None, &[TextEdit::Paragraph { page: 0, objects, text: text.clone(), fit: false, push_down: true, flow: false }], &out, None).unwrap();
     let after = page_text(&out, None, 0, None).unwrap();
     let p2 = after.paragraphs.iter().find(|p| p.text.starts_with("The quick")).unwrap();
     assert!(p2.lines >= 4, "{} lines: {}", p2.lines, p2.text);
@@ -658,4 +658,99 @@ fn pictures_are_moved_replaced_deleted_and_added() {
     let imgs = page_text(&out3, None, 0, None).unwrap().images;
     assert_eq!(imgs.len(), 1);
     assert!((imgs[0].x - 0.5).abs() < 0.002 && (imgs[0].w - 0.2).abs() < 0.002, "{:?}", imgs[0]);
+}
+
+#[test]
+fn table_cells_are_found_and_edited_inside_their_box() {
+    if !pdfium_available() {
+        return;
+    }
+    let input = fixture("tables.pdf");
+    let pt = page_text(&input, None, 0, None).unwrap();
+    assert!(!pt.tables.is_empty(), "no tables found");
+    let t = &pt.tables[0];
+    assert!(t.rows >= 2 && t.cols >= 2, "{} x {}", t.rows, t.cols);
+    let cell = t.cells.iter().find(|c| c.row > 0 && !c.text.trim().is_empty()).expect("a cell with text");
+    let objects: Vec<_> = cell.items.iter().flat_map(|i| pt.items[*i].objects.clone()).collect();
+    let others: Vec<String> = t.cells.iter().filter(|c| c.row != cell.row || c.col != cell.col).map(|c| c.text.clone()).filter(|s| !s.is_empty()).collect();
+    let new = format!("{} and some more words that need another line", cell.text.replace('\n', " "));
+    let out = tmp("cell.pdf");
+    let edit = TextEdit::Cell { page: 0, x: cell.x, y: cell.y, w: cell.w, h: cell.h, objects, text: new.clone(), fit: true };
+    apply_edits(&input, None, &[edit], &out, None).unwrap();
+    let after = page_text(&out, None, 0, None).unwrap();
+    // The new text is inside the cell's box.
+    let inside: Vec<&TextItem> = after
+        .items
+        .iter()
+        .filter(|i| {
+            let (cx, cy) = (i.x + i.w / 2.0, i.y + i.h / 2.0);
+            cx >= cell.x && cx <= cell.x + cell.w && cy >= cell.y && cy <= cell.y + cell.h
+        })
+        .collect();
+    let joined = inside.iter().map(|i| i.text.trim()).collect::<Vec<_>>().join(" ");
+    assert_eq!(joined.split_whitespace().collect::<Vec<_>>(), new.split_whitespace().collect::<Vec<_>>());
+    for i in &inside {
+        assert!(i.x >= cell.x - 0.002 && i.x + i.w <= cell.x + cell.w + 0.002, "{:?} leaves the cell", i.text);
+    }
+    // The other cells keep their text.
+    let all: String = after.items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>().join(" ");
+    for o in others.iter().take(6) {
+        for w in o.split_whitespace() {
+            assert!(all.contains(w), "{w:?} lost");
+        }
+    }
+}
+
+/// A page with two columns of numbered lines (one paragraph per column).
+fn columns_pdf(name: &str, lines: usize) -> PathBuf {
+    let mut c = String::new();
+    for col in 0..2 {
+        for i in 0..lines {
+            let y = 720 - i * 14;
+            let x = 72 + col * 260;
+            c.push_str(&format!("BT /F1 10 Tf {x} {y} Td (c{col}l{i:02} alpha beta gamma delta eps) Tj ET\n"));
+        }
+    }
+    make_pdf(name, &c, 0)
+}
+
+#[test]
+fn text_flows_into_the_next_column_and_a_new_page() {
+    if !pdfium_available() {
+        return;
+    }
+    let input = columns_pdf("flow.pdf", 40);
+    let pt = page_text(&input, None, 0, None).unwrap();
+    let first = pt.paragraphs.iter().position(|p| p.text.starts_with("c0l00")).expect("first column paragraph");
+    let p = &pt.paragraphs[first];
+    assert_eq!(p.lines, 40);
+    let objects: Vec<_> = p.items.iter().flat_map(|i| pt.items[*i].objects.clone()).collect();
+    let extra = "added words ".repeat(40);
+    let text = format!("{} {}", p.text, extra.trim());
+    let out = tmp("flow-out.pdf");
+    let report = apply_edits(&input, None, &[TextEdit::Paragraph { page: 0, objects, text, fit: false, push_down: true, flow: true }], &out, None).unwrap();
+    assert!(!report.notes.is_empty());
+    assert_eq!(pdf2word_core::inspect(&out, None, None).unwrap().pages, 2, "a page is added for the text that no longer fits");
+    let words = |page: usize| -> Vec<String> {
+        let pt = page_text(&out, None, page, None).unwrap();
+        let mut items = pt.items.clone();
+        // Reading order: column by column, top to bottom.
+        let key = |i: &TextItem| ((i.x > 0.4) as u8, (i.baseline * 1000.0).round() as i64, (i.x * 1000.0).round() as i64);
+        items.sort_by_key(key);
+        items.iter().flat_map(|i| i.text.split_whitespace().map(str::to_string).collect::<Vec<_>>()).collect()
+    };
+    let all: Vec<String> = words(0).into_iter().chain(words(1)).collect();
+    // Every original line and the added words are still there, in order.
+    let mut expect: Vec<String> = Vec::new();
+    for i in 0..40 {
+        expect.extend(format!("c0l{i:02} alpha beta gamma delta eps").split_whitespace().map(str::to_string));
+    }
+    expect.extend(extra.split_whitespace().map(str::to_string));
+    for i in 0..40 {
+        expect.extend(format!("c1l{i:02} alpha beta gamma delta eps").split_whitespace().map(str::to_string));
+    }
+    assert_eq!(all, expect);
+    // The last lines of the second column moved to the new page.
+    assert!(words(1).iter().any(|w| w == "c1l39"));
+    assert!(!words(0).iter().any(|w| w == "c1l39"));
 }
