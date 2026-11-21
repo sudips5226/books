@@ -479,6 +479,8 @@ pub(crate) struct Scan {
     pub shows: Vec<Show>,
     /// Operator indices of `Do` operators that paint form XObjects, in order.
     pub form_dos: Vec<usize>,
+    /// Operators that paint images (`Do` of image XObjects and inline images), in order.
+    pub image_ops: Vec<usize>,
     /// Lowest q/Q nesting reached (negative with stray Q operators) and the final nesting.
     pub min_depth: i64,
     pub end_depth: i64,
@@ -486,10 +488,11 @@ pub(crate) struct Scan {
 
 impl Scan {
     /// Only the operators (when the text cannot be followed).
-    pub fn ops_only(content: &[u8], forms: &HashSet<Vec<u8>>) -> Self {
+    pub fn ops_only(content: &[u8], forms: &HashSet<Vec<u8>>, images: &HashSet<Vec<u8>>) -> Self {
         let ops = parse_content(content).unwrap_or_default();
         let (mut depth, mut min_depth) = (0i64, 0i64);
         let mut form_dos = Vec::new();
+        let mut image_ops = Vec::new();
         for (i, op) in ops.iter().enumerate() {
             match op.name.as_slice() {
                 b"q" => depth += 1,
@@ -499,15 +502,19 @@ impl Scan {
                 }
                 b"Do" => {
                     if let Some(Arg::Name(n)) = op.args.first() {
-                        if forms.contains(&decode_name(n)) {
+                        let n = decode_name(n);
+                        if forms.contains(&n) {
                             form_dos.push(i);
+                        } else if images.contains(&n) {
+                            image_ops.push(i);
                         }
                     }
                 }
+                b"BI" => image_ops.push(i),
                 _ => {}
             }
         }
-        Scan { ops, shows: Vec::new(), form_dos, min_depth, end_depth: depth }
+        Scan { ops, shows: Vec::new(), form_dos, image_ops, min_depth, end_depth: depth }
     }
 }
 
@@ -594,7 +601,7 @@ pub(crate) fn scan_paths(ops: &[Op], ctm0: Mat) -> Vec<PathPaint> {
 /// Follows the text position through `content` and pairs every glyph-showing
 /// operator with PDFium's text object (`objs`: object index and origin, in
 /// order, in the same coordinate space as `ctm0`).
-pub(crate) fn scan(content: &[u8], objs: &[(usize, (f64, f64))], forms: &HashSet<Vec<u8>>, ctm0: Mat) -> anyhow::Result<Scan> {
+pub(crate) fn scan(content: &[u8], objs: &[(usize, (f64, f64))], forms: &HashSet<Vec<u8>>, images: &HashSet<Vec<u8>>, ctm0: Mat) -> anyhow::Result<Scan> {
     let ops = parse_content(content)?;
     let mut st = GState { ctm: ctm0, ts: TextState { font: Vec::new(), size: 0.0, tc: 0.0, tw: 0.0, th: 1.0, tl: 0.0, rise: 0.0 } };
     let mut stack: Vec<GState> = Vec::new();
@@ -607,6 +614,7 @@ pub(crate) fn scan(content: &[u8], objs: &[(usize, (f64, f64))], forms: &HashSet
     let mut cursor = 0usize;
     let mut shows: Vec<Show> = Vec::new();
     let mut form_dos = Vec::new();
+    let mut image_ops = Vec::new();
     let tol = |p: (f64, f64)| 0.6 + 1e-4 * (p.0.abs() + p.1.abs());
 
     for (i, op) in ops.iter().enumerate() {
@@ -636,11 +644,15 @@ pub(crate) fn scan(content: &[u8], objs: &[(usize, (f64, f64))], forms: &HashSet
             b"cm" if a.len() >= 6 => st.ctm = mul(&[num(0), num(1), num(2), num(3), num(4), num(5)], &st.ctm),
             b"Do" => {
                 if let Some(Arg::Name(n)) = a.first() {
-                    if forms.contains(&decode_name(n)) {
+                    let n = decode_name(n);
+                    if forms.contains(&n) {
                         form_dos.push(i);
+                    } else if images.contains(&n) {
+                        image_ops.push(i);
                     }
                 }
             }
+            b"BI" => image_ops.push(i),
             b"BT" => {
                 tlm = IDENTITY;
                 s = 0.0;
@@ -782,7 +794,7 @@ pub(crate) fn scan(content: &[u8], objs: &[(usize, (f64, f64))], forms: &HashSet
     if cursor != objs.len() {
         bail!("PDFium reports text that is not in this content stream");
     }
-    Ok(Scan { ops, shows, form_dos, min_depth, end_depth: depth })
+    Ok(Scan { ops, shows, form_dos, image_ops, min_depth, end_depth: depth })
 }
 
 // ---------------------------------------------------------------------------
@@ -929,22 +941,24 @@ mod tests {
     fn follows_text_position_and_measures_advances() {
         let d = b"BT /F1 10 Tf 100 700 Td (ab) Tj [-100 (cd)] TJ 0 -12 Td (ef) Tj ET";
         let objs = vec![(0, (100.0, 700.0)), (1, (100.0 + 11.0 + 1.0, 700.0)), (2, (100.0, 688.0))];
-        let sc = scan(d, &objs, &HashSet::new(), IDENTITY).unwrap();
+        let sc = scan(d, &objs, &HashSet::new(), &HashSet::new(), IDENTITY).unwrap();
         assert_eq!(sc.shows.len(), 3);
         assert!((sc.shows[0].advance.unwrap() - 11.0).abs() < 1e-6);
         assert!(sc.shows[1].advance.is_none());
         assert_eq!(neutralize(&sc.shows[0]).unwrap(), "[-1100] TJ");
         assert_eq!(resume(&sc.shows[0]), "BT 1 0 0 1 100 700 Tm [-1100] TJ");
         let bad = vec![(0, (100.0, 700.0)), (1, (112.0, 700.0)), (2, (100.0, 600.0))];
-        assert!(scan(d, &bad, &HashSet::new(), IDENTITY).is_err());
+        assert!(scan(d, &bad, &HashSet::new(), &HashSet::new(), IDENTITY).is_err());
     }
 
     #[test]
     fn forms_and_matrices() {
         let d = b"q 2 0 0 2 10 20 cm /X1 Do /Im1 Do Q";
         let forms: HashSet<Vec<u8>> = [b"X1".to_vec()].into_iter().collect();
-        let sc = scan(d, &[], &forms, IDENTITY).unwrap();
+        let images: HashSet<Vec<u8>> = [b"Im1".to_vec()].into_iter().collect();
+        let sc = scan(d, &[], &forms, &images, IDENTITY).unwrap();
         assert_eq!(sc.form_dos, vec![2]);
+        assert_eq!(sc.image_ops, vec![3]);
         let m = [2.0, 0.0, 0.0, 2.0, 10.0, 20.0];
         let i = invert(&m).unwrap();
         let p = apply(&mul(&m, &i), 3.0, 4.0);

@@ -30,6 +30,7 @@ pub mod metrics;
 pub mod navigate;
 pub mod model;
 pub mod ocr;
+pub mod pages;
 pub mod reflow;
 pub mod scan;
 pub mod structure;

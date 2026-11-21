@@ -22,6 +22,9 @@ ApplicationWindow {
     readonly property var pageText: JSON.parse(conv.pageTextJson)
     readonly property var textItems: pageText.items || []
     readonly property var paragraphs: pageText.paragraphs || []
+    readonly property var images: pageText.images || []
+    // Dragging on the page draws a box that is redacted.
+    property bool redactMode: false
     // Edit whole paragraphs instead of single lines.
     property bool paragraphMode: false
     // Runs selected with Ctrl/Shift-click.
@@ -79,7 +82,65 @@ ApplicationWindow {
         ["textbox", "Text box"], ["comment", "Comment"]
     ]
 
-    onClosing: conv.saveSettings()
+    property bool quitting: false
+    onClosing: (close) => {
+        conv.saveSettings()
+        if (!quitting && conv.unsavedFiles() > 0) {
+            close.accepted = false
+            closeDialog.open()
+        }
+    }
+
+    // Edits that were not saved as PDF when the window is closed.
+    Dialog {
+        id: closeDialog
+        title: "Unsaved edits"
+        modal: true
+        anchors.centerIn: parent
+        width: Math.min(window.width - 80, 520)
+        ColumnLayout {
+            anchors.fill: parent
+            spacing: 10
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: conv.unsavedFiles() === 1
+                      ? "One file has edits that were not saved as a PDF. They are kept, and come back when you open the file again."
+                      : conv.unsavedFiles() + " files have edits that were not saved as PDFs. They are kept, and come back when you open the files again."
+            }
+            RowLayout {
+                Layout.alignment: Qt.AlignRight
+                Button { text: "Save PDFs…"; onClicked: { closeDialog.close(); saveAllDialog.open() } }
+                Button { text: "Discard edits"; onClicked: { conv.discardAllEdits(); window.quitting = true; Qt.quit() } }
+                Button { text: "Keep and quit"; highlighted: true; onClicked: { window.quitting = true; Qt.quit() } }
+                Button { text: "Cancel"; onClicked: closeDialog.close() }
+            }
+        }
+    }
+    FolderDialog {
+        id: saveAllDialog
+        title: "Folder for the edited PDFs"
+        onAccepted: { conv.saveAllEdited(selectedFolder); window.quitting = true; Qt.quit() }
+    }
+
+    // Confirms forgetting edits (removing an edited file from the list).
+    Dialog {
+        id: discardDialog
+        property var action: null
+        property string what: ""
+        title: "Discard edits?"
+        modal: true
+        anchors.centerIn: parent
+        width: Math.min(window.width - 80, 460)
+        standardButtons: Dialog.Discard | Dialog.Cancel
+        Label { width: parent.width; wrapMode: Text.WordWrap; text: discardDialog.what }
+        onDiscarded: { if (action) action(); close() }
+    }
+    function confirmDiscard(what, action) {
+        discardDialog.what = what
+        discardDialog.action = action
+        discardDialog.open()
+    }
 
     Converter {
         id: conv
@@ -167,6 +228,78 @@ ApplicationWindow {
         }
     }
 
+    FileDialog {
+        id: pictureDialog
+        title: "Add a picture"
+        fileMode: FileDialog.OpenFile
+        nameFilters: ["Pictures (*.png *.jpg *.jpeg *.bmp *.gif *.webp *.tif *.tiff)", "All files (*)"]
+        onAccepted: conv.insertImage(selectedFile)
+    }
+    FileDialog {
+        id: replacePictureDialog
+        title: "Replace the picture with"
+        fileMode: FileDialog.OpenFile
+        nameFilters: ["Pictures (*.png *.jpg *.jpeg *.bmp *.gif *.webp *.tif *.tiff)", "All files (*)"]
+        onAccepted: conv.replaceImage(imageMenu.index, selectedFile)
+    }
+    FileDialog {
+        id: insertPdfDialog
+        title: "Insert the pages of a PDF"
+        fileMode: FileDialog.OpenFile
+        nameFilters: ["PDF documents (*.pdf)"]
+        onAccepted: conv.insertPdf(selectedFile)
+    }
+    FileDialog {
+        id: mergeDialog
+        title: "Join the listed files into"
+        fileMode: FileDialog.SaveFile
+        defaultSuffix: "pdf"
+        nameFilters: ["PDF documents (*.pdf)"]
+        onAccepted: conv.mergeFiles(selectedFile)
+    }
+    Dialog {
+        id: extractDialog
+        title: "Save pages as a PDF"
+        modal: true
+        anchors.centerIn: parent
+        width: Math.min(window.width - 80, 420)
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        onOpened: { pagesField.text = String(conv.previewPage); pagesField.selectAll(); pagesField.forceActiveFocus() }
+        onAccepted: extractFileDialog.open()
+        ColumnLayout {
+            anchors.fill: parent
+            Label { text: "Pages (e.g. 1-3, 7):" }
+            TextField { id: pagesField; Layout.fillWidth: true; onAccepted: extractDialog.accept() }
+        }
+    }
+    FileDialog {
+        id: extractFileDialog
+        title: "Save the pages as"
+        fileMode: FileDialog.SaveFile
+        defaultSuffix: "pdf"
+        nameFilters: ["PDF documents (*.pdf)"]
+        onAccepted: conv.extractPages(pagesField.text, selectedFile)
+    }
+    Dialog {
+        id: splitDialog
+        title: "Split into files"
+        modal: true
+        anchors.centerIn: parent
+        width: Math.min(window.width - 80, 420)
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        onAccepted: splitFolderDialog.open()
+        RowLayout {
+            anchors.fill: parent
+            Label { text: "Pages per file:" }
+            SpinBox { id: splitEvery; from: 1; to: 9999; value: 1; editable: true }
+        }
+    }
+    FolderDialog {
+        id: splitFolderDialog
+        title: "Folder for the parts"
+        onAccepted: conv.splitPdf(splitEvery.value, selectedFolder)
+    }
+
     // Find, tick the matches to change, replace.
     Dialog {
         id: findDialog
@@ -234,6 +367,13 @@ ApplicationWindow {
             }
             RowLayout {
                 TextField { id: replaceField; Layout.fillWidth: true; placeholderText: "Replace with" }
+                Button {
+                    text: "Redact ticked"
+                    enabled: findDialog.results.length > 0 && !conv.editBusy && !conv.busy
+                    onClicked: conv.redactFound(JSON.stringify(findDialog.ticked()))
+                    ToolTip.text: "Remove the ticked matches permanently and black them out"
+                    ToolTip.visible: hovered
+                }
                 Button {
                     text: "Replace ticked"
                     enabled: findDialog.results.length > 0 && !conv.editBusy && !conv.busy
@@ -434,6 +574,113 @@ ApplicationWindow {
                                               : modelData.font + " · " + modelData.size + " pt — click to edit, drag to move, Ctrl-click to select"
                                 ToolTip.delay: 500
                             }
+                        }
+                    }
+
+                    // Pictures: drag to move, drag the corner to resize, click for more.
+                    Repeater {
+                        model: conv.editMode && !window.paragraphMode && !window.redactMode && preview.status === Image.Ready ? window.images : []
+                        delegate: Rectangle {
+                            id: pic
+                            required property var modelData
+                            required property int index
+                            property real dx: 0
+                            property real dy: 0
+                            property real dw: 0
+                            property real dh: 0
+                            x: editOverlay.x + modelData.x * editOverlay.width + dx
+                            y: editOverlay.y + modelData.y * editOverlay.height + dy
+                            width: Math.max(8, modelData.w * editOverlay.width + dw)
+                            height: Math.max(8, modelData.h * editOverlay.height + dh)
+                            z: 1
+                            color: picArea.containsMouse ? Qt.rgba(0.15, 0.6, 0.3, 0.10) : "transparent"
+                            border.color: "#27ae60"
+                            border.width: picArea.containsMouse ? 2 : 1
+                            function commit() {
+                                if (dx === 0 && dy === 0 && dw === 0 && dh === 0) return
+                                conv.placeImage(index, (x - editOverlay.x) / editOverlay.width, (y - editOverlay.y) / editOverlay.height,
+                                                width / editOverlay.width, height / editOverlay.height)
+                            }
+                            MouseArea {
+                                id: picArea
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.SizeAllCursor
+                                enabled: !conv.editBusy
+                                property point start
+                                property bool moved: false
+                                onPressed: (m) => { start = Qt.point(m.x, m.y); moved = false }
+                                onPositionChanged: (m) => {
+                                    if (!pressed) return
+                                    var ddx = m.x - start.x, ddy = m.y - start.y
+                                    if (!moved && Math.abs(ddx) + Math.abs(ddy) > 5) moved = true
+                                    if (moved) { pic.dx += ddx; pic.dy += ddy }
+                                }
+                                onReleased: { if (moved) pic.commit() }
+                                onClicked: { if (!moved) { imageMenu.index = pic.index; imageMenu.popup() } }
+                            }
+                            Rectangle {
+                                width: 12
+                                height: 12
+                                anchors.right: parent.right
+                                anchors.bottom: parent.bottom
+                                color: "#27ae60"
+                                MouseArea {
+                                    anchors.fill: parent
+                                    cursorShape: Qt.SizeFDiagCursor
+                                    property point start
+                                    onPressed: (m) => start = Qt.point(m.x, m.y)
+                                    onPositionChanged: (m) => {
+                                        if (!pressed) return
+                                        // Keep the proportions.
+                                        var ratio = pic.height / Math.max(1, pic.width)
+                                        var ddx = m.x - start.x
+                                        pic.dw += ddx
+                                        pic.dh += ddx * ratio
+                                    }
+                                    onReleased: pic.commit()
+                                }
+                            }
+                        }
+                    }
+                    Menu {
+                        id: imageMenu
+                        property int index: -1
+                        MenuItem { text: "Replace picture…"; onTriggered: replacePictureDialog.open() }
+                        MenuItem { text: "Delete picture"; onTriggered: conv.deleteImage(imageMenu.index) }
+                    }
+
+                    // Redaction: drag a box over what must go.
+                    MouseArea {
+                        id: redactArea
+                        visible: conv.editMode && window.redactMode && preview.status === Image.Ready
+                        x: editOverlay.x
+                        y: editOverlay.y
+                        width: editOverlay.width
+                        height: editOverlay.height
+                        z: 15
+                        cursorShape: Qt.CrossCursor
+                        enabled: !conv.editBusy
+                        property point start
+                        property rect box: Qt.rect(0, 0, 0, 0)
+                        onPressed: (m) => { start = Qt.point(m.x, m.y); box = Qt.rect(m.x, m.y, 0, 0) }
+                        onPositionChanged: (m) => {
+                            if (pressed)
+                                box = Qt.rect(Math.min(start.x, m.x), Math.min(start.y, m.y), Math.abs(m.x - start.x), Math.abs(m.y - start.y))
+                        }
+                        onReleased: {
+                            if (box.width > 3 && box.height > 3)
+                                conv.redactArea(box.x / width, box.y / height, box.width / width, box.height / height)
+                            box = Qt.rect(0, 0, 0, 0)
+                        }
+                        Rectangle {
+                            x: redactArea.box.x
+                            y: redactArea.box.y
+                            width: redactArea.box.width
+                            height: redactArea.box.height
+                            color: Qt.rgba(0, 0, 0, 0.55)
+                            border.color: "#c0392b"
+                            border.width: 2
                         }
                     }
 
@@ -724,6 +971,19 @@ ApplicationWindow {
                         ToolTip.visible: hovered
                     }
                     Button {
+                        text: "Redact area"
+                        checkable: true
+                        checked: window.redactMode
+                        onToggled: { window.closeEditor(true); window.redactMode = checked }
+                        ToolTip.text: "Drag a box over text or pictures to remove them permanently (shown in black)"
+                        ToolTip.visible: hovered
+                    }
+                    Button {
+                        text: "Add picture…"
+                        enabled: !conv.editBusy && !conv.busy
+                        onClicked: pictureDialog.open()
+                    }
+                    Button {
                         text: "Delete selected"
                         visible: window.selection.length > 0
                         enabled: !conv.editBusy
@@ -830,6 +1090,28 @@ ApplicationWindow {
                             enabled: conv.previewPage < conv.pageCount
                             onClicked: conv.showPage(conv.previewPage + 1)
                         }
+                        Button {
+                            id: pageMenuButton
+                            text: "Page ▾"
+                            enabled: !conv.editBusy && !conv.busy
+                            onClicked: pageMenu.open()
+                            Menu {
+                                id: pageMenu
+                                y: -implicitHeight
+                                MenuItem { text: "Turn left"; onTriggered: conv.pageOp("rotate-left") }
+                                MenuItem { text: "Turn right"; onTriggered: conv.pageOp("rotate-right") }
+                                MenuSeparator {}
+                                MenuItem { text: "Move earlier"; enabled: conv.previewPage > 1; onTriggered: conv.pageOp("move-earlier") }
+                                MenuItem { text: "Move later"; enabled: conv.previewPage < conv.pageCount; onTriggered: conv.pageOp("move-later") }
+                                MenuSeparator {}
+                                MenuItem { text: "Insert blank page after"; onTriggered: conv.pageOp("insert-blank") }
+                                MenuItem { text: "Insert PDF after…"; onTriggered: insertPdfDialog.open() }
+                                MenuItem { text: "Delete page"; enabled: conv.pageCount > 1; onTriggered: conv.pageOp("delete") }
+                                MenuSeparator {}
+                                MenuItem { text: "Save pages as PDF…"; onTriggered: extractDialog.open() }
+                                MenuItem { text: "Split into files…"; onTriggered: splitDialog.open() }
+                            }
+                        }
                     }
                     Item { Layout.fillWidth: true }
                 }
@@ -901,7 +1183,13 @@ ApplicationWindow {
                                             enabled: row.modelData.status !== "converting"
                                             implicitWidth: 26
                                             implicitHeight: 22
-                                            onClicked: conv.removeItem(row.index)
+                                            onClicked: {
+                                                var i = row.index
+                                                if (row.modelData.edits > 0)
+                                                    window.confirmDiscard("Removing " + row.modelData.name + " from the list discards its edits.", function() { conv.removeItem(i) })
+                                                else
+                                                    conv.removeItem(i)
+                                            }
                                         }
                                     }
                                     ProgressBar {
@@ -927,9 +1215,23 @@ ApplicationWindow {
                                 onClicked: openDialog.open()
                             }
                             Button {
+                                text: "Join files…"
+                                visible: window.queue.length > 1
+                                enabled: !conv.busy && !conv.editBusy
+                                onClicked: mergeDialog.open()
+                                ToolTip.text: "Join all listed files (with their edits) into one PDF"
+                                ToolTip.visible: hovered
+                            }
+                            Button {
                                 text: "Clear list"
                                 enabled: window.queue.length > 0 && !conv.busy
-                                onClicked: conv.clearQueue()
+                                onClicked: {
+                                    var edited = window.queue.filter(function(q) { return q.edits > 0 }).length
+                                    if (edited > 0)
+                                        window.confirmDiscard("Clearing the list discards the edits of " + edited + (edited === 1 ? " file." : " files."), function() { conv.clearQueue() })
+                                    else
+                                        conv.clearQueue()
+                                }
                             }
                         }
                     }
@@ -1261,6 +1563,7 @@ ApplicationWindow {
     function screenshot() {
         window.contentItem.parent.grabToImage(function(result) {
             result.saveToFile(conv.screenshotPath)
+            window.quitting = true
             Qt.quit()
         })
     }
@@ -1274,6 +1577,12 @@ ApplicationWindow {
     readonly property bool paraDemo: conv.editDemo.startsWith("para:")
     readonly property bool ocrDemo: conv.editDemo === "ocr"
     readonly property bool findDemo: conv.editDemo.startsWith("find:")
+    readonly property bool pageDemo: conv.editDemo.startsWith("page:")
+    Timer {
+        running: window.pageDemo
+        interval: 3000
+        onTriggered: conv.pageOp(conv.editDemo.substring(5))
+    }
     Timer {
         running: window.findDemo
         interval: 3500
@@ -1294,7 +1603,7 @@ ApplicationWindow {
         onTriggered: window.openEditor(window.textItems.length - 1)
     }
     Timer {
-        running: conv.editDemo.length > 0 && !window.paraDemo && !window.ocrDemo && !window.findDemo
+        running: conv.editDemo.length > 0 && !window.paraDemo && !window.ocrDemo && !window.findDemo && !window.pageDemo
         interval: 4000
         onTriggered: conv.editRun(0, conv.editDemo, true, "{}")
     }
@@ -1312,7 +1621,7 @@ ApplicationWindow {
         }
     }
     Timer {
-        running: conv.editDemo.length > 0 && !window.paraDemo && !window.ocrDemo && !window.findDemo
+        running: conv.editDemo.length > 0 && !window.paraDemo && !window.ocrDemo && !window.findDemo && !window.pageDemo
         interval: 7500
         onTriggered: {
             if (window.textItems.length > 1) {

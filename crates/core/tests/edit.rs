@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 
 use lopdf::{dictionary, Document, Object, Stream};
 use pdf2word_core::edit::{
-    apply_edits, compact, find_replace, find_text, outlined_text, page_text, replace_matches, text_items, FindOptions, NewTextStyle, StyleChange, TextEdit,
-    TextItem,
+    apply_edits, compact, find_replace, find_text, outlined_text, page_text, replace_matches, text_items, FindOptions, ImageChange, NewTextStyle, StyleChange,
+    TextEdit, TextItem,
 };
 
 fn pdfium_available() -> bool {
@@ -530,4 +530,132 @@ fn letters_of_an_embedded_font_program_are_used() {
     // No other font was added.
     let doc = Document::load(&out).unwrap();
     assert!(!doc.objects.values().any(|o| o.as_dict().is_ok_and(|d| d.has(b"P2WFont"))));
+}
+
+/// A page with `content` and an image /Im1 (`w`×`h` pixels, white) next to Helvetica /F1.
+fn make_pdf_with_image(name: &str, content: &str, w: u32, h: u32) -> PathBuf {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica", "Encoding" => "WinAnsiEncoding" });
+    let img_id = doc.add_object(Stream::new(
+        dictionary! { "Type" => "XObject", "Subtype" => "Image", "Width" => w as i64, "Height" => h as i64, "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8 },
+        vec![255u8; (w * h * 3) as usize],
+    ));
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.as_bytes().to_vec()));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page", "Parent" => pages_id, "Contents" => content_id,
+        "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id }, "XObject" => dictionary! { "Im1" => img_id } },
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+    });
+    doc.objects.insert(pages_id, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1 }));
+    let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog_id);
+    let path = tmp(name);
+    doc.save(&path).unwrap();
+    path
+}
+
+/// The pixel of the page's first picture at (fx, fy), fractions from its top-left.
+fn picture_pixel(path: &Path, fx: f32, fy: f32) -> [u8; 3] {
+    use pdfium_render::prelude::PdfPageObjectsCommon;
+    let pdfium = pdf2word_core::load_pdfium(None).unwrap();
+    let doc = pdfium.load_pdf_from_file(path, None).unwrap();
+    let page = doc.pages().get(0).unwrap();
+    for o in page.objects().iter() {
+        if let Some(img) = o.as_image_object() {
+            let raw = img.get_raw_image().unwrap().to_rgb8();
+            let x = ((raw.width() as f32 * fx) as u32).min(raw.width() - 1);
+            let y = ((raw.height() as f32 * fy) as u32).min(raw.height() - 1);
+            return raw.get_pixel(x, y).0;
+        }
+    }
+    panic!("no picture");
+}
+
+#[test]
+fn redaction_removes_text_and_pixels_for_good() {
+    if !pdfium_available() {
+        return;
+    }
+    let content = format!("{LINES} q 100 0 0 100 300 500 cm /Im1 Do Q");
+    let input = make_pdf_with_image("redact.pdf", &content, 20, 20);
+    let items = text_items(&input, None, 0, None).unwrap();
+    let hello = item(&items, "Hello world");
+    // A box over "world" and the left half of the picture.
+    let (wx, wy) = (hello.x + hello.w * 0.55, hello.y - 0.002);
+    let edits = [
+        TextEdit::Redact { page: 0, x: wx, y: wy, w: hello.x + hello.w - wx + 0.002, h: hello.h + 0.004, fill: None },
+        TextEdit::Redact { page: 0, x: 300.0 / 612.0, y: (792.0 - 600.0) / 792.0, w: 50.0 / 612.0, h: 100.0 / 792.0, fill: Some([0, 0, 0]) },
+    ];
+    let out = tmp("redact-out.pdf");
+    apply_edits(&input, None, &edits, &out, None).unwrap();
+    let after = texts(&text_items(&out, None, 0, None).unwrap());
+    assert!(after.iter().any(|t| t.starts_with("Hello")) && !after.iter().any(|t| t.contains("world")), "{after:?}");
+    assert!(after.contains(&"Second line".to_string()) && after.contains(&", again".to_string()), "{after:?}");
+    // The following text keeps its place: the removed glyphs left their space.
+    let again = |p: &Path| item(&text_items(p, None, 0, None).unwrap(), ", again").x;
+    assert!((again(&out) - again(&input)).abs() < 0.001);
+    assert_eq!(picture_pixel(&out, 0.25, 0.5), [0, 0, 0]);
+    assert_eq!(picture_pixel(&out, 0.75, 0.5), [255, 255, 255]);
+    // Compacted, the removed text is not in the file at all.
+    let out2 = tmp("redact-compact.pdf");
+    compact(&out, None, &out2, None).unwrap();
+    let doc = Document::load(&out2).unwrap();
+    let all: Vec<u8> = doc.objects.values().filter_map(|o| o.as_stream().ok()).flat_map(|s| s.decompressed_content().unwrap_or_default()).collect();
+    let hay = String::from_utf8_lossy(&all);
+    assert!(!hay.contains("world") && !hay.contains("776F726C64"), "redacted text still in the file");
+}
+
+#[test]
+fn search_matches_are_redacted() {
+    if !pdfium_available() {
+        return;
+    }
+    let content = "BT /F1 10 Tf 72 700 Td (Account number 1234-5678 belongs to) Tj 0 -14 Td (the customer named John Smith.) Tj ET";
+    let input = make_pdf("redact-find.pdf", content, 0);
+    let found = find_text(&input, None, "1234-5678", FindOptions::default(), None).unwrap();
+    assert_eq!(found.len(), 1);
+    let out = tmp("redact-find-out.pdf");
+    pdf2word_core::edit::redact_matches(&input, None, &found, None, &out, None).unwrap();
+    let all = texts(&text_items(&out, None, 0, None).unwrap()).join(" ");
+    assert!(!all.contains("1234") && all.contains("Account number") && all.contains("belongs to"), "{all}");
+}
+
+#[test]
+fn pictures_are_moved_replaced_deleted_and_added() {
+    if !pdfium_available() {
+        return;
+    }
+    let input = make_pdf_with_image("pics.pdf", "q 100 0 0 50 300 500 cm /Im1 Do Q", 20, 10);
+    let pt = page_text(&input, None, 0, None).unwrap();
+    assert_eq!(pt.images.len(), 1);
+    let im = &pt.images[0];
+    assert!((im.x - 300.0 / 612.0).abs() < 0.001 && (im.w - 100.0 / 612.0).abs() < 0.001, "{im:?}");
+
+    // Move and enlarge.
+    let out = tmp("pics-place.pdf");
+    let change = ImageChange::Place { x: 0.1, y: 0.1, w: 0.4, h: 0.1 };
+    apply_edits(&input, None, &[TextEdit::Image { page: 0, path: im.path.clone(), change }], &out, None).unwrap();
+    let moved = &page_text(&out, None, 0, None).unwrap().images[0];
+    assert!((moved.x - 0.1).abs() < 0.002 && (moved.w - 0.4).abs() < 0.002 && (moved.h - 0.1).abs() < 0.002, "{moved:?}");
+
+    // Replace with a red PNG (square: fitted into the 2:1 box).
+    let png = tmp("red.png");
+    image::RgbImage::from_pixel(8, 8, image::Rgb([255, 0, 0])).save(&png).unwrap();
+    let out2 = tmp("pics-replace.pdf");
+    apply_edits(&input, None, &[TextEdit::Image { page: 0, path: im.path.clone(), change: ImageChange::Replace { file: png.clone() } }], &out2, None).unwrap();
+    let r = &page_text(&out2, None, 0, None).unwrap().images[0];
+    assert!((r.h - im.h).abs() < 0.002 && r.w < im.w * 0.6, "{r:?}");
+    assert_eq!(picture_pixel(&out2, 0.5, 0.5), [255, 0, 0]);
+
+    // Delete, and add one.
+    let out3 = tmp("pics-delete.pdf");
+    let edits = [
+        TextEdit::Image { page: 0, path: im.path.clone(), change: ImageChange::Delete },
+        TextEdit::InsertImage { page: 0, x: 0.5, y: 0.5, w: 0.2, h: 0.2, file: png },
+    ];
+    apply_edits(&input, None, &edits, &out3, None).unwrap();
+    let imgs = page_text(&out3, None, 0, None).unwrap().images;
+    assert_eq!(imgs.len(), 1);
+    assert!((imgs[0].x - 0.5).abs() < 0.002 && (imgs[0].w - 0.2).abs() < 0.002, "{:?}", imgs[0]);
 }

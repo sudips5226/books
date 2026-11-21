@@ -95,6 +95,28 @@ pub struct PageText {
     /// Shapes on the page that look like letters turned into outlines (not
     /// text): [`outlined_text`] can recognise them.
     pub outlined_shapes: usize,
+    pub images: Vec<ImageItem>,
+}
+
+/// A picture on a page.
+#[derive(Clone, Debug)]
+pub struct ImageItem {
+    pub path: ObjPath,
+    /// Box as fractions of the displayed page (0..1, origin top-left).
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+/// A change to a picture.
+#[derive(Clone, Debug)]
+pub enum ImageChange {
+    Delete,
+    /// Moves and scales the picture into this box (fractions of the displayed page).
+    Place { x: f32, y: f32, w: f32, h: f32 },
+    /// Shows another picture (PNG, JPEG …) in the same place.
+    Replace { file: std::path::PathBuf },
 }
 
 /// Style of newly added text.
@@ -134,6 +156,14 @@ pub enum TextEdit {
     /// outlines inside the box (`x`, `y`, `w`, `h`, fractions of the displayed
     /// page), writing `text` on `baseline` with an installed font.
     Outlined { page: usize, x: f32, y: f32, w: f32, h: f32, baseline: f32, text: String, size: f32, color: [u8; 3], style: NewTextStyle, fit: bool },
+    /// Permanently removes everything in a box (fractions of the displayed
+    /// page) — text, shapes, the pixels of pictures, annotations — and fills
+    /// it with `fill` (black when `None`).
+    Redact { page: usize, x: f32, y: f32, w: f32, h: f32, fill: Option<[u8; 3]> },
+    /// Changes a picture ([`PageText::images`]).
+    Image { page: usize, path: ObjPath, change: ImageChange },
+    /// Adds a picture into a box (fractions of the displayed page).
+    InsertImage { page: usize, x: f32, y: f32, w: f32, h: f32, file: std::path::PathBuf },
     /// Rewrites a paragraph (all its runs) with new text, wrapping it over as
     /// many lines as it needs. With `fit` the text is made smaller instead of
     /// taking more lines; with `push_down` the text below moves down when the
@@ -150,6 +180,9 @@ impl TextEdit {
             | TextEdit::Restyle { page, .. }
             | TextEdit::Move { page, .. }
             | TextEdit::Outlined { page, .. }
+            | TextEdit::Redact { page, .. }
+            | TextEdit::Image { page, .. }
+            | TextEdit::InsertImage { page, .. }
             | TextEdit::Paragraph { page, .. } => *page,
         }
     }
@@ -440,6 +473,87 @@ pub fn find_replace(
     Ok((matches.len(), report))
 }
 
+/// Redacts the given matches (from [`find_text`] on the same file): their
+/// characters are removed for good and covered with `fill` (black when `None`).
+pub fn redact_matches(input: &Path, password: Option<&str>, matches: &[Match], fill: Option<[u8; 3]>, output: &Path, pdfium_path: Option<&Path>) -> anyhow::Result<EditReport> {
+    let pdfium = crate::load_pdfium(pdfium_path)?;
+    let document = pdfium.load_pdf_from_file(input, password).map_err(|e| anyhow!("could not open {}: {e}", input.display()))?;
+    let mut edits = Vec::new();
+    let mut pages: BTreeMap<usize, Vec<&Match>> = BTreeMap::new();
+    for m in matches {
+        pages.entry(m.page).or_default().push(m);
+    }
+    for (page, ms) in pages {
+        let p = document.pages().get(page as PdfPageIndex)?;
+        let a = analyse(&p)?;
+        let (pw, ph) = (a.tf.width() as f64, a.tf.height() as f64);
+        for m in ms {
+            let Some(para) = a.paras.get(m.paragraph) else { continue };
+            // Character boxes of the match, one box per text object.
+            let mut boxes: BTreeMap<usize, [f64; 4]> = BTreeMap::new();
+            for pos in m.start..m.end.min(para.src.len()) {
+                let Src::Run(r, i) = para.src[pos] else { continue };
+                let Some((k, ci)) = objects::run_char_map(&a.po.objs, &a.runs[r]).get(i).copied().flatten() else { continue };
+                let b = a.po.objs[k].boxes[ci];
+                let e = boxes.entry(k).or_insert(b);
+                *e = [e[0].min(b[0]), e[1].min(b[1]), e[2].max(b[2]), e[3].max(b[3])];
+            }
+            for b in boxes.values() {
+                let r = disp_rect(&a.tf, *b);
+                let pad = 0.5;
+                edits.push(TextEdit::Redact {
+                    page,
+                    x: ((r.0 - pad) / pw) as f32,
+                    y: ((r.1 - pad) / ph) as f32,
+                    w: ((r.2 - r.0 + 2.0 * pad) / pw) as f32,
+                    h: ((r.3 - r.1 + 2.0 * pad) / ph) as f32,
+                    fill,
+                });
+            }
+        }
+    }
+    drop(document);
+    if edits.is_empty() {
+        std::fs::copy(input, output)?;
+        return Ok(EditReport::default());
+    }
+    apply_edits(input, password, &edits, output, pdfium_path)
+}
+
+/// Width and height in pixels of a picture file, if it can be read.
+pub fn image_size(file: &Path) -> Option<(u32, u32)> {
+    image::image_dimensions(file).ok()
+}
+
+/// A page-space rectangle (left, bottom, right, top) on the display (left, top, right, bottom).
+fn disp_rect(tf: &PageTransform, r: [f64; 4]) -> (f64, f64, f64, f64) {
+    let p = tf.point(r[0] as f32, r[1] as f32);
+    let q = tf.point(r[2] as f32, r[3] as f32);
+    (p.0.min(q.0) as f64, p.1.min(q.1) as f64, p.0.max(q.0) as f64, p.1.max(q.1) as f64)
+}
+
+/// A box in fractions of the display (x, y, w, h) in page space (left, bottom, right, top).
+fn display_box_to_page(tf: &PageTransform, b: [f32; 4]) -> [f64; 4] {
+    let (dw, dh) = (tf.width(), tf.height());
+    let corners = [(b[0], b[1]), (b[0] + b[2], b[1]), (b[0] + b[2], b[1] + b[3]), (b[0], b[1] + b[3])].map(|(x, y)| tf.to_user(x * dw, y * dh));
+    let xs = corners.iter().map(|c| c.0 as f64);
+    let ys = corners.iter().map(|c| c.1 as f64);
+    [xs.clone().fold(f64::MAX, f64::min), ys.clone().fold(f64::MAX, f64::min), xs.fold(f64::MIN, f64::max), ys.fold(f64::MIN, f64::max)]
+}
+
+/// Share of `b`'s area inside `r` (both left, bottom, right, top).
+fn inside_share(b: [f64; 4], r: [f64; 4]) -> f64 {
+    let area = ((b[2] - b[0]) * (b[3] - b[1])).max(1e-9);
+    let ix = (b[2].min(r[2]) - b[0].max(r[0])).max(0.0);
+    let iy = (b[3].min(r[3]) - b[1].max(r[1])).max(0.0);
+    if b[2] - b[0] < 1e-6 || b[3] - b[1] < 1e-6 {
+        // A degenerate box (a line): inside when its centre is.
+        let (cx, cy) = ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0);
+        return if cx >= r[0] && cx <= r[2] && cy >= r[1] && cy <= r[3] { 1.0 } else { 0.0 };
+    }
+    ix * iy / area
+}
+
 fn find_in(text: &str, query: &str, opts: FindOptions) -> Vec<(usize, usize)> {
     let fold = |c: char| if opts.match_case { c } else { c.to_lowercase().next().unwrap_or(c) };
     let t: Vec<char> = text.chars().collect();
@@ -461,7 +575,7 @@ fn find_in(text: &str, query: &str, opts: FindOptions) -> Vec<(usize, usize)> {
     out
 }
 
-fn load_lopdf(bytes: &[u8], password: Option<&str>) -> anyhow::Result<lopdf::Document> {
+pub(crate) fn load_lopdf(bytes: &[u8], password: Option<&str>) -> anyhow::Result<lopdf::Document> {
     let opts = match password {
         Some(pw) if !pw.is_empty() => lopdf::LoadOptions::with_password(pw),
         _ => lopdf::LoadOptions::default(),
@@ -471,7 +585,7 @@ fn load_lopdf(bytes: &[u8], password: Option<&str>) -> anyhow::Result<lopdf::Doc
 
 /// Writes `doc` as an incremental update of `prev` (the original file
 /// `bytes`): only new and changed objects are appended.
-fn save_incremental(bytes: Vec<u8>, prev: lopdf::Document, mut doc: lopdf::Document, output: &Path) -> anyhow::Result<()> {
+pub(crate) fn save_incremental(bytes: Vec<u8>, prev: lopdf::Document, mut doc: lopdf::Document, output: &Path) -> anyhow::Result<()> {
     let changed: Vec<(ObjectId, Object)> = doc
         .objects
         .iter()
@@ -579,7 +693,16 @@ impl Analysis {
                 lines: p.lines.len(),
             })
             .collect();
-        PageText { width: pw as f32, height: ph as f32, items, paragraphs, outlined_shapes: self.outline_shapes().len() }
+        let images = self
+            .po
+            .images
+            .iter()
+            .map(|im| {
+                let r = disp_rect(&self.tf, im.rect);
+                ImageItem { path: im.path.clone(), x: (r.0 / pw) as f32, y: (r.1 / ph) as f32, w: ((r.2 - r.0) / pw) as f32, h: ((r.3 - r.1) / ph) as f32 }
+            })
+            .collect();
+        PageText { width: pw as f32, height: ph as f32, items, paragraphs, outlined_shapes: self.outline_shapes().len(), images }
     }
 
     /// Letter-like outline shapes away from real text (display points: left, top, right, bottom).
@@ -737,13 +860,13 @@ fn page_resources(doc: &lopdf::Document, page_id: ObjectId) -> Dictionary {
     Dictionary::new()
 }
 
-/// Names of the form XObjects in a resource dictionary.
-fn form_names(doc: &lopdf::Document, res: &Dictionary) -> HashSet<Vec<u8>> {
+/// Names of the XObjects of a subtype ("Form", "Image") in a resource dictionary.
+fn xobject_names(doc: &lopdf::Document, res: &Dictionary, subtype: &[u8]) -> HashSet<Vec<u8>> {
     let mut out = HashSet::new();
     if let Ok(x) = res.get(b"XObject").map(|o| deref(doc, o)).and_then(|o| o.as_dict()) {
         for (name, v) in x.iter() {
             if let Ok(s) = deref(doc, v).as_stream() {
-                if s.dict.get(b"Subtype").ok().and_then(|o| o.as_name().ok()) == Some(b"Form") {
+                if s.dict.get(b"Subtype").ok().and_then(|o| o.as_name().ok()) == Some(subtype) {
                     out.insert(name.clone());
                 }
             }
@@ -810,11 +933,12 @@ impl<'a, 'b> Session<'a, 'b> {
         };
         let owner = xobject.unwrap_or(plan.page_id);
         let fonts = resource_fonts(&self.doc, &resources, owner);
-        let forms = form_names(&self.doc, &resources);
+        let forms = xobject_names(&self.doc, &resources, b"Form");
+        let images = xobject_names(&self.doc, &resources, b"Image");
         let objs = po.text_in(path);
-        let (scan, scan_error) = match content::scan(&content, &objs, &forms, matrix) {
+        let (scan, scan_error) = match content::scan(&content, &objs, &forms, &images, matrix) {
             Ok(s) => (s, None),
-            Err(e) => (Scan::ops_only(&content, &forms), Some(e.to_string())),
+            Err(e) => (Scan::ops_only(&content, &forms, &images), Some(e.to_string())),
         };
         if scan_error.is_none() && self.learning {
             let by_index: HashMap<usize, &PObj> = po.objs.iter().filter(|o| o.container() == path).map(|o| (o.index(), o)).collect();
@@ -878,7 +1002,7 @@ impl<'a, 'b> Session<'a, 'b> {
                 | TextEdit::Restyle { objects, .. }
                 | TextEdit::Move { objects, .. }
                 | TextEdit::Paragraph { objects, .. } => objects,
-                TextEdit::Insert { .. } | TextEdit::Outlined { .. } => &[],
+                TextEdit::Insert { .. } | TextEdit::Outlined { .. } | TextEdit::Redact { .. } | TextEdit::Image { .. } | TextEdit::InsertImage { .. } => &[],
             };
             for o in objects {
                 if !touched.insert(o.clone()) {
@@ -901,6 +1025,12 @@ impl<'a, 'b> Session<'a, 'b> {
                     self.move_objects(&mut plan, &a, objects, v)?
                 }
                 TextEdit::Paragraph { objects, text, fit, push_down, .. } => self.paragraph(&mut plan, &a, objects, text, *fit, *push_down, &mut touched)?,
+                TextEdit::Redact { x, y, w, h, fill, .. } => {
+                    let region = display_box_to_page(&a.tf, [*x, *y, *w, *h]);
+                    self.redact(&mut plan, &a, region, fill.unwrap_or([0, 0, 0]))?
+                }
+                TextEdit::Image { path, change, .. } => self.image(&mut plan, &a, path, change)?,
+                TextEdit::InsertImage { x, y, w, h, file, .. } => self.insert_image(&mut plan, &a, [*x, *y, *w, *h], file)?,
                 TextEdit::Outlined { x, y, w, h, baseline, text, size, color, style, fit, .. } => {
                     self.outlined(&mut plan, &a, [*x, *y, *w, *h], *baseline, text, *size, *color, style, *fit)?
                 }
@@ -1151,6 +1281,263 @@ impl<'a, 'b> Session<'a, 'b> {
         let c = self.container(plan, &a.po, &[])?;
         let run = SegRun { font: Some(RunFont::Fallback(fb)), size, color: Some(color), tz, tm: Some(m), items: pieces.into_iter().map(Item::Piece).collect(), ..Default::default() };
         plan.containers[c].appended.push(Out::Block(Segment { prefix: String::new(), reset: false, runs: vec![run], resume: String::new() }));
+        Ok(())
+    }
+
+    /// Permanently removes what lies in `region` (page space) and covers it.
+    fn redact(&mut self, plan: &mut PagePlan, a: &Analysis, region: [f64; 4], fill: [u8; 3]) -> anyhow::Result<()> {
+        let containers: Vec<(ObjPath, Mat, Vec<usize>)> = a.po.containers.iter().map(|c| (c.path.clone(), c.to_page, c.images.clone())).collect();
+        let mut partial = false;
+        for (path, to_page, image_objs) in containers {
+            let c = self.container(plan, &a.po, &path)?;
+            // Text: the glyphs inside are replaced by their advance.
+            let shows = plan.containers[c].scan.shows.clone();
+            let has_text_inside = a.po.objs.iter().any(|o| o.container() == path && o.boxes.iter().zip(&o.seq).any(|(b, (_, g))| !g && inside_share(*b, region) > 0.3));
+            if has_text_inside {
+                plan.containers[c].check().context("the text here cannot be redacted safely")?;
+            }
+            for sh in shows {
+                let mut opath = path.clone();
+                opath.push(sh.object);
+                let Some(o) = a.po.find(&opath) else { continue };
+                let hits: Vec<usize> = o.seq.iter().enumerate().filter(|(i, (_, g))| !g && inside_share(o.boxes[*i], region) > 0.3).map(|(i, _)| i).collect();
+                if hits.is_empty() {
+                    continue;
+                }
+                let cp = &plan.containers[c];
+                let op = &cp.scan.ops[sh.op];
+                let (s0, e0) = (op.start, op.end);
+                let replacement = match cp.fonts.get(&content::decode_name(&sh.font)).and_then(|m| m.code_len.map(|l| (m, l))) {
+                    Some((meta, len)) => {
+                        let real_index: Vec<usize> = o.seq.iter().enumerate().filter(|(_, (_, g))| !g).map(|(i, _)| i).collect();
+                        let n_codes: usize = sh.parts.iter().map(|p| if let content::Arg::Str(b) = p { b.len() / len } else { 0 }).sum();
+                        if n_codes == real_index.len() {
+                            let mut toks = Vec::new();
+                            let mut k = 0;
+                            for p in &sh.parts {
+                                match p {
+                                    content::Arg::Num(n) => toks.push(Tok::Kern(*n)),
+                                    content::Arg::Str(b) => {
+                                        for code in split_codes(b, len) {
+                                            let ci = real_index[k];
+                                            k += 1;
+                                            if hits.contains(&ci) {
+                                                let em = if meta.has_widths {
+                                                    *meta.widths.get(&fonts::code_value(&code)).unwrap_or(&meta.missing)
+                                                } else {
+                                                    let bx = o.boxes[ci];
+                                                    (bx[2] - bx[0]) / (o.size as f64).max(0.1)
+                                                };
+                                                let ws = if code == [32] && len == 1 { sh.tw } else { 0.0 };
+                                                let size = sh.size.abs().max(1e-6);
+                                                toks.push(Tok::Kern(-(em * 1000.0 + (sh.tc + ws) * 1000.0 / size)));
+                                            } else {
+                                                toks.push(Tok::Code(code));
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            format!("{}{}", quote_prefix(&sh, true), tj_ops(&toks, sh.size, sh.rise))
+                        } else {
+                            partial = true;
+                            neutralize(&sh)?
+                        }
+                    }
+                    None => {
+                        partial = true;
+                        neutralize(&sh)?
+                    }
+                };
+                plan.containers[c].splices.push((s0, e0, Out::Parts(vec![Part::Raw(replacement)])));
+            }
+            // Shapes mostly inside.
+            let cp = &mut plan.containers[c];
+            for paint in content::scan_paths(&cp.scan.ops, cp.matrix) {
+                if paint.clip {
+                    continue;
+                }
+                let hits: Vec<bool> = paint.subpaths.iter().map(|sp| inside_share(objects::transform_rect(&to_page, sp.2), region) > 0.5).collect();
+                for (sp, hit) in paint.subpaths.iter().zip(&hits) {
+                    if *hit {
+                        cp.splices.push((sp.0, sp.1, Out::Parts(vec![Part::Raw(String::new())])));
+                    }
+                }
+                if !hits.is_empty() && hits.iter().all(|h| *h) {
+                    cp.splices.push((paint.paint.0, paint.paint.1, Out::Parts(vec![Part::Raw(String::new())])));
+                }
+            }
+            // Pictures: the pixels inside are painted over.
+            for (k, idx) in image_objs.iter().enumerate() {
+                let mut ipath = path.clone();
+                ipath.push(*idx);
+                let Some(img) = a.po.images.iter().find(|i| i.path == ipath) else { continue };
+                if inside_share(img.rect, region) <= 0.0 {
+                    continue;
+                }
+                let cp = &plan.containers[c];
+                let op_index = *cp.scan.image_ops.get(k).ok_or_else(|| anyhow!("a picture here cannot be redacted safely"))?;
+                let op = cp.scan.ops[op_index].clone();
+                if op.name == b"BI" {
+                    // Inline image: removed entirely.
+                    plan.containers[c].splices.push((op.start, op.end, Out::Parts(vec![Part::Raw(String::new())])));
+                    partial = true;
+                    continue;
+                }
+                let Some(content::Arg::Name(raw)) = op.args.first() else { continue };
+                let name = content::decode_name(raw);
+                let xid = plan.containers[c]
+                    .resources
+                    .get(b"XObject")
+                    .ok()
+                    .map(|o| deref(&self.doc, o))
+                    .and_then(|o| o.as_dict().ok())
+                    .and_then(|d| d.get(&name).ok())
+                    .and_then(|o| o.as_reference().ok())
+                    .ok_or_else(|| anyhow!("a picture here cannot be redacted safely"))?;
+                let new_id = self.redact_image(plan.page, &ipath, xid, &mul(&img.matrix, &img.to_page), region, fill)?;
+                let cp = &mut plan.containers[c];
+                let new_name = cp.resource_name(&self.doc, b"XObject", new_id);
+                cp.splices.push((op.start, op.end, Out::Parts(vec![Part::Raw(format!("{} Do", write_name(&new_name)))])));
+            }
+        }
+        // Annotations over the area.
+        let page_id = plan.page_id;
+        let annots = self.doc.get_dictionary(page_id)?.get(b"Annots").ok().map(|o| deref(&self.doc, o).clone());
+        if let Some(Object::Array(list)) = annots {
+            let keep: Vec<Object> = list
+                .iter()
+                .filter(|o| {
+                    let r = deref(&self.doc, o).as_dict().ok().and_then(|d| d.get(b"Rect").ok()).and_then(|r| deref(&self.doc, r).as_array().ok()).map(|a| {
+                        let v: Vec<f64> = a.iter().map(|x| fonts::obj_num(&self.doc, x).unwrap_or(0.0)).collect();
+                        [v[0].min(v[2]), v[1].min(v[3]), v[0].max(v[2]), v[1].max(v[3])]
+                    });
+                    !r.is_some_and(|r| r[0] < region[2] && r[2] > region[0] && r[1] < region[3] && r[3] > region[1])
+                })
+                .cloned()
+                .collect();
+            if keep.len() != list.len() {
+                self.doc.get_dictionary_mut(page_id)?.set("Annots", Object::Array(keep));
+            }
+        }
+        if partial {
+            self.ctx.note(format!("Page {}: some text or pictures touching the redacted area were removed entirely.", plan.page + 1));
+        }
+        // The box itself.
+        let c = self.container(plan, &a.po, &[])?;
+        let [r, g, b] = fill;
+        let cover = format!(
+            "q {} {} {} rg {} {} {} {} re f Q\n",
+            fmt(r as f64 / 255.0),
+            fmt(g as f64 / 255.0),
+            fmt(b as f64 / 255.0),
+            fmt(region[0]),
+            fmt(region[1]),
+            fmt(region[2] - region[0]),
+            fmt(region[3] - region[1])
+        );
+        plan.containers[c].appended.push(Out::Parts(vec![Part::Raw(cover)]));
+        Ok(())
+    }
+
+    /// The PDFium image object at `path` on a page, decoded.
+    fn decoded_image(&self, page: usize, path: &[usize]) -> anyhow::Result<image::DynamicImage> {
+        fn find(obj: &PdfPageObject, rest: &[usize]) -> anyhow::Result<image::DynamicImage> {
+            match rest.split_first() {
+                None => Ok(obj.as_image_object().ok_or_else(|| anyhow!("not a picture"))?.get_raw_image()?),
+                Some((k, rest)) => {
+                    let child = obj.as_x_object_form_object().ok_or_else(|| anyhow!("picture not found"))?.get(*k as PdfPageObjectIndex)?;
+                    find(&child, rest)
+                }
+            }
+        }
+        let p = self.pdoc.pages().get(page as PdfPageIndex)?;
+        let obj = p.objects().get(path[0] as PdfPageObjectIndex)?;
+        find(&obj, &path[1..])
+    }
+
+    /// A copy of image `xid` with the pixels inside `region` painted over.
+    fn redact_image(&mut self, page: usize, path: &[usize], xid: ObjectId, unit_to_page: &Mat, region: [f64; 4], fill: [u8; 3]) -> anyhow::Result<ObjectId> {
+        let decoded = self.decoded_image(page, path)?;
+        let mut rgb = decoded.to_rgb8();
+        let (w, h) = (rgb.width() as f64, rgb.height() as f64);
+        let inv = invert(unit_to_page).ok_or_else(|| anyhow!("degenerate picture"))?;
+        let corners = [(region[0], region[1]), (region[2], region[1]), (region[2], region[3]), (region[0], region[3])].map(|(x, y)| apply(&inv, x, y));
+        let (u0, u1) = (corners.iter().map(|c| c.0).fold(f64::MAX, f64::min), corners.iter().map(|c| c.0).fold(f64::MIN, f64::max));
+        let (v0, v1) = (corners.iter().map(|c| c.1).fold(f64::MAX, f64::min), corners.iter().map(|c| c.1).fold(f64::MIN, f64::max));
+        let x0 = (u0.max(0.0) * w).floor() as u32;
+        let x1 = ((u1.min(1.0) * w).ceil() as u32).min(rgb.width());
+        let y0 = ((1.0 - v1.min(1.0)) * h).floor() as u32;
+        let y1 = (((1.0 - v0.max(0.0)) * h).ceil() as u32).min(rgb.height());
+        for y in y0..y1 {
+            for x in x0..x1 {
+                rgb.put_pixel(x, y, image::Rgb(fill));
+            }
+        }
+        let old = self.doc.get_object(xid)?.as_stream()?.clone();
+        let jpeg = old.dict.get(b"Filter").ok().map(|f| format!("{f:?}")).is_some_and(|f| f.contains("DCTDecode"));
+        let mut dict = Dictionary::new();
+        for key in [&b"Interpolate"[..], b"SMask", b"Intent"] {
+            if let Ok(v) = old.dict.get(key) {
+                dict.set(key.to_vec(), v.clone());
+            }
+        }
+        Ok(self.doc.add_object(image_stream(dict, &image::DynamicImage::ImageRgb8(rgb), jpeg)?))
+    }
+
+    /// Changes a picture.
+    fn image(&mut self, plan: &mut PagePlan, a: &Analysis, path: &[usize], change: &ImageChange) -> anyhow::Result<()> {
+        let img = a.po.images.iter().find(|i| i.path == path).ok_or_else(|| anyhow!("picture not found"))?;
+        let container_path = path[..path.len() - 1].to_vec();
+        let info = a.po.container(&container_path).ok_or_else(|| anyhow!("picture not found"))?;
+        let k = info.images.iter().position(|i| Some(i) == path.last()).ok_or_else(|| anyhow!("picture not found"))?;
+        let c = self.container(plan, &a.po, &container_path)?;
+        let op_index = *plan.containers[c].scan.image_ops.get(k).ok_or_else(|| anyhow!("could not find the picture in the content"))?;
+        let op = plan.containers[c].scan.ops[op_index].clone();
+        let original = String::from_utf8_lossy(&plan.containers[c].content[op.start..op.end]).into_owned();
+        let m_page = mul(&img.matrix, &img.to_page);
+        // Draws `what` with the unit square mapped by `target` (page space).
+        let placed = |target: &Mat, what: &str| -> anyhow::Result<String> {
+            let to_c = invert(&img.to_page).ok_or_else(|| anyhow!("degenerate matrix"))?;
+            let m_c = mul(target, &to_c);
+            let adj = mul(&m_c, &invert(&img.matrix).ok_or_else(|| anyhow!("degenerate picture"))?);
+            Ok(format!("q {} cm {what} Q", fmt_mat(&adj)))
+        };
+        let text = match change {
+            ImageChange::Delete => String::new(),
+            ImageChange::Place { x, y, w, h } => {
+                let target = display_box_to_page(&a.tf, [*x, *y, *w, *h]);
+                placed(&rect_map(&m_page, img.rect, target), &original)?
+            }
+            ImageChange::Replace { file } => {
+                let (id, (iw, ih)) = add_image_file(&mut self.doc, file)?;
+                let name = plan.containers[c].resource_name(&self.doc, b"XObject", id);
+                // Fit inside the old box, keeping the new picture's proportions.
+                let (bw, bh) = (img.rect[2] - img.rect[0], img.rect[3] - img.rect[1]);
+                let s = (bw / iw as f64).min(bh / ih as f64);
+                let (nw, nh) = (iw as f64 * s, ih as f64 * s);
+                let (cx, cy) = ((img.rect[0] + img.rect[2]) / 2.0, (img.rect[1] + img.rect[3]) / 2.0);
+                let target = [nw, 0.0, 0.0, nh, cx - nw / 2.0, cy - nh / 2.0];
+                placed(&target, &format!("{} Do", write_name(&name)))?
+            }
+        };
+        plan.containers[c].splices.push((op.start, op.end, Out::Parts(vec![Part::Raw(text)])));
+        Ok(())
+    }
+
+    /// Adds a picture in a box of the displayed page.
+    fn insert_image(&mut self, plan: &mut PagePlan, a: &Analysis, bx: [f32; 4], file: &Path) -> anyhow::Result<()> {
+        let (id, _) = add_image_file(&mut self.doc, file)?;
+        let c = self.container(plan, &a.po, &[])?;
+        let name = plan.containers[c].resource_name(&self.doc, b"XObject", id);
+        let (dw, dh) = (a.tf.width(), a.tf.height());
+        // Upright as displayed: x along the display's right, y up the display.
+        let o = a.tf.to_user(bx[0] * dw, (bx[1] + bx[3]) * dh);
+        let r = a.tf.to_user((bx[0] + bx[2]) * dw, (bx[1] + bx[3]) * dh);
+        let u = a.tf.to_user(bx[0] * dw, bx[1] * dh);
+        let m: Mat = [(r.0 - o.0) as f64, (r.1 - o.1) as f64, (u.0 - o.0) as f64, (u.1 - o.1) as f64, o.0 as f64, o.1 as f64];
+        plan.containers[c].appended.push(Out::Parts(vec![Part::Raw(format!("q {} cm {} Do Q\n", fmt_mat(&m), write_name(&name)))]));
         Ok(())
     }
 
@@ -1890,6 +2277,87 @@ fn visual_order_of(dirs: &[Option<bool>], rtl_para: bool) -> Vec<usize> {
         lvl -= 1;
     }
     order
+}
+
+/// `m` (unit square → page) changed so that its bounds `from` become `to`.
+fn rect_map(m: &Mat, from: [f64; 4], to: [f64; 4]) -> Mat {
+    let sx = (to[2] - to[0]) / (from[2] - from[0]).max(1e-9);
+    let sy = (to[3] - to[1]) / (from[3] - from[1]).max(1e-9);
+    let a: Mat = [sx, 0.0, 0.0, sy, to[0] - from[0] * sx, to[1] - from[1] * sy];
+    mul(m, &a)
+}
+
+/// An image XObject for `img` (JPEG or Flate-compressed samples, alpha as a soft mask).
+fn image_stream(mut dict: Dictionary, img: &image::DynamicImage, jpeg: bool) -> anyhow::Result<Stream> {
+    dict.set("Type", Object::Name(b"XObject".to_vec()));
+    dict.set("Subtype", Object::Name(b"Image".to_vec()));
+    dict.set("Width", img.width() as i64);
+    dict.set("Height", img.height() as i64);
+    dict.set("BitsPerComponent", 8i64);
+    let gray = matches!(img.color(), image::ColorType::L8 | image::ColorType::L16 | image::ColorType::La8 | image::ColorType::La16);
+    dict.set("ColorSpace", Object::Name(if gray { b"DeviceGray".to_vec() } else { b"DeviceRGB".to_vec() }));
+    if jpeg {
+        let mut out = Vec::new();
+        let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90);
+        if gray {
+            img.to_luma8().write_with_encoder(enc)?;
+        } else {
+            img.to_rgb8().write_with_encoder(enc)?;
+        }
+        dict.set("Filter", Object::Name(b"DCTDecode".to_vec()));
+        return Ok(Stream::new(dict, out).with_compression(false));
+    }
+    let samples = if gray { img.to_luma8().into_raw() } else { img.to_rgb8().into_raw() };
+    let mut s = Stream::new(dict, samples);
+    let _ = s.compress();
+    Ok(s)
+}
+
+/// Adds an image file to the document as an image XObject; returns it and its size in pixels.
+fn add_image_file(doc: &mut lopdf::Document, file: &Path) -> anyhow::Result<(ObjectId, (u32, u32))> {
+    let (mut stream, mask, size) = load_image_file(file)?;
+    if let Some(mask) = mask {
+        let mid = doc.add_object(mask);
+        stream.dict.set("SMask", mid);
+    }
+    Ok((doc.add_object(stream), size))
+}
+
+/// An image file as an image XObject (and its soft mask), and its size in pixels.
+fn load_image_file(file: &Path) -> anyhow::Result<(Stream, Option<Stream>, (u32, u32))> {
+    let bytes = std::fs::read(file).with_context(|| format!("could not read {}", file.display()))?;
+    let img = image::load_from_memory(&bytes).with_context(|| format!("{} is not a picture this program can read", file.display()))?;
+    let (w, h) = (img.width(), img.height());
+    let is_jpeg = bytes.starts_with(&[0xFF, 0xD8]);
+    let mut dict = Dictionary::new();
+    let mut mask = None;
+    let stream = if is_jpeg && matches!(img.color(), image::ColorType::Rgb8 | image::ColorType::L8) {
+        // The JPEG as it is.
+        dict.set("Type", Object::Name(b"XObject".to_vec()));
+        dict.set("Subtype", Object::Name(b"Image".to_vec()));
+        dict.set("Width", w as i64);
+        dict.set("Height", h as i64);
+        dict.set("BitsPerComponent", 8i64);
+        dict.set("ColorSpace", Object::Name(if img.color() == image::ColorType::L8 { b"DeviceGray".to_vec() } else { b"DeviceRGB".to_vec() }));
+        dict.set("Filter", Object::Name(b"DCTDecode".to_vec()));
+        Stream::new(dict, bytes).with_compression(false)
+    } else {
+        if img.color().has_alpha() {
+            let alpha: Vec<u8> = img.to_rgba8().pixels().map(|p| p.0[3]).collect();
+            let mut md = Dictionary::new();
+            md.set("Type", Object::Name(b"XObject".to_vec()));
+            md.set("Subtype", Object::Name(b"Image".to_vec()));
+            md.set("Width", w as i64);
+            md.set("Height", h as i64);
+            md.set("BitsPerComponent", 8i64);
+            md.set("ColorSpace", Object::Name(b"DeviceGray".to_vec()));
+            let mut ms = Stream::new(md, alpha);
+            let _ = ms.compress();
+            mask = Some(ms);
+        }
+        image_stream(dict, &img, false)?
+    };
+    Ok((stream, mask, (w, h)))
 }
 
 fn x_len(m: &Mat) -> f64 {

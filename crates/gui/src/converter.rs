@@ -228,6 +228,77 @@ pub mod qobject {
         #[cxx_name = "redoEdit"]
         fn redo_edit(self: Pin<&mut Converter>);
 
+        /// Changes the current page: "rotate-left", "rotate-right", "delete",
+        /// "move-earlier", "move-later", "insert-blank".
+        #[qinvokable]
+        #[cxx_name = "pageOp"]
+        fn page_op(self: Pin<&mut Converter>, kind: &QString);
+
+        /// Inserts the pages of another PDF after the current page.
+        #[qinvokable]
+        #[cxx_name = "insertPdf"]
+        fn insert_pdf(self: Pin<&mut Converter>, url: &QUrl);
+
+        /// Writes pages (e.g. "1-3,7") of the selected file to a new PDF.
+        #[qinvokable]
+        #[cxx_name = "extractPages"]
+        fn extract_pages(self: Pin<&mut Converter>, spec: &QString, url: &QUrl);
+
+        /// Splits the selected file into PDFs of `every` pages in a folder.
+        #[qinvokable]
+        #[cxx_name = "splitPdf"]
+        fn split_pdf(self: Pin<&mut Converter>, every: i32, folder: &QUrl);
+
+        /// Joins all listed files (with their edits) into one PDF and adds it to the list.
+        #[qinvokable]
+        #[cxx_name = "mergeFiles"]
+        fn merge_files(self: Pin<&mut Converter>, url: &QUrl);
+
+        /// Permanently removes everything in a box (fractions of the page) and blacks it out.
+        #[qinvokable]
+        #[cxx_name = "redactArea"]
+        fn redact_area(self: Pin<&mut Converter>, x: f64, y: f64, w: f64, h: f64);
+
+        /// Redacts the found matches with these indices (JSON array).
+        #[qinvokable]
+        #[cxx_name = "redactFound"]
+        fn redact_found(self: Pin<&mut Converter>, indices: &QString);
+
+        /// Deletes picture `index` (from `pageTextJson`).
+        #[qinvokable]
+        #[cxx_name = "deleteImage"]
+        fn delete_image(self: Pin<&mut Converter>, index: i32);
+
+        /// Moves/resizes picture `index` into a box (fractions of the page).
+        #[qinvokable]
+        #[cxx_name = "placeImage"]
+        fn place_image(self: Pin<&mut Converter>, index: i32, x: f64, y: f64, w: f64, h: f64);
+
+        /// Shows another picture file in place of picture `index`.
+        #[qinvokable]
+        #[cxx_name = "replaceImage"]
+        fn replace_image(self: Pin<&mut Converter>, index: i32, url: &QUrl);
+
+        /// Adds a picture file in the middle of the page.
+        #[qinvokable]
+        #[cxx_name = "insertImage"]
+        fn insert_image(self: Pin<&mut Converter>, url: &QUrl);
+
+        /// Number of files with edits that were not saved as PDF.
+        #[qinvokable]
+        #[cxx_name = "unsavedFiles"]
+        fn unsaved_files(self: &Converter) -> i32;
+
+        /// Saves every edited file as `<name>-edited.pdf` in a folder.
+        #[qinvokable]
+        #[cxx_name = "saveAllEdited"]
+        fn save_all_edited(self: Pin<&mut Converter>, folder: &QUrl);
+
+        /// Forgets the edits of every file.
+        #[qinvokable]
+        #[cxx_name = "discardAllEdits"]
+        fn discard_all_edits(self: Pin<&mut Converter>);
+
         /// Saves the selected file's edited PDF.
         #[qinvokable]
         #[cxx_name = "saveEditedPdf"]
@@ -261,6 +332,8 @@ struct QueueItem {
     versions: Vec<PathBuf>,
     /// Undone versions, most recently undone last.
     redo: Vec<PathBuf>,
+    /// The current version was saved as a PDF.
+    saved: Option<PathBuf>,
 }
 
 impl QueueItem {
@@ -273,6 +346,23 @@ impl QueueItem {
         for v in self.versions.drain(..).chain(self.redo.drain(..)) {
             let _ = std::fs::remove_file(v);
         }
+        if let Some(dir) = session_dir(&self.input) {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// Records the versions so that they come back when the file is opened again.
+    fn save_session(&self) {
+        let Some(dir) = session_dir(&self.input) else { return };
+        if self.versions.is_empty() && self.redo.is_empty() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let (size, mtime) = file_stamp(&self.input).unwrap_or((0, 0));
+        let names = |v: &[PathBuf]| v.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>();
+        let v = json!({ "input": self.input.to_string_lossy(), "size": size, "mtime": mtime, "versions": names(&self.versions), "redo": names(&self.redo) });
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join("session.json"), v.to_string());
     }
 
     fn clear_redo(&mut self) {
@@ -348,14 +438,18 @@ pub struct ConverterRust {
     preview_edit: Option<(String, PathBuf, PathBuf)>,
     /// A preview asked for while another edit was running.
     queued_preview: Option<(String, String, EditJob)>,
+    /// Page to show after the running edit (1-based), e.g. after moving a page.
+    goto_after_edit: Option<i32>,
     /// Incremented for every preview render, so that stale results are dropped.
     render_gen: u64,
 }
 
 impl Drop for ConverterRust {
     fn drop(&mut self) {
-        for q in &mut self.queue {
-            q.discard_versions();
+        // Edited versions stay in their sessions (restored when the file is
+        // opened again); only an unused preview is removed.
+        if let Some((_, path, _)) = self.preview_edit.take() {
+            let _ = std::fs::remove_file(path);
         }
     }
 }
@@ -372,6 +466,44 @@ fn settings_file() -> Option<PathBuf> {
         std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
     }?;
     Some(base.join("pdf2word").join("settings.json"))
+}
+
+/// Where the edited versions of a PDF are kept between runs.
+fn session_dir(input: &Path) -> Option<PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let base = if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA").or_else(|| std::env::var_os("APPDATA")).map(PathBuf::from)
+    } else if cfg!(target_os = "macos") {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support"))
+    } else {
+        std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+    }?;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    input.to_string_lossy().hash(&mut h);
+    Some(base.join("pdf2word").join("sessions").join(format!("{:016x}", h.finish())))
+}
+
+/// Size and modification time of a file (to tell whether it changed).
+fn file_stamp(p: &Path) -> Option<(u64, u64)> {
+    let m = std::fs::metadata(p).ok()?;
+    let t = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    Some((m.len(), t))
+}
+
+/// The versions kept for `input`, when the file has not changed since.
+fn load_session(input: &Path) -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let dir = session_dir(input)?;
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("session.json")).ok()?).ok()?;
+    let (size, mtime) = file_stamp(input)?;
+    if v.get("size").and_then(Value::as_u64) != Some(size) || v.get("mtime").and_then(Value::as_u64) != Some(mtime) {
+        let _ = std::fs::remove_dir_all(&dir);
+        return None;
+    }
+    let paths = |k: &str| -> Vec<PathBuf> {
+        v.get(k).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(PathBuf::from).filter(|p| p.is_file()).collect()).unwrap_or_default()
+    };
+    let (versions, redo) = (paths("versions"), paths("redo"));
+    (!versions.is_empty() || !redo.is_empty()).then_some((versions, redo))
 }
 
 impl Default for ConverterRust {
@@ -436,6 +568,7 @@ impl Default for ConverterRust {
             matches_source: PathBuf::new(),
             preview_edit: None,
             queued_preview: None,
+            goto_after_edit: None,
             render_gen: 0,
         };
         if let Some(v) = settings_file().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|t| serde_json::from_str::<Value>(&t).ok()) {
@@ -626,6 +759,11 @@ impl qobject::Converter {
             return i;
         }
         let output = output_for(&path, self.folder().as_deref());
+        let (versions, redo) = load_session(&path).unwrap_or_default();
+        if !versions.is_empty() {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            self.as_mut().set_status(QString::from(&format!("{name}: {} edit{} from last time restored", versions.len(), if versions.len() == 1 { "" } else { "s" })));
+        }
         self.as_mut().rust_mut().queue.push(QueueItem {
             input: path,
             output,
@@ -633,8 +771,9 @@ impl qobject::Converter {
             status: ItemStatus::Waiting,
             progress: 0.0,
             message: String::new(),
-            versions: Vec::new(),
-            redo: Vec::new(),
+            versions,
+            redo,
+            saved: None,
         });
         self.rust().queue.len() - 1
     }
@@ -1124,7 +1263,8 @@ impl qobject::Converter {
             .map(|(i, p)| json!({ "i": i, "items": p.items, "text": p.text, "x": p.x, "y": p.y, "w": p.w, "h": p.h, "lines": p.lines,
                 "align": format!("{:?}", p.align).to_lowercase() }))
             .collect();
-        let v = json!({ "w": pt.width, "h": pt.height, "outlined": pt.outlined_shapes, "recognised": !self.rust().outlined.is_empty(), "items": items, "paragraphs": paras });
+        let images: Vec<Value> = pt.images.iter().enumerate().map(|(i, im)| json!({ "i": i, "x": im.x, "y": im.y, "w": im.w, "h": im.h })).collect();
+        let v = json!({ "w": pt.width, "h": pt.height, "outlined": pt.outlined_shapes, "recognised": !self.rust().outlined.is_empty(), "items": items, "paragraphs": paras, "images": images });
         self.as_mut().set_page_text_json(QString::from(&v.to_string()));
     }
 
@@ -1231,7 +1371,18 @@ impl qobject::Converter {
     fn commit_version(mut self: Pin<&mut Self>, index: usize, out: PathBuf, what: &str, notes: &[String]) {
         if let Some(item) = self.as_mut().rust_mut().queue.get_mut(index) {
             item.clear_redo();
-            item.versions.push(out);
+            // Into the file's session folder, where it outlives this run.
+            let kept = session_dir(&item.input)
+                .and_then(|dir| {
+                    std::fs::create_dir_all(&dir).ok()?;
+                    let n = PREVIEW_COUNTER.fetch_add(1, Ordering::SeqCst);
+                    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+                    let target = dir.join(format!("v{stamp}-{n}.pdf"));
+                    (std::fs::rename(&out, &target).is_ok() || (std::fs::copy(&out, &target).is_ok() && std::fs::remove_file(&out).is_ok())).then_some(target)
+                })
+                .unwrap_or(out);
+            item.versions.push(kept);
+            item.save_session();
             if item.status == ItemStatus::Done {
                 item.status = ItemStatus::Waiting;
                 item.progress = 0.0;
@@ -1247,9 +1398,31 @@ impl qobject::Converter {
         self.as_mut().set_status(QString::from(&msg));
         self.as_mut().set_previewing(false);
         self.as_mut().sync_queue();
+        let goto = self.as_mut().rust_mut().goto_after_edit.take();
         if *self.selected() == index as i32 {
-            let page = *self.preview_page();
+            self.as_mut().refresh_page_count();
+            let page = goto.unwrap_or(*self.preview_page());
             self.show_page(page);
+        }
+    }
+
+    /// Reads the page count of the selected file's current version again.
+    fn refresh_page_count(mut self: Pin<&mut Self>) {
+        let Some(source) = self.selected_source() else { return };
+        let password = opt_string(self.password());
+        if let Ok(pdfium) = pdf2word_core::load_pdfium(None) {
+            if let Ok(doc) = pdfium.load_pdf_from_file(&source, password.as_deref()) {
+                let n = doc.pages().len();
+                drop(doc);
+                self.as_mut().set_page_count(n);
+                let info = self.document_info().to_string();
+                if let Some(rest) = info.split_once(" page").map(|(a, b)| (a.rsplit_once(' ').map(|x| x.0).unwrap_or(""), b)) {
+                    let prefix = if rest.0.is_empty() { String::new() } else { format!("{} ", rest.0) };
+                    let plural = if n == 1 { "" } else { "s" };
+                    let tail = rest.1.trim_start_matches('s');
+                    self.as_mut().set_document_info(QString::from(&format!("{prefix}{n} page{plural}{tail}")));
+                }
+            }
         }
     }
 
@@ -1544,6 +1717,7 @@ impl qobject::Converter {
             Some(item) => match item.versions.pop() {
                 Some(v) => {
                     item.redo.push(v);
+                    item.save_session();
                     if item.status == ItemStatus::Done {
                         item.status = ItemStatus::Waiting;
                         item.progress = 0.0;
@@ -1557,6 +1731,7 @@ impl qobject::Converter {
         if undone {
             self.as_mut().set_status(QString::from("Edit undone"));
             self.as_mut().sync_queue();
+            self.as_mut().refresh_page_count();
             let page = *self.preview_page();
             self.show_page(page);
         }
@@ -1572,6 +1747,7 @@ impl qobject::Converter {
             Some(item) => match item.redo.pop() {
                 Some(v) => {
                     item.versions.push(v);
+                    item.save_session();
                     true
                 }
                 None => false,
@@ -1581,6 +1757,7 @@ impl qobject::Converter {
         if redone {
             self.as_mut().set_status(QString::from("Edit redone"));
             self.as_mut().sync_queue();
+            self.as_mut().refresh_page_count();
             let page = *self.preview_page();
             self.show_page(page);
         }
@@ -1604,13 +1781,239 @@ impl qobject::Converter {
             let result = pdf2word_core::edit::compact(&source, password.as_deref(), &path, None).or_else(|_| std::fs::copy(&source, &path).map(|_| ()).map_err(anyhow::Error::from));
             let _ = qt_thread.queue(move |mut obj| {
                 let msg = match result {
-                    Ok(()) => format!("Saved {}", path.display()),
+                    Ok(()) => {
+                        if let Some(q) = obj.as_mut().rust_mut().queue.iter_mut().find(|q| q.versions.last() == Some(&source)) {
+                            q.saved = Some(source.clone());
+                        }
+                        format!("Saved {}", path.display())
+                    }
                     Err(e) => format!("Could not save {}: {e:#}", path.display()),
                 };
                 obj.as_mut().append_log(&msg);
                 obj.as_mut().set_status(QString::from(&msg));
             });
         });
+    }
+
+    fn page_ops(self: Pin<&mut Self>, what: &str, ops: Vec<pdf2word_core::pages::PageOp>) {
+        self.run_edit(
+            what.to_string(),
+            Box::new(move |src, pw, out| {
+                pdf2word_core::pages::apply_page_ops(src, pw, &ops, out)?;
+                Ok((1, Vec::new()))
+            }),
+            None,
+        );
+    }
+
+    pub fn page_op(mut self: Pin<&mut Self>, kind: &QString) {
+        use pdf2word_core::pages::PageOp;
+        let page = self.page_index();
+        let count = (*self.page_count()).max(0) as usize;
+        let (what, op, next) = match kind.to_string().as_str() {
+            "rotate-left" => ("Turning the page", PageOp::Rotate { pages: vec![page], degrees: -90 }, page),
+            "rotate-right" => ("Turning the page", PageOp::Rotate { pages: vec![page], degrees: 90 }, page),
+            "delete" if count > 1 => ("Deleting the page", PageOp::Delete { pages: vec![page] }, page.min(count - 2)),
+            "move-earlier" if page > 0 => ("Moving the page", PageOp::Move { from: page, to: page - 1 }, page - 1),
+            "move-later" if page + 1 < count => ("Moving the page", PageOp::Move { from: page, to: page + 1 }, page + 1),
+            "insert-blank" => ("Inserting a page", PageOp::InsertBlank { at: page + 1 }, page + 1),
+            _ => return,
+        };
+        self.as_mut().rust_mut().goto_after_edit = Some(next as i32 + 1);
+        self.page_ops(what, vec![op]);
+    }
+
+    pub fn insert_pdf(mut self: Pin<&mut Self>, url: &QUrl) {
+        let Some(file) = url_to_path(url) else { return };
+        let at = self.page_index() + 1;
+        self.as_mut().rust_mut().goto_after_edit = Some(at as i32 + 1);
+        let password = opt_string(self.password());
+        self.page_ops("Inserting pages", vec![pdf2word_core::pages::PageOp::InsertPdf { at, file, password, pages: None }]);
+    }
+
+    pub fn extract_pages(mut self: Pin<&mut Self>, spec: &QString, url: &QUrl) {
+        let Some(mut out) = url_to_path(url) else { return };
+        if out.extension().is_none_or(|e| !e.eq_ignore_ascii_case("pdf")) {
+            out.set_extension("pdf");
+        }
+        let Some(source) = self.selected_source() else { return };
+        let password = opt_string(self.password());
+        let count = (*self.page_count()).max(0) as usize;
+        let msg = match pdf2word_core::parse_page_range(&spec.to_string(), count)
+            .and_then(|pages| pdf2word_core::pages::extract(&source, password.as_deref(), &pages, &out).map(|_| pages.len()))
+        {
+            Ok(n) => format!("Saved {n} page{} as {}", if n == 1 { "" } else { "s" }, out.display()),
+            Err(e) => format!("Could not extract the pages: {e:#}"),
+        };
+        self.as_mut().append_log(&msg);
+        self.as_mut().set_status(QString::from(&msg));
+    }
+
+    pub fn split_pdf(mut self: Pin<&mut Self>, every: i32, folder: &QUrl) {
+        let Some(dir) = url_to_path(folder).filter(|p| p.is_dir()) else { return };
+        let Some(source) = self.selected_source() else { return };
+        let input = PathBuf::from(self.input_path().to_string());
+        let password = opt_string(self.password());
+        // Name the parts after the original file, not the edited copy.
+        let tmp = std::env::temp_dir().join(format!("pdf2word-split-{}", std::process::id()));
+        let named = tmp.join(input.file_name().unwrap_or_default());
+        let result = std::fs::create_dir_all(&tmp)
+            .map_err(anyhow::Error::from)
+            .and_then(|_| std::fs::copy(&source, &named).map_err(anyhow::Error::from))
+            .and_then(|_| pdf2word_core::pages::split(&named, password.as_deref(), every.max(1) as usize, &dir));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let msg = match result {
+            Ok(parts) => format!("Split into {} file{} in {}", parts.len(), if parts.len() == 1 { "" } else { "s" }, dir.display()),
+            Err(e) => format!("Could not split the PDF: {e:#}"),
+        };
+        self.as_mut().append_log(&msg);
+        self.as_mut().set_status(QString::from(&msg));
+    }
+
+    pub fn merge_files(mut self: Pin<&mut Self>, url: &QUrl) {
+        let Some(mut out) = url_to_path(url) else { return };
+        if out.extension().is_none_or(|e| !e.eq_ignore_ascii_case("pdf")) {
+            out.set_extension("pdf");
+        }
+        let password = opt_string(self.password());
+        let inputs: Vec<(PathBuf, Option<String>)> = self.rust().queue.iter().map(|q| (q.source(), password.clone())).collect();
+        if inputs.len() < 2 {
+            return;
+        }
+        match pdf2word_core::pages::merge(&inputs, &out) {
+            Ok(()) => {
+                let msg = format!("Joined {} files into {}", inputs.len(), out.display());
+                self.as_mut().append_log(&msg);
+                let i = self.as_mut().add_path(out);
+                self.as_mut().sync_queue();
+                self.as_mut().select_item(i as i32);
+                self.as_mut().set_status(QString::from(&msg));
+            }
+            Err(e) => self.as_mut().set_status(QString::from(&format!("Could not join the files: {e:#}"))),
+        }
+    }
+
+    pub fn redact_area(self: Pin<&mut Self>, x: f64, y: f64, w: f64, h: f64) {
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        let edit = pdf2word_core::edit::TextEdit::Redact { page: self.page_index(), x: x as f32, y: y as f32, w: w as f32, h: h as f32, fill: None };
+        self.apply("Redacting", vec![edit], false);
+    }
+
+    pub fn redact_found(mut self: Pin<&mut Self>, indices: &QString) {
+        let idx: Vec<usize> = serde_json::from_str(&indices.to_string()).unwrap_or_default();
+        if self.selected_source().as_ref() != Some(&self.rust().matches_source) {
+            self.as_mut().set_status(QString::from("The document changed: search again"));
+            return;
+        }
+        let chosen: Vec<pdf2word_core::edit::Match> = idx.iter().filter_map(|i| self.rust().matches.get(*i).cloned()).collect();
+        if chosen.is_empty() {
+            return;
+        }
+        let n = chosen.len();
+        self.as_mut().set_find_json(QString::from("[]"));
+        self.as_mut().rust_mut().matches.clear();
+        self.as_mut().drop_pending();
+        self.run_edit(
+            format!("Redacting {n} match{}", if n == 1 { "" } else { "es" }),
+            Box::new(move |src, pw, out| {
+                let r = pdf2word_core::edit::redact_matches(src, pw, &chosen, None, out, None)?;
+                Ok((n, r.notes))
+            }),
+            None,
+        );
+    }
+
+    fn image_path(&self, index: i32) -> Option<Vec<usize>> {
+        let pt = self.rust().page_text.as_ref()?;
+        usize::try_from(index).ok().and_then(|i| pt.images.get(i)).map(|im| im.path.clone())
+    }
+
+    pub fn delete_image(self: Pin<&mut Self>, index: i32) {
+        let Some(path) = self.image_path(index) else { return };
+        let edit = pdf2word_core::edit::TextEdit::Image { page: self.page_index(), path, change: pdf2word_core::edit::ImageChange::Delete };
+        self.apply("Deleting the picture", vec![edit], false);
+    }
+
+    pub fn place_image(self: Pin<&mut Self>, index: i32, x: f64, y: f64, w: f64, h: f64) {
+        let Some(path) = self.image_path(index) else { return };
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        let change = pdf2word_core::edit::ImageChange::Place { x: x as f32, y: y as f32, w: w as f32, h: h as f32 };
+        let edit = pdf2word_core::edit::TextEdit::Image { page: self.page_index(), path, change };
+        self.apply("Placing the picture", vec![edit], false);
+    }
+
+    pub fn replace_image(self: Pin<&mut Self>, index: i32, url: &QUrl) {
+        let (Some(path), Some(file)) = (self.image_path(index), url_to_path(url)) else { return };
+        let edit = pdf2word_core::edit::TextEdit::Image { page: self.page_index(), path, change: pdf2word_core::edit::ImageChange::Replace { file } };
+        self.apply("Replacing the picture", vec![edit], false);
+    }
+
+    pub fn insert_image(mut self: Pin<&mut Self>, url: &QUrl) {
+        let Some(file) = url_to_path(url) else { return };
+        let Some((iw, ih)) = pdf2word_core::edit::image_size(&file) else {
+            self.as_mut().set_status(QString::from("This picture cannot be read"));
+            return;
+        };
+        // A third of the page wide (or less tall than half of it), centred.
+        let (pw, ph) = self.rust().page_text.as_ref().map(|p| (p.width as f64, p.height as f64)).unwrap_or((612.0, 792.0));
+        let mut w = pw / 3.0;
+        let mut h = w * ih as f64 / iw.max(1) as f64;
+        if h > ph / 2.0 {
+            h = ph / 2.0;
+            w = h * iw as f64 / ih.max(1) as f64;
+        }
+        let (fw, fh) = (w / pw, h / ph);
+        let edit = pdf2word_core::edit::TextEdit::InsertImage { page: self.page_index(), x: (0.5 - fw / 2.0) as f32, y: (0.5 - fh / 2.0) as f32, w: fw as f32, h: fh as f32, file };
+        self.apply("Adding the picture", vec![edit], false);
+    }
+
+    pub fn unsaved_files(&self) -> i32 {
+        self.rust().queue.iter().filter(|q| !q.versions.is_empty() && q.saved.as_ref() != q.versions.last()).count() as i32
+    }
+
+    pub fn save_all_edited(mut self: Pin<&mut Self>, folder: &QUrl) {
+        let Some(dir) = url_to_path(folder).filter(|p| p.is_dir()) else { return };
+        let password = opt_string(self.password());
+        let mut saved = 0;
+        let mut failed = Vec::new();
+        let items: Vec<(usize, PathBuf, PathBuf)> = self
+            .rust()
+            .queue
+            .iter()
+            .enumerate()
+            .filter(|(_, q)| !q.versions.is_empty())
+            .map(|(i, q)| (i, q.input.clone(), q.source()))
+            .collect();
+        for (i, input, source) in items {
+            let stem = input.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "document".into());
+            let target = dir.join(format!("{stem}-edited.pdf"));
+            match pdf2word_core::edit::compact(&source, password.as_deref(), &target, None) {
+                Ok(()) => {
+                    saved += 1;
+                    if let Some(q) = self.as_mut().rust_mut().queue.get_mut(i) {
+                        q.saved = Some(source);
+                    }
+                }
+                Err(e) => failed.push(format!("{}: {e:#}", input.display())),
+            }
+        }
+        for f in &failed {
+            self.as_mut().append_log(&format!("✖ {f}"));
+        }
+        let msg = format!("{saved} edited PDF{} saved in {}", if saved == 1 { "" } else { "s" }, dir.display());
+        self.as_mut().append_log(&msg);
+        self.as_mut().set_status(QString::from(&msg));
+    }
+
+    pub fn discard_all_edits(mut self: Pin<&mut Self>) {
+        for q in self.as_mut().rust_mut().queue.iter_mut() {
+            q.discard_versions();
+        }
+        self.as_mut().sync_queue();
     }
 
     pub fn save_settings(&self) {

@@ -137,6 +137,30 @@ struct Args {
     #[arg(long)]
     keep_history: bool,
 
+    /// Join the input PDFs into one (--output, a .pdf file) instead of converting.
+    #[arg(long)]
+    merge: bool,
+
+    /// Write these pages (1-based, e.g. `1-3,7`) to a new PDF (--output) instead of converting.
+    #[arg(long, value_name = "PAGES")]
+    extract_pages: Option<String>,
+
+    /// Split the PDF into files of this many pages (in --output, a folder; default: next to the PDF).
+    #[arg(long, value_name = "N")]
+    split: Option<usize>,
+
+    /// Remove these pages (writes a PDF, like --replace).
+    #[arg(long, value_name = "PAGES")]
+    delete_pages: Option<String>,
+
+    /// Turn pages clockwise, e.g. `2-4:90` or `1:180` (repeatable; writes a PDF).
+    #[arg(long, value_name = "PAGES:DEGREES")]
+    rotate: Vec<String>,
+
+    /// Put the pages in this order, e.g. `3,1,2,4-` (pages not listed are left out; writes a PDF).
+    #[arg(long, value_name = "PAGES")]
+    page_order: Option<String>,
+
     /// Path to the PDFium shared library (file or directory).
     #[arg(long)]
     pdfium: Option<PathBuf>,
@@ -146,16 +170,45 @@ struct Args {
     quiet: bool,
 }
 
-/// `--replace`: corrects text in the PDF and writes a new PDF.
-fn replace_text(args: &Args) -> anyhow::Result<()> {
-    let [input] = args.inputs.as_slice() else { bail!("--replace works on one PDF at a time") };
+/// Operations that write PDFs instead of converting.
+fn pdf_tools(args: &Args) -> anyhow::Result<()> {
+    use pdf2word_core::pages;
+    let pw = args.password.as_deref();
+    let is_pdf = |p: &std::path::Path| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
+    if args.merge {
+        let output = args.output.clone().ok_or_else(|| anyhow::anyhow!("--merge needs --output (a .pdf file)"))?;
+        if !is_pdf(&output) {
+            bail!("--merge writes a PDF file: {}", output.display());
+        }
+        let inputs: Vec<(PathBuf, Option<String>)> = args.inputs.iter().map(|p| (p.clone(), args.password.clone())).collect();
+        pages::merge(&inputs, &output)?;
+        log::info!("wrote {} ({} files joined)", output.display(), inputs.len());
+        return Ok(());
+    }
+    let [input] = args.inputs.as_slice() else { bail!("this works on one PDF at a time") };
+    let total = pdf2word_core::inspect(input, pw, args.pdfium.as_deref())?.pages;
+    if let Some(n) = args.split {
+        let dir = args.output.clone().unwrap_or_else(|| input.parent().map(PathBuf::from).unwrap_or_default());
+        std::fs::create_dir_all(&dir)?;
+        let parts = pages::split(input, pw, n, &dir)?;
+        log::info!("wrote {} file(s) to {}", parts.len(), dir.display());
+        return Ok(());
+    }
+    if let Some(spec) = &args.extract_pages {
+        let output = args.output.clone().ok_or_else(|| anyhow::anyhow!("--extract-pages needs --output (a .pdf file)"))?;
+        let list = pdf2word_core::parse_page_range(spec, total)?;
+        pages::extract(input, pw, &list, &output)?;
+        log::info!("wrote {} ({} page(s))", output.display(), list.len());
+        return Ok(());
+    }
     let output = args.output.clone().unwrap_or_else(|| {
         let stem = input.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "document".into());
         input.with_file_name(format!("{stem}-edited.pdf"))
     });
-    if output.extension().is_none_or(|e| !e.eq_ignore_ascii_case("pdf")) {
-        bail!("with --replace the output is a PDF file: {}", output.display());
+    if !is_pdf(&output) {
+        bail!("the output is a PDF file: {}", output.display());
     }
+    let total_pages = total;
     let tmp = std::env::temp_dir().join(format!("pdf2word-edit-{}", std::process::id()));
     std::fs::create_dir_all(&tmp)?;
     let mut current = input.clone();
@@ -164,7 +217,7 @@ fn replace_text(args: &Args) -> anyhow::Result<()> {
         let Some((old, new)) = pair.split_once('=') else { bail!("--replace expects OLD=NEW, got '{pair}'") };
         let next = tmp.join(format!("step{i}.pdf"));
         let opts = pdf2word_core::edit::FindOptions { match_case: args.match_case, whole_word: args.whole_word };
-        let (n, report) = pdf2word_core::edit::find_replace(&current, args.password.as_deref(), old, new, opts, &next, args.pdfium.as_deref())?;
+        let (n, report) = pdf2word_core::edit::find_replace(&current, pw, old, new, opts, &next, args.pdfium.as_deref())?;
         for note in report.notes {
             log::warn!("{note}");
         }
@@ -176,10 +229,34 @@ fn replace_text(args: &Args) -> anyhow::Result<()> {
             current = next;
         }
     }
+    // Page operations, after the text changes.
+    let mut ops = Vec::new();
+    for r in &args.rotate {
+        let Some((pages_spec, deg)) = r.rsplit_once(':') else { bail!("--rotate expects PAGES:DEGREES, got '{r}'") };
+        let degrees: i32 = deg.trim().parse().with_context(|| format!("invalid angle in '{r}'"))?;
+        ops.push(pages::PageOp::Rotate { pages: pdf2word_core::parse_page_range(pages_spec, total_pages)?, degrees });
+    }
+    if let Some(spec) = &args.page_order {
+        ops.push(pages::PageOp::Reorder { order: pdf2word_core::parse_page_range(spec, total_pages)? });
+    }
+    if let Some(spec) = &args.delete_pages {
+        let mut del = pdf2word_core::parse_page_range(spec, total_pages)?;
+        // Page numbers refer to the order after --page-order.
+        if let Some(pages::PageOp::Reorder { order }) = ops.last() {
+            del.retain(|p| *p < order.len());
+        }
+        ops.push(pages::PageOp::Delete { pages: del });
+    }
+    if !ops.is_empty() {
+        let next = tmp.join("pages.pdf");
+        pages::apply_page_ops(&current, pw, &ops, &next)?;
+        current = next;
+        total += ops.len();
+    }
     if args.keep_history || total == 0 {
         std::fs::copy(&current, &output).with_context(|| format!("cannot write {}", output.display()))?;
     } else {
-        pdf2word_core::edit::compact(&current, args.password.as_deref(), &output, args.pdfium.as_deref())?;
+        pdf2word_core::edit::compact(&current, pw, &output, args.pdfium.as_deref())?;
     }
     let _ = std::fs::remove_dir_all(&tmp);
     if !args.quiet {
@@ -202,8 +279,9 @@ fn main() {
 }
 
 fn run(args: Args) -> anyhow::Result<()> {
-    if !args.replace.is_empty() {
-        return replace_text(&args);
+    let page_tools = args.merge || args.split.is_some() || args.extract_pages.is_some() || args.delete_pages.is_some() || !args.rotate.is_empty() || args.page_order.is_some();
+    if !args.replace.is_empty() || page_tools {
+        return pdf_tools(&args);
     }
     let mut opts = ConvertOptions {
         layout_mode: args.mode,
